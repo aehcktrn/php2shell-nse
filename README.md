@@ -1,125 +1,169 @@
 # php2shell-nse
 
-Script Nmap NSE pour rechercher une **version de PHP potentiellement concernée par PHP2Shell**, à partir des en-têtes HTTP exposés par une application.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et afficher le correctif à appliquer.** Le script NSE couvre **CVE-2026-109618** et **CVE-2026-109619** à partir des versions annoncées dans les en-têtes HTTP.
 
-Il couvre **CVE-2026-109618** et **CVE-2026-109619**. Il effectue une évaluation par version : il ne déclenche pas les vulnérabilités et ne confirme ni l'exploitabilité, ni une compromission. Une version masquée produit un résultat **`UNKNOWN`**, jamais une déclaration d'absence de vulnérabilité.
+## Lancer un contrôle
 
-## Démarrage rapide
-
-Prérequis : Nmap avec le moteur NSE et ses bibliothèques HTTP standard. Le script est autonome ; aucune bibliothèque Lua supplémentaire ni installation dans les répertoires de Nmap n'est nécessaire.
+Prérequis : **Nmap et Git**. Aucun installateur ni bibliothèque Lua supplémentaire n'est nécessaire. Python 3 sert uniquement à l'export CSV optionnel.
 
 ```bash
 git clone https://github.com/aehcktrn/php2shell-nse.git
 cd php2shell-nse
 
-nmap -Pn -sV -p 80,443 \
-  --script ./http-php2shell.nse \
-  application.example.com
+nmap -sV -p- --script ./http-php2shell.nse application.example.com
 ```
 
-Indiquez le nom DNS de l'application, sans `https://`. Adaptez les ports au service. `-sV` aide Nmap à identifier HTTP et HTTPS ; les sondes de détection de service de Nmap s'ajoutent aux requêtes du script.
+Remplacez la cible par une IP ou un nom DNS, sans `https://`. **Vous n'avez pas à connaître le port web à l'avance** : `-p-` étend le scan aux ports TCP 1 à 65535 et `-sV` recherche les services exposés. Le NSE intervient sur les services HTTP/HTTPS reconnus et les ports web usuels.
 
-### IP connue, hôte virtuel et chemin applicatif
+## Scanner une liste de domaines
+
+Créez **`domaines.txt`**, avec **un nom DNS exact par ligne**. Les commentaires commencent par `#`. Vous pouvez copier le modèle fourni, puis remplacer ses noms d'exemple par ceux de votre périmètre :
 
 ```bash
-nmap -Pn -sV -p 443 \
+cp domaines.example.txt domaines.txt
+```
+
+Format attendu :
+
+```text
+# Applications a controler
+application.example.com
+portail.example.com
+api.example.org
+```
+
+Utilisez les noms complets, sans `https://`, port, chemin, joker `*` ou suffixe CIDR. Un nom racine comme `example.com` n'inclut pas automatiquement ses sous-domaines : ajoutez chaque application souhaitée. La liste est fournie par l'opérateur ; sa propriété n'est pas vérifiée automatiquement.
+
+Lancez le scan depuis un poste ayant accès aux applications :
+
+```bash
+mkdir -p results
+nmap -sT -sV -Pn -p- --resolve-all \
+  --script ./http-php2shell.nse \
+  --script-timeout 20s \
+  --stats-every 30s \
+  -iL domaines.txt \
+  -oA results/php2shell
+```
+
+Pour ses cibles, Nmap résout les noms listés, recherche les ports et identifie les services. Le NSE utilise le nom de l'application pour **Host HTTP et SNI TLS**. La commande affiche la progression toutes les 30 secondes et conserve les résultats en texte et XML.
+
+`--resolve-all` couvre toutes les adresses obtenues pour chaque nom dans la famille choisie. Évitez `--unique` : plusieurs noms partageant une IP doivent conserver des contrôles distincts. Le script ne découvre pas de sous-domaines supplémentaires, ne suit pas les redirections et ne déduit aucune plage réseau à partir des domaines.
+
+**Le scan de ports vise les IP résolues ; Host/SNI sélectionnent l'application lors des échanges web.** Un reverse proxy, un répartiteur de charge ou un frontal mutualisé peut masquer plusieurs backends. Le résultat décrit ce qui est visible par ce frontal, sans constituer un inventaire des machines, conteneurs ou runtimes derrière lui. Une liste de domaines n'isole donc pas les sondes TCP par application.
+
+La commande utilise IPv4. Pour IPv6, effectuez une exécution distincte avec `-6`. `-Pn` tente les adresses même sans réponse à la découverte initiale ; cela peut allonger le scan. `--script-timeout 20s` borne chaque exécution NSE, pas la durée totale. Un port sans résultat NSE reste à vérifier.
+
+## Lire le verdict et agir
+
+La sortie terminal est courte : verdict, version PHP, correction conseillée et vérification. Exemple pour une version PHP 8.3.35 annoncée :
+
+```text
+| http-php2shell:
+|   VULNERABLE PROBABLE (selon la version annoncee)
+|   PHP : 8.3.35
+|   Correctif : PHP >= 8.3.36 dans sa branche, ou paquet fournisseur corrigeant les deux CVE.
+|_  Verification : Apres mise a jour, redemarrer les workers web ou redeployer les conteneurs; verifier le runtime actif et les backports fournisseur.
+```
+
+| Verdict affiché | État structuré | Action |
+|---|---|---|
+| `VULNERABLE PROBABLE (selon la version annoncee)` | `POTENTIALLY_VULNERABLE` | Appliquer le correctif indiqué, ou vérifier que le fournisseur l'a déjà rétroporté. |
+| `VERSION CORRIGEE ANNONCEE` | `PATCHED_VERSION_ADVERTISED` | Confirmer que cette version est effectivement exécutée par les instances web. |
+| `INDETERMINE - A VERIFIER` | `UNKNOWN` | Vérifier le runtime côté serveur, le chemin interrogé et l'hôte virtuel. |
+
+**La détection repose sur la version annoncée ; l'exploitabilité n'est pas testée.** Le champ `exploitability` reste `NOT_TESTED`. Une version masquée, contradictoire ou non reconnue ne permet pas de conclure. Si une preuve suspecte figure parmi des versions contradictoires, l'état reste `UNKNOWN`, mais la vérification est signalée comme prioritaire.
+
+### Exporter un tableau CSV
+
+À partir du XML conservé par la commande de scan :
+
+```bash
+python3 report.py results/php2shell.xml -o results/php2shell.csv
+```
+
+L'export contient les évaluations du NSE et des lignes de couverture. **Filtrez la colonne `row_type`** : `ASSESSMENT` correspond à un résultat NSE ; `COVERAGE` signale un port TCP ouvert sans évaluation, ou un hôte sans autre résultat. Cela comprend aussi des services non HTTP, comme SSH : `NOT_ASSESSED` ne signifie ni vulnérable ni corrigé.
+
+Les évaluations conservent le verdict, les versions, les seuils de correction et les actions du XML. Les preuves détaillées restent dans le fichier XML. La colonne `priority` permet de traiter d'abord `PATCH_OR_VERIFY_BACKPORT` et `VERIFY_PRIORITY`, puis `VERIFY_RUNTIME` et `CONFIRM_RUNTIME`.
+
+Un XML tronqué ou une exécution Nmap qui n'est pas terminée avec succès est refusé : un rapport existant n'est alors pas remplacé.
+
+Le CSV reflète uniquement les enregistrements présents dans le XML. Il ne peut pas répertorier les cibles absentes de ce fichier, notamment après un échec de résolution DNS. Consultez aussi les messages d'erreur de Nmap et rapprochez les résultats de votre inventaire de départ.
+
+### Alternative : inventaire d'IP et de réseaux
+
+Pour un périmètre réseau connu, `-iL` accepte aussi un fichier `perimetre.txt` contenant des IP, des plages CIDR ou des noms DNS :
+
+```text
+192.0.2.10
+198.51.100.0/24
+application.example.com
+```
+
+Remplacez alors `-iL domaines.txt` par `-iL perimetre.txt` dans la commande précédente. **Sur de grandes plages peu occupées, `-Pn -p-` peut prendre beaucoup de temps** : découpez les réseaux en lots. Un inventaire d'IP seul ne découvre pas tous les hôtes virtuels ; conservez aussi les noms d'applications connus.
+
+## Correctifs de référence
+
+Matrice issue des avis PHP du **21 octobre 2026**, vérifiés le **22 octobre 2026** :
+
+| Branche | Premier correctif officiel |
+|---|---|
+| PHP 8.2 | **8.2.35** |
+| PHP 8.3 | **8.3.36** |
+| PHP 8.4 | **8.4.27** |
+| PHP 8.5 | **8.5.12** |
+| PHP 8.6 en préversion | **8.6.0RC4** |
+
+Ces seuils sont des **minima**, ou peuvent être remplacés par un paquet fournisseur corrigeant les deux CVE. Après la mise à jour, assurez-vous que les workers PHP et les instances applicatives utilisent effectivement les nouveaux binaires.
+
+Les branches PHP 5, PHP 7, PHP 8.0 et PHP 8.1 sont signalées comme potentiellement vulnérables. Des backports fournisseur existent, ainsi que des correctifs source PHP minimaux pour 7.4, 8.0 et 8.1. Un suffixe de distribution est conservé en preuve ; il ne suffit pas à établir l'application d'un correctif.
+
+Pour `8.6.0`, les préversions alpha, bêta et RC1 à RC3 précèdent le correctif ; RC4 et les RC ultérieures reconnues atteignent le seuil. Les versions stables de la branche 8.6 sont également comparées à ce seuil. Les builds `-dev`, suffixes non reconnus et branches non référencées restent `UNKNOWN`. La matrice est intégrée au script : elle n'est pas actualisée par un service externe pendant les scans.
+
+## Options pour une application précise
+
+```bash
+nmap -sV -Pn -p 443 \
   --script ./http-php2shell.nse \
   --script-args 'http-php2shell.vhost=application.example.com,http-php2shell.path=/index.php,http-php2shell.timeout=5000' \
   192.0.2.10
 ```
 
-L'option `vhost` fixe le nom HTTP **Host** et le **SNI TLS**, tout en conservant l'IP ciblée pour la connexion. Elle permet d'interroger l'application voulue sur un serveur hébergeant plusieurs sites. Elle ne recherche pas les autres hôtes virtuels.
-
-### Export des résultats
-
-```bash
-mkdir -p scan-results
-nmap -Pn -sV -p 80,443,8080,8443 \
-  --script ./http-php2shell.nse \
-  -oA scan-results/php2shell \
-  application.example.com
-```
-
-Le fichier XML contient les champs structurés du script. Le format texte reste directement lisible dans le terminal et le fichier `.nmap`.
-
-## Interpréter les résultats
-
-| `state` | Signification | Vérification à effectuer |
+| Argument | Défaut | Utilité |
 |---|---|---|
-| `POTENTIALLY_VULNERABLE` | La version annoncée précède le correctif connu de sa branche, ou appartient à une ancienne branche concernée. | Vérifier le paquet effectivement exécuté, les éventuels correctifs rétroportés et la mise à jour des workers. |
-| `PATCHED_VERSION_ADVERTISED` | La version annoncée atteint le seuil corrigé connu de sa branche. | Confirmer cette version sur les instances qui servent réellement l'application. |
-| `UNKNOWN` | Les éléments disponibles ne permettent pas de conclure : version absente, ambiguë, non reconnue, contradictoire ou réponse inutilisable. | Contrôler côté serveur ou interroger le bon hôte virtuel et le bon chemin. |
+| `http-php2shell.path` | `/` | Chemin applicatif local, jusqu'à 2 048 caractères. URL complète, `//`, espaces, caractères de contrôle, antislashs et fragments `#` refusés. |
+| `http-php2shell.vhost` | Nom fourni à Nmap | Nom DNS pour **Host et SNI**, en conservant l'IP ciblée. Sans schéma, port ou chemin. |
+| `http-php2shell.timeout` | `5000` | Délai des opérations réseau en millisecondes, entier de 1 à 60000. |
 
-Le champ **`exploitability` vaut toujours `NOT_TESTED`**. Une bannière est une déclaration du serveur, du proxy ou de l'application ; elle peut être obsolète ou modifiée. `PATCHED_VERSION_ADVERTISED` n'est donc pas une certification de correction.
+`http.host` est pris en compte en l'absence de `http-php2shell.vhost`, avec les mêmes contraintes. L'option spécifique est prioritaire. Sur un port autre que 80 ou 443, le port est ajouté à Host, pas au SNI.
 
-Le rapport contient notamment :
+## Couverture et limites
 
-- `cves` : les deux identifiants traités ;
-- `versions` : les versions annoncées relevées ;
-- `evidence` : la source de chaque version, son évaluation et le seuil de correction lorsqu'il est connu ;
-- `http_status` : le statut HTTP reçu, lorsqu'il est disponible ;
-- `reason` et `notes` : les motifs du résultat et les limites applicables.
+Le script lit les indications `PHP/...` des en-têtes **`X-Powered-By`** et **`Server`** avec une requête GET normale. Il n'envoie aucune charge d'exploitation. Le corps lu est limité à 64 Kio ; ni ce corps ni les cookies ne sont enregistrés dans les preuves. Les sondes `-sV` de Nmap s'ajoutent à cette requête.
 
-Si les en-têtes annoncent des versions différentes, le résultat global reste `UNKNOWN` et les éléments sont conservés séparément. Une version suspecte dans ces éléments mérite une vérification, même lorsque l'ensemble est contradictoire.
+Les **redirections ne sont pas suivies**. Choisissez explicitement leur destination applicative si nécessaire. Une erreur réseau, un filtrage ou une absence de version ne démontre pas l'absence de PHP.
 
-## Versions de référence
+La couverture dépend des cibles fournies, de la visibilité réseau et de l'identification des services. `-p-` ne garantit pas l'identification de chaque application : les exclusions de détection de services de Nmap restent applicables. Hôtes virtuels non inventoriés, versions masquées, frontaux et backends multiples nécessitent un complément d'inventaire. La version PHP en ligne de commande peut différer de celle du service web.
 
-Matrice établie à partir des avis officiels du **21 octobre 2026**, vérifiés le **22 octobre 2026** :
+## Données structurées et tests
 
-| Branche | Première version corrigée annoncée |
-|---|---|
-| PHP 8.2 | `8.2.35` |
-| PHP 8.3 | `8.3.36` |
-| PHP 8.4 | `8.4.27` |
-| PHP 8.5 | `8.5.12` |
-| PHP 8.6 en préversion | `8.6.0RC4` |
+Le XML conserve `state`, `cves`, `versions`, `evidence`, `http_status`, `reason` et `notes`. Il ajoute `verdict`, `fixed_versions`, `remediation`, `verification`, `priority` et `potentially_vulnerable_evidence` pour faciliter le suivi des corrections.
 
-Le comparateur traite les composantes numériques, et non leur ordre alphabétique. Il distingue les préversions reconnues : pour `8.6.0`, les versions alpha, bêta et RC1 à RC3 précèdent le correctif ; RC4 et les RC ultérieures atteignent le seuil annoncé. Les versions stables de la branche 8.6 sont également comparées à ce seuil. Les builds `-dev`, suffixes non reconnus et branches futures non référencées restent `UNKNOWN`.
-
-Les anciennes branches PHP 5, PHP 7, PHP 8.0 et PHP 8.1 sont signalées comme potentiellement vulnérables. Un suffixe de distribution est conservé dans la preuve, mais **ne démontre pas qu'un correctif a été rétroporté**. Inversement, une version de base ancienne peut être corrigée par son fournisseur. PHP a notamment publié des backports source minimaux pour 7.4, 8.0 et 8.1 ; les correctifs des distributions doivent être vérifiés auprès de leurs éditeurs.
-
-La matrice est intégrée au script. Le scanner ne télécharge pas de données externes pendant une exécution : toute évolution de la matrice exige une mise à jour du dépôt.
-
-## Arguments
-
-| Argument | Défaut | Description |
-|---|---|---|
-| `http-php2shell.path` | `/` | Chemin local de l'application (2 048 caractères maximum). Il doit commencer par `/`. Une URL complète, `//`, les espaces, caractères de contrôle, antislashs et fragments `#` sont refusés. |
-| `http-php2shell.vhost` | Nom fourni à Nmap | Nom DNS à utiliser pour Host et SNI. Ne pas ajouter de schéma, de port ou de chemin. |
-| `http-php2shell.timeout` | `5000` | Délai des opérations réseau, en millisecondes, entier de 1 à 60000. Ce n'est pas une limite globale de durée du scan Nmap. |
-
-Si l'argument générique Nmap `http.host` est fourni sans `http-php2shell.vhost`, il sert aussi de nom Host/SNI et doit respecter le même format de nom DNS sans port. L'option spécifique `http-php2shell.vhost` est prioritaire. Sur un port autre que 80 ou 443, le port est ajouté à l'en-tête Host, pas au SNI.
-
-## Comportement et limites
-
-Le script utilise une requête **GET** normale et analyse uniquement les indications `PHP/...` des en-têtes **`X-Powered-By`** et **`Server`**. Il ne recherche pas de webshell, n'envoie pas de commande système, ne provoque pas volontairement d'épuisement mémoire et ne soumet pas de formulaire multipart.
-
-La lecture du corps est limitée à **64 Kio** ; ce corps ne sert pas à identifier la version et n'est pas inclus dans le rapport. Les cookies et les autres en-têtes ne sont pas reproduits dans les preuves.
-
-Les redirections ne sont **pas suivies**, même vers le même domaine. Le statut de redirection reste visible : choisissez explicitement le service et le chemin finaux à analyser. Une réponse de connexion refusée, un blocage WAF ou un timeout ne prouvent aucune vulnérabilité.
-
-Un frontal peut masquer PHP, afficher sa propre bannière ou répartir les requêtes entre plusieurs versions. Ce contrôle ponctuel ne recense pas tous les backends. Pour conclure, vérifiez chaque runtime web effectivement utilisé : PHP-FPM, module Apache, conteneur ou autre intégration. La version du seul exécutable PHP en ligne de commande peut être différente.
-
-## Développement et tests
-
-Les tests unitaires exercent le script avec des réponses HTTP simulées. Les tests d'intégration utilisent Nmap et des serveurs HTTP/HTTPS sur la boucle locale ; ils ne sondent aucun service Internet.
-
-Prérequis supplémentaires : Lua 5.4, Python 3 et OpenSSL.
+Les tests utilisent des réponses simulées et des serveurs HTTP/HTTPS en boucle locale. Prérequis : Lua 5.4, Python 3, OpenSSL et Nmap.
 
 ```bash
 lua5.4 tests/unit.lua
 python3 tests/integration.py
+python3 -m unittest discover -s tests -p 'test_report.py'
 ```
 
-Les variables `NMAP` et `NMAP_DATADIR` permettent aux tests d'intégration d'utiliser une installation locale spécifique de Nmap. Le workflow GitHub Actions exécute les deux suites sur Ubuntu 24.04. Les résultats d'une exécution sont à consulter dans les journaux correspondants.
+`NMAP` et `NMAP_DATADIR` permettent de choisir une installation spécifique de Nmap. Le workflow GitHub Actions exécute les tests sur Ubuntu 24.04.
 
-## Sources
+## Sources et licence
 
-- [PHP — avis de sécurité et versions du 21 octobre 2026](https://www.php.net/).
-- [CVE-2026-109618 — RCE via OOM corruption, avis PHP officiel](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w).
-- [CVE-2026-109619 — RCE via stale global state, avis PHP officiel](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp).
-- [Nmap — bibliothèque HTTP du moteur NSE](https://nmap.org/nsedoc/lib/http.html).
-
-## Licence
+- [PHP — avis de sécurité et versions](https://www.php.net/).
+- [CVE-2026-109618 — avis PHP officiel](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w).
+- [CVE-2026-109619 — avis PHP officiel](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp).
+- [Nmap — sélection des cibles](https://nmap.org/book/man-target-specification.html), [sélection des ports](https://nmap.org/book/man-port-specification.html), [identification des services](https://nmap.org/book/man-version-detection.html), [découverte des hôtes](https://nmap.org/book/man-host-discovery.html) et [bibliothèque HTTP NSE](https://nmap.org/nsedoc/lib/http.html).
 
 Le code original de ce dépôt est distribué sous [licence MIT](LICENSE). Nmap et ses bibliothèques conservent leurs propres licences.

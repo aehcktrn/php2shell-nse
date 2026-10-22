@@ -2,4 +2,11 @@ __pycache__/
 *.py[cod]
 .venv/
 scan-results/
+results/
+/perimetre.txt
+/domaines.txt
+/php2shell.nmap
+/php2shell.gnmap
+/php2shell.xml
+/php2shell.csv
 .DS_Store

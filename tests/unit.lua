@@ -60,12 +60,27 @@ local function run(response, args, host, port)
   local chunk, load_error = loadfile(script_path, "t", env)
   truthy(chunk, load_error)
   chunk()
-  local result = env.action(host or {ip = "127.0.0.1", targetname = "app.example.test"},
+  local result, human = env.action(host or {ip = "127.0.0.1", targetname = "app.example.test"},
     port or {number = 443, protocol = "tcp", service = "https", state = "open"})
   truthy(type(result) == "table", "action must return a structured result")
   equal(result.exploitability, "NOT_TESTED", "never claim exploitation was tested")
   truthy(type(result.reason) == "string" and #result.reason > 0, "provide a reason")
-  return result, calls
+  local verdicts = {
+    POTENTIALLY_VULNERABLE = "VULNERABLE PROBABLE (selon la version annoncee)",
+    PATCHED_VERSION_ADVERTISED = "VERSION CORRIGEE ANNONCEE",
+    UNKNOWN = "INDETERMINE - A VERIFIER",
+  }
+  equal(result.verdict, verdicts[result.state], "qualified human verdict")
+  truthy(type(result.remediation) == "string" and #result.remediation > 0, "patch guidance absent")
+  truthy(type(result.verification) == "string" and #result.verification > 0, "verification guidance absent")
+  truthy(type(result.fixed_versions) == "table", "structured fix versions absent")
+  equal(type(result.potentially_vulnerable_evidence), "boolean", "suspect evidence flag")
+  truthy(type(human) == "string", "action must return human text as its second value")
+  equal(human:sub(1, #result.verdict + 1), "\n" .. result.verdict, "human output must lead with the verdict")
+  truthy(human:find("PHP : ", 1, true), "human output lacks PHP evidence")
+  truthy(human:find("Correctif : " .. result.remediation, 1, true), "human output lacks remediation")
+  truthy(human:find("Verification : " .. result.verification, 1, true), "human output lacks verification")
+  return result, calls, human
 end
 
 local function response(value, extra)
@@ -124,6 +139,71 @@ test("CVE identifiers and evidence remain machine readable", function()
   equal(result.evidence[1].version, "8.4.26")
   equal(result.evidence[1].state, "POTENTIALLY_VULNERABLE")
   equal(result.evidence[1].fixed_version, "8.4.27")
+end)
+
+test("suspect version gives its branch fix and verification priority", function()
+  local result, _, human = run(response("PHP/8.4.26"))
+  equal(result.priority, "PATCH_OR_VERIFY_BACKPORT")
+  equal(result.potentially_vulnerable_evidence, true)
+  equal(#result.fixed_versions, 1)
+  equal(result.fixed_versions[1], "8.4.27")
+  truthy(result.remediation:find("8.4.27", 1, true), "correct branch patch absent")
+  local advice = (result.remediation .. " " .. result.verification):lower()
+  truthy(advice:find("backport", 1, true) or advice:find("retroport", 1, true), "vendor backport caveat absent")
+  truthy(advice:find("redemarr", 1, true) or advice:find("restart", 1, true), "running workers restart absent")
+  truthy(human:find("PHP : 8.4.26", 1, true))
+end)
+
+test("patched advertised version requests runtime confirmation", function()
+  local result = run(response("PHP/8.3.36"))
+  equal(result.priority, "CONFIRM_RUNTIME")
+  equal(result.potentially_vulnerable_evidence, false)
+  equal(#result.fixed_versions, 1)
+  equal(result.fixed_versions[1], "8.3.36")
+end)
+
+test("missing evidence yields verification guidance rather than an all-clear", function()
+  local result, _, human = run(nil)
+  equal(result.priority, "VERIFY_RUNTIME")
+  equal(result.potentially_vulnerable_evidence, false)
+  equal(#result.fixed_versions, 0)
+  truthy(human:find("PHP : non determine", 1, true))
+  truthy(not human:find("VERSION CORRIGEE ANNONCEE", 1, true))
+end)
+
+test("conflicting evidence keeps suspicious versions a priority", function()
+  local result = run({status = 200,
+    header = {["x-powered-by"] = "PHP/8.3.36", server = "Apache PHP/8.4.26"}})
+  equal(result.state, "UNKNOWN")
+  equal(result.priority, "VERIFY_PRIORITY")
+  equal(result.potentially_vulnerable_evidence, true)
+  truthy(contains(result.fixed_versions, "8.3.36"))
+  truthy(contains(result.fixed_versions, "8.4.27"))
+end)
+
+test("same branch conflict reports a unique fix version", function()
+  local result = run({status = 200,
+    header = {["x-powered-by"] = "PHP/8.3.36", server = "Apache PHP/8.3.35"}})
+  equal(result.priority, "VERIFY_PRIORITY")
+  equal(#result.fixed_versions, 1)
+  equal(result.fixed_versions[1], "8.3.36")
+end)
+
+test("conflicting patched versions remain inconclusive without suspect evidence", function()
+  local result = run(response("PHP/8.3.36, PHP/8.4.27"))
+  equal(result.state, "UNKNOWN")
+  equal(result.priority, "VERIFY_RUNTIME")
+  equal(result.potentially_vulnerable_evidence, false)
+end)
+
+test("legacy branch guidance does not invent an upstream patch", function()
+  local result = run(response("PHP/7.4.33"))
+  equal(result.priority, "PATCH_OR_VERIFY_BACKPORT")
+  equal(result.potentially_vulnerable_evidence, true)
+  equal(#result.fixed_versions, 0)
+  local advice = result.remediation:lower()
+  truthy(advice:find("migr", 1, true), "legacy branch migration absent")
+  truthy(advice:find("fournisseur", 1, true) or advice:find("vendor", 1, true), "vendor alternative absent")
 end)
 
 test("case insensitive PHP token", function()
@@ -195,12 +275,12 @@ test("HTTP failure table is unknown", function()
 end)
 
 test("cookies, complete headers and bodies are not leaked", function()
-  local result = run(response("PHP/8.3.35", {
+  local result, _, human = run(response("PHP/8.3.35", {
     rawheader = {"X-Powered-By: PHP/8.3.35", "Set-Cookie: session=TOP_SECRET_COOKIE"},
     cookies = {{name = "session", value = "TOP_SECRET_COOKIE"}},
     body = "TOP_SECRET_BODY",
   }))
-  local output = flatten(result)
+  local output = flatten(result) .. human
   truthy(not output:find("TOP_SECRET_COOKIE", 1, true))
   truthy(not output:find("TOP_SECRET_BODY", 1, true))
 end)

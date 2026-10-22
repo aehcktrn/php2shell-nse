@@ -26,5 +26,8 @@ jobs:
       - name: Run unit tests
         run: lua5.4 tests/unit.lua
 
+      - name: Run XML report tests
+        run: python3 -m unittest discover -s tests -p 'test_report.py'
+
       - name: Run HTTP and HTTPS integration tests on loopback
         run: python3 tests/integration.py

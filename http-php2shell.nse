@@ -14,6 +14,11 @@ The script makes a bounded GET request to one supplied path. It does not follow
 redirects, submit multipart bodies, trigger memory exhaustion, or execute code.
 HTTP and HTTPS are supported by Nmap's HTTP library.
 
+Use -sV -p- to discover HTTP/HTTPS on nonstandard TCP ports automatically.
+Nmap performs port and service discovery; this script assesses the web services
+that Nmap identifies. Normal output shows a short verdict and patch guidance;
+XML output retains all evidence and assessment details for perimeter reports.
+
 References (reviewed 2026-10-22):
 https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w
 https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp
@@ -22,7 +27,8 @@ https://www.php.net/
 
 ---
 -- @usage
--- nmap -sV -Pn -p80,443 --script ./http-php2shell.nse application.example.com
+-- nmap -sV -p- --script ./http-php2shell.nse application.example.com
+-- nmap -sT -sV -Pn -p- --resolve-all --script ./http-php2shell.nse -iL domaines.txt -oA php2shell
 -- nmap -sV -Pn -p443 --script ./http-php2shell.nse \
 --   --script-args 'http-php2shell.vhost=application.example.com,http-php2shell.path=/index.php' 192.0.2.10
 --
@@ -34,13 +40,10 @@ https://www.php.net/
 --
 -- @output
 -- | http-php2shell:
--- |   state: POTENTIALLY_VULNERABLE
--- |   detection_method: HTTP response headers (version-based)
--- |   exploitability: NOT_TESTED
--- |   versions:
--- |     8.3.35
--- |   reason: The advertised version predates the upstream fix; verify vendor backports.
--- |_  http_status: 200
+-- |   VULNERABLE PROBABLE (selon la version annoncee)
+-- |   PHP : 8.3.35
+-- |   Correctif : PHP >= 8.3.36 dans sa branche, ou paquet fournisseur corrigeant les deux CVE.
+-- |_  Verification : Apres mise a jour, redemarrer les workers web ou redeployer les conteneurs; verifier le runtime actif et les backports fournisseur.
 
 author = "aehcktrn"
 license = "MIT; see https://github.com/aehcktrn/php2shell-nse/blob/main/LICENSE"
@@ -64,7 +67,7 @@ local function output()
   result.state = UNKNOWN
   result.detection_method = "HTTP response headers (version-based)"
   result.exploitability = "NOT_TESTED"
-  result.script_version = "0.1.0"
+  result.script_version = "0.2.0"
   result.advisory_date = "2026-10-21"
   result.cves = {"CVE-2026-109618", "CVE-2026-109619"}
   result.versions = {}
@@ -75,6 +78,83 @@ local function output()
   }
   result.reason = "No reliable PHP version evidence was obtained."
   return result
+end
+
+-- Keep the complete machine-readable assessment, but give operators a compact
+-- verdict and a branch-specific action. In particular, a hidden version or a
+-- failed request is never rendered as an all-clear. Conflicting evidence keeps
+-- UNKNOWN while retaining an urgent review priority when any version is suspect.
+local function finish(result)
+  local fixed_seen, fixed_labels = {}, {}
+  result.fixed_versions = {}
+  result.potentially_vulnerable_evidence = false
+  for _, evidence in ipairs(result.evidence) do
+    if evidence.state == POTENTIAL then
+      result.potentially_vulnerable_evidence = true
+    end
+    local fixed = evidence.fixed_version
+    if fixed and not fixed_seen[fixed] then
+      fixed_seen[fixed] = true
+      table.insert(result.fixed_versions, fixed)
+      table.insert(fixed_labels, "PHP >= " .. fixed)
+    end
+  end
+  local fixed_text = table.concat(fixed_labels, "; ")
+  local update_check = "Apres mise a jour, redemarrer les workers web ou redeployer les conteneurs; verifier le runtime actif et les backports fournisseur."
+
+  if result.state == POTENTIAL then
+    result.verdict = "VULNERABLE PROBABLE (selon la version annoncee)"
+    result.priority = "PATCH_OR_VERIFY_BACKPORT"
+    if #result.fixed_versions > 0 then
+      result.remediation = fixed_text .. " dans sa branche, ou paquet fournisseur corrigeant les deux CVE."
+    else
+      result.remediation = "Migrer vers une branche PHP maintenue et corrigee, ou appliquer un paquet fournisseur corrigeant les deux CVE."
+    end
+    result.verification = update_check
+  elseif result.state == PATCHED then
+    result.verdict = "VERSION CORRIGEE ANNONCEE"
+    result.priority = "CONFIRM_RUNTIME"
+    result.remediation = "Seuil " .. fixed_text .. " atteint selon la version annoncee."
+    result.verification = "Confirmer le paquet et la version reellement executes par chaque worker web et backend; une banniere seule ne certifie pas la correction."
+  else
+    result.verdict = "INDETERMINE - A VERIFIER"
+    result.priority = result.potentially_vulnerable_evidence and "VERIFY_PRIORITY" or "VERIFY_RUNTIME"
+    if result.potentially_vulnerable_evidence then
+      result.remediation = "Une version suspecte figure dans les preuves; verifier et corriger les runtimes concernes en priorite."
+      if #result.fixed_versions > 0 then
+        result.remediation = result.remediation .. " Minima par branche : " .. fixed_text .. "."
+      end
+      result.verification = update_check
+    else
+      result.remediation = "Statut non determine; verifier le paquet PHP et le correctif fournisseur sur le runtime web."
+      result.verification = "Controler l'acces HTTP, le bon hote virtuel/chemin et chaque backend; une version masquee ne prouve pas une correction."
+    end
+  end
+
+  local lines = {
+    result.verdict,
+    "PHP : " .. (#result.versions > 0 and table.concat(result.versions, ", ") or "non determine"),
+    "Correctif : " .. result.remediation,
+    "Verification : " .. result.verification
+  }
+  if result.state == UNKNOWN then
+    local detail
+    if result.error then
+      detail = result.error
+    elseif not result.http_status then
+      detail = "Aucune reponse HTTP exploitable; verifier la connexion et le service."
+    elseif #result.versions > 1 then
+      detail = "Versions PHP contradictoires; verifier chaque backend."
+    elseif #result.evidence > 0 then
+      detail = "Version ou preuves non conclusives; consulter les details dans le XML."
+    elseif result.php_detected == "YES" then
+      detail = "PHP annonce sans version exploitable."
+    else
+      detail = "Aucune version PHP exposee; PHP peut tout de meme etre present."
+    end
+    table.insert(lines, "Detail : " .. detail)
+  end
+  return result, "\n" .. table.concat(lines, "\n")
 end
 
 local function valid_package_suffix(suffix)
@@ -283,7 +363,8 @@ action = function(host, port)
   local args, error_message = parameters()
   if not args then
     result.reason = error_message
-    return result
+    result.error = error_message
+    return finish(result)
   end
 
   local request_host = {}
@@ -309,7 +390,7 @@ action = function(host, port)
   })
   if type(response) ~= "table" or not tonumber(response.status) then
     result.reason = "No complete HTTP response; reachability and PHP patch status are indeterminate."
-    return result
+    return finish(result)
   end
   result.http_status = tonumber(response.status)
   extract(response, result)
@@ -321,5 +402,5 @@ action = function(host, port)
   if response.truncated then
     table.insert(result.notes, "Response body truncated at 65536 bytes; the body is not used as evidence.")
   end
-  return result
+  return finish(result)
 end

@@ -28,14 +28,14 @@ SECRET_BODY = "SYNTHETIC_BODY_MUST_NOT_APPEAR"
 
 class FixtureHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "SyntheticFixture"
-    sys_version = ""
+    # Keep the real BaseHTTP/Python signature so -sV can identify this fixture.
 
     def log_message(self, *_args):
         pass
 
     def do_GET(self):
-        entry = {"method": "GET", "path": self.path, "host": self.headers.get("Host")}
+        entry = {"method": "GET", "path": self.path, "host": self.headers.get("Host"),
+                 "sni": getattr(self.connection, "_test_sni", None)}
         with self.server.record_lock:
             self.server.requests.append(entry)
         status, headers, body = 200, {}, b"Synthetic fixture."
@@ -136,7 +136,10 @@ class NSEIntegration(unittest.TestCase):
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(cert, key)
             cls.httpsd = LocalServer()
-            def capture_sni(_socket, server_name, _context):
+            def capture_sni(tls_socket, server_name, _context):
+                # Bind SNI to this connection, so a later HTTP assertion cannot
+                # accidentally use a name observed only during a version probe.
+                tls_socket._test_sni = server_name
                 with cls.httpsd.record_lock:
                     cls.httpsd.sni_names.append(server_name)
             context.set_servername_callback(capture_sni)
@@ -153,17 +156,24 @@ class NSEIntegration(unittest.TestCase):
                 thread.join(timeout=5)
         cls.temp.cleanup()
 
-    def scan(self, path, *, server=None, vhost=None):
+    def scan(self, path, *, server=None, vhost=None, discover=False, targets_file=None):
         server = server or self.httpd
         args = f"http-php2shell.path={path},http-php2shell.timeout=2000"
         if vhost:
             args += f",http-php2shell.vhost={vhost}"
+        script_selector = str(SCRIPT) if discover else "+" + str(SCRIPT)
         command = [self.nmap, "-sT", "-Pn", "-n", "-p", str(server.server_port),
-                   "--script", "+" + str(SCRIPT), "--script-args", args,
-                   "--script-timeout", "15s", "-oX", "-", "127.0.0.1"]
+                   "--script", script_selector, "--script-args", args,
+                   "--script-timeout", "15s", "-oX", "-"]
+        if targets_file is not None:
+            command.extend(["--resolve-all", "-iL", str(targets_file)])
+        else:
+            command.append("127.0.0.1")
+        if discover:
+            command[1:1] = ["-sV"]
         if os.environ.get("NMAP_DATADIR"):
             command[1:1] = ["--datadir", os.environ["NMAP_DATADIR"]]
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=25)
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=60 if discover else 25)
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
         try:
             root = ET.fromstring(completed.stdout)
@@ -176,6 +186,18 @@ class NSEIntegration(unittest.TestCase):
         exploitability = script.find("elem[@key='exploitability']")
         self.assertIsNotNone(exploitability)
         self.assertEqual(exploitability.text, "NOT_TESTED")
+        verdict = script.find("elem[@key='verdict']")
+        remediation = script.find("elem[@key='remediation']")
+        verification = script.find("elem[@key='verification']")
+        self.assertIsNotNone(verdict)
+        self.assertIsNotNone(remediation)
+        self.assertIsNotNone(verification)
+        human = script.get("output", "")
+        self.assertTrue(human.startswith("\n" + verdict.text), human)
+        self.assertIn("PHP : ", human)
+        self.assertIn("Correctif : " + remediation.text, human)
+        self.assertIn("Verification : " + verification.text, human)
+        self.assertNotIn("detection_method:", human)
         return state.text, script, completed.stdout
 
     def test_vulnerable_version_header(self):
@@ -224,6 +246,44 @@ class NSEIntegration(unittest.TestCase):
             self.assertIn(VHOST, self.httpsd.sni_names)
             self.assertTrue(any(item["host"].split(":", 1)[0] == VHOST
                                 for item in self.httpsd.requests))
+
+    def test_service_detection_selects_http_on_an_arbitrary_port(self):
+        state, _, output = self.scan("/old", discover=True)
+        self.assertEqual(state, "POTENTIALLY_VULNERABLE")
+        service = ET.fromstring(output).find(".//port/service")
+        self.assertIsNotNone(service)
+        self.assertEqual(service.get("name"), "http")
+        self.assertEqual(service.get("method"), "probed")
+
+    def test_service_detection_selects_https_on_an_arbitrary_port(self):
+        if self.httpsd is None:
+            self.skipTest("openssl is required to create the local TLS fixture")
+        state, _, output = self.scan("/fixed", server=self.httpsd, discover=True)
+        self.assertEqual(state, "PATCHED_VERSION_ADVERTISED")
+        service = ET.fromstring(output).find(".//port/service")
+        self.assertIsNotNone(service)
+        self.assertEqual(service.get("name"), "http")
+        self.assertEqual(service.get("tunnel"), "ssl")
+        self.assertEqual(service.get("method"), "probed")
+
+    def test_domain_file_preserves_host_and_sni_without_vhost_override(self):
+        if self.httpsd is None:
+            self.skipTest("openssl is required to create the local TLS fixture")
+        targets_file = Path(self.temp.name) / "domains.txt"
+        # localhost resolves locally; no public DNS name or /etc/hosts edit.
+        targets_file.write_text("localhost\n", encoding="utf-8")
+        with self.httpsd.record_lock:
+            before = len(self.httpsd.requests)
+        state, _, _ = self.scan("/fixed", server=self.httpsd, discover=True,
+                                targets_file=targets_file)
+        self.assertEqual(state, "PATCHED_VERSION_ADVERTISED")
+        with self.httpsd.record_lock:
+            requests = [entry for entry in self.httpsd.requests[before:]
+                        if entry["path"] == "/fixed"]
+        self.assertTrue(requests, "The NSE GET was not received by the TLS fixture")
+        for entry in requests:
+            self.assertEqual(entry["host"], f"localhost:{self.httpsd.server_port}")
+            self.assertEqual(entry["sni"], "localhost", "SNI on the NSE GET connection")
 
     def test_large_response_keeps_header_evidence(self):
         self.assertEqual(self.scan("/large")[0], "PATCHED_VERSION_ADVERTISED")
