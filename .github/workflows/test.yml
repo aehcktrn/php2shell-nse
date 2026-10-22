@@ -1,4 +1,4 @@
-name: NSE tests
+name: PHP2Shell scanner tests
 
 on:
   push:

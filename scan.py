@@ -496,7 +496,7 @@ def bounded_int(low: int, high: int):
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     result.add_argument("targets", nargs="?", type=Path, help="Fichier de noms DNS exacts, un par ligne")
-    result.add_argument("--version", action="version", version=f"php2shell-nse {VERSION}")
+    result.add_argument("--version", action="version", version=f"php2shell-scanner {VERSION}")
     result.add_argument("--profile", choices=PROFILES, default="complet", help="Complet, rapide ou recontrole")
     result.add_argument("--scope", type=Path, help="Domaines autorises, sous-domaines inclus")
     result.add_argument("--discover-from", action="append", type=Path, default=[], help="Import local TXT/CSV/TSV/JSON, repetable; exige --scope")
