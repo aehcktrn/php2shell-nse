@@ -36,17 +36,19 @@ local function flatten(value, into)
   return table.concat(into, " ")
 end
 
-local function run(response, args, host, port)
+local function run(response, args, host, port, clock)
   local calls = {}
   local modules = {
     http = {
       get = function(request_host, request_port, path, options)
         calls[#calls + 1] = {host = request_host, port = request_port,
           path = path, options = options}
+        if type(response) == "function" then return response(path, #calls, request_host, options) end
         return response
       end,
     },
     shortport = {http = function() return true end},
+    nmap = {clock_ms = clock or function() return 1000 end},
     stdnse = {
       get_script_args = function(name) return (args or {})[name] end,
       output_table = function() return {} end,
@@ -383,6 +385,335 @@ for _, value in ipairs({"0", "-1", "60001", "1.5", "nan", "5s"}) do
     local result, calls = run(response("PHP/8.3.35"), {["http-php2shell.timeout"] = value})
     equal(result.state, "UNKNOWN")
     equal(#calls, 0)
+  end)
+end
+
+test("silent entry path falls back to index.php", function()
+  local result, calls = run(function(path)
+    return path == "/index.php" and response("PHP/8.3.35") or {status = 200, header = {}}
+  end)
+  equal(result.state, "POTENTIALLY_VULNERABLE")
+  equal(#calls, 2)
+  equal(calls[2].path, "/index.php")
+  equal(result.observations[1].reason_code, "PHP_NOT_IDENTIFIED")
+  equal(result.observations[2].reason_code, "AFFECTED_VERSION_ADVERTISED")
+end)
+
+test("explicit paths are all assessed and retain conflicting evidence", function()
+  local result, calls = run(function(path)
+    return response(path == "/legacy" and "PHP/8.3.35" or "PHP/8.3.36")
+  end, {["http-php2shell.paths"] = {"/legacy", "/legacy", "/"}})
+  equal(#calls, 2)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "CONFLICTING_VERSIONS")
+  equal(result.priority, "VERIFY_PRIORITY")
+  equal(result.evidence[1].path, "/")
+  equal(result.evidence[2].path, "/legacy")
+end)
+
+test("version evidence includes exact transport and request identity", function()
+  local result = run(response("PHP/8.3.36", {ssl = true}), nil,
+    {ip = "192.0.2.7", targetname = "app.example.test"}, {number = 8443, service = "https"})
+  local evidence = result.evidence[1]
+  equal(result.schema_version, "1")
+  equal(result.script_version, "0.3.0")
+  equal(result.vhost, "app.example.test")
+  equal(evidence.ip, "192.0.2.7")
+  equal(evidence.port, 8443)
+  equal(evidence.scheme, "https")
+  equal(evidence.http_host, "app.example.test:8443")
+  equal(evidence.tls_sni, "app.example.test")
+  equal(evidence.http_status, 200)
+  equal(evidence.request_number, 1)
+end)
+
+test("query values are used for requests but redacted in evidence", function()
+  local result, calls = run(response("PHP/8.3.36"), {["http-php2shell.path"] = "/index.php?token=QUERY_SECRET"})
+  equal(calls[1].path, "/index.php?token=QUERY_SECRET")
+  truthy(not flatten(result):find("QUERY_SECRET", 1, true))
+  equal(result.path, "/index.php?[redacted]")
+  equal(result.evidence[1].path, "/index.php?[redacted]")
+end)
+
+test("same-origin relative redirect is followed with IP Host and SNI preserved", function()
+  local result, calls = run(function(path)
+    if path == "/" then return {status = 302, header = {location = "/app/index.php"}} end
+    return response("PHP/8.5.12")
+  end)
+  equal(result.state, "PATCHED_VERSION_ADVERTISED")
+  equal(#calls, 2)
+  equal(calls[2].path, "/app/index.php")
+  equal(calls[2].host.ip, "127.0.0.1")
+  equal(calls[2].options.header.Host, "app.example.test")
+  equal(result.observations[1].redirect_followed, true)
+end)
+
+test("relative parent redirect is resolved against the current path", function()
+  local result, calls = run(function(path)
+    if path == "/app/start" then return {status = 302, header = {location = "../index.php"}} end
+    return response("PHP/8.5.12")
+  end, {["http-php2shell.path"] = "/app/start"})
+  equal(result.state, "PATCHED_VERSION_ADVERTISED")
+  equal(calls[2].path, "/index.php")
+end)
+
+test("absolute redirect accepts only the exact same origin", function()
+  local result, calls = run(function(path)
+    if path == "/" then return {status = 302, header = {location = "https://APP.EXAMPLE.TEST:443/fixed"}} end
+    return response("PHP/8.3.36")
+  end)
+  equal(result.state, "PATCHED_VERSION_ADVERTISED")
+  equal(calls[2].path, "/fixed")
+end)
+
+test("protocol relative same-origin redirect is allowed", function()
+  local result, calls = run(function(path)
+    if path == "/" then return {status = 302, header = {location = "//app.example.test/fixed"}} end
+    return response("PHP/8.3.36")
+  end)
+  equal(result.state, "PATCHED_VERSION_ADVERTISED")
+  equal(calls[2].path, "/fixed")
+end)
+
+local unsafe_redirects = {
+  "https://outside.example.test/fixed", "http://app.example.test/fixed",
+  "https://app.example.test:8443/fixed", "https://app.example.test.evil.test/fixed",
+  "https://app.example.test@evil.test/fixed", "file:///etc/passwd", "javascript:alert(1)",
+  "https://app.example.test:99999/fixed", "/bad\\path", "/bad\r\nX: hi",
+}
+for i, location in ipairs(unsafe_redirects) do
+  test("unsafe or foreign redirect never triggers a request #" .. i, function()
+    local result, calls = run(function(path)
+      if path == "/" then return {status = 302, header = {location = location}} end
+      return {status = 200, header = {}}
+    end)
+    equal(result.state, "UNKNOWN")
+    equal(#calls, 2)
+    equal(calls[2].path, "/index.php", "only the local fallback may be requested")
+    equal(result.observations[1].reason_code, "REDIRECT_NOT_ASSESSED")
+    equal(result.reason_code, "REDIRECT_NOT_ASSESSED", "a silent fallback must not hide the redirect cause")
+    equal(result.observations[1].redirect_followed, false)
+    for _, call in ipairs(calls) do equal(call.host.ip, "127.0.0.1") end
+  end)
+end
+
+test("redirect query values are redacted", function()
+  local result = run(function(path)
+    if path == "/" then return {status = 302, header = {location = "https://outside.example.test/path?token=REDIRECT_SECRET"}} end
+    return {status = 200, header = {}}
+  end)
+  truthy(not flatten(result):find("REDIRECT_SECRET", 1, true))
+  equal(result.observations[1].redirect_to, "https://outside.example.test/path?[redacted]")
+end)
+
+test("ambiguous duplicate Location headers are not followed", function()
+  local result, calls = run(function(path)
+    if path == "/" then return {status = 302,
+      rawheader = {"Location: /one", "Location: /two"}, header = {location = "/two"}} end
+    return {status = 200, header = {}}
+  end)
+  equal(calls[2].path, "/index.php")
+  equal(result.observations[1].redirect_followed, false)
+end)
+
+test("redirect limit bounds chains and preserves the stopped condition", function()
+  local result, calls = run(function(path)
+    return {status = 302, header = {location = path .. "next"}}
+  end, {["http-php2shell.redirects"] = 1, ["http-php2shell.max_requests"] = 4})
+  equal(#calls, 4)
+  equal(result.state, "UNKNOWN")
+  equal(result.observations[2].reason_code, "REDIRECT_LIMIT_REACHED")
+end)
+
+test("redirect loop does not repeat the same path in its chain", function()
+  local result, calls = run(function(path)
+    return {status = 302, header = {location = path}}
+  end)
+  equal(#calls, 2)
+  equal(result.observations[1].reason_code, "REDIRECT_LIMIT_REACHED")
+end)
+
+test("redirects may be explicitly disabled", function()
+  local result, calls = run(function(path)
+    if path == "/" then return {status = 302, header = {location = "/fixed"}} end
+    return {status = 200, header = {}}
+  end, {["http-php2shell.redirects"] = 0})
+  equal(#calls, 2)
+  equal(calls[2].path, "/index.php")
+  equal(result.observations[1].redirect_followed, false)
+end)
+
+for status, code in pairs({[401] = "AUTHENTICATION_REQUIRED", [403] = "HTTP_ACCESS_DENIED", [429] = "RATE_LIMITED"}) do
+  test("HTTP " .. status .. " yields an actionable cause and stops traversal", function()
+    local result, calls = run({status = status, header = {}}, {
+      ["http-php2shell.paths"] = {"/other"}, ["http-php2shell.samples"] = 3})
+    equal(result.state, "UNKNOWN")
+    equal(result.reason_code, code)
+    equal(#calls, 1)
+    truthy(type(result.next_action) == "string" and #result.next_action > 0)
+  end)
+end
+
+test("PHP version on a denied response remains evidence and traversal stops", function()
+  local result, calls = run(response("PHP/8.3.35", {status = 403}))
+  equal(result.state, "POTENTIALLY_VULNERABLE")
+  equal(result.observations[1].http_condition, "HTTP_ACCESS_DENIED")
+  equal(#calls, 1)
+  equal(result.traversal_complete, true)
+end)
+
+for status, code in pairs({[401] = "AUTHENTICATION_REQUIRED", [403] = "HTTP_ACCESS_DENIED", [429] = "RATE_LIMITED"}) do
+  test("a fixed banner cannot hide a later HTTP " .. status .. " path", function()
+    local result, calls = run(function(path)
+      return path == "/" and response("PHP/8.3.36") or {status = status, header = {}}
+    end, {["http-php2shell.paths"] = {"/legacy", "/remaining"}})
+    equal(#calls, 2)
+    equal(result.state, "UNKNOWN")
+    equal(result.reason_code, code)
+    equal(result.traversal_complete, false)
+    equal(result.traversal_reason_code, code)
+    truthy(contains(result.versions, "8.3.36"))
+  end)
+end
+
+test("a fixed banner cannot hide a network failure on the final requested path", function()
+  local result, calls = run(function(path)
+    if path == "/" then return response("PHP/8.3.36") end
+    return nil
+  end, {["http-php2shell.paths"] = {"/legacy"}})
+  equal(#calls, 2)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "NO_HTTP_RESPONSE")
+  equal(result.traversal_complete, false)
+  truthy(contains(result.versions, "8.3.36"))
+end)
+
+test("a version-bearing denied response cannot stand in for another requested path", function()
+  local result, calls = run(response("PHP/8.3.35", {status = 403}), {
+    ["http-php2shell.paths"] = {"/remaining"}})
+  equal(#calls, 1)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "HTTP_ACCESS_DENIED")
+  equal(result.traversal_complete, false)
+  equal(result.priority, "VERIFY_PRIORITY")
+  truthy(contains(result.versions, "8.3.35"))
+end)
+
+test("a fixed banner followed by rate limiting cannot hide skipped samples", function()
+  local result, calls = run(function(_, number)
+    return number == 1 and response("PHP/8.3.36") or {status = 429, header = {}}
+  end, {["http-php2shell.samples"] = 3})
+  equal(#calls, 2)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "RATE_LIMITED")
+  equal(result.traversal_complete, false)
+end)
+
+test("a version-bearing denied sample cannot hide the remaining sample", function()
+  local result, calls = run(function(_, number)
+    return response("PHP/8.3.36", {status = number == 1 and 200 or 403})
+  end, {["http-php2shell.samples"] = 3})
+  equal(#calls, 2)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "HTTP_ACCESS_DENIED")
+  equal(result.traversal_complete, false)
+end)
+
+test("suspicious evidence keeps its priority after a later network failure", function()
+  local result = run(function(path)
+    if path == "/" then return response("PHP/8.3.35") end
+    return nil
+  end, {["http-php2shell.paths"] = {"/legacy"}})
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "NO_HTTP_RESPONSE")
+  equal(result.priority, "VERIFY_PRIORITY")
+  equal(result.potentially_vulnerable_evidence, true)
+end)
+
+test("sampling exposes alternating versions without discarding the suspect one", function()
+  local result, calls = run(function(_, index)
+    return response(index % 2 == 0 and "PHP/8.3.35" or "PHP/8.3.36")
+  end, {["http-php2shell.samples"] = 3})
+  equal(#calls, 3)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "CONFLICTING_VERSIONS")
+  equal(result.priority, "VERIFY_PRIORITY")
+  equal(result.observations[3].sample, 3)
+  truthy(flatten(result.notes):find("all backends", 1, true))
+end)
+
+test("sample count does not extend request cap", function()
+  local result, calls = run(response("PHP/8.3.36"), {
+    ["http-php2shell.samples"] = 3, ["http-php2shell.max_requests"] = 2})
+  equal(#calls, 2)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "REQUEST_BUDGET_EXHAUSTED")
+  equal(result.budget_exhausted, true)
+end)
+
+test("request cap does not flag a fully completed one-request assessment", function()
+  local result, calls = run(response("PHP/8.3.36"), {["http-php2shell.max_requests"] = 1})
+  equal(#calls, 1)
+  equal(result.state, "PATCHED_VERSION_ADVERTISED")
+  equal(result.budget_exhausted, false)
+end)
+
+test("a budget bounds socket timeout and prevents a second request", function()
+  local now = 1000
+  local result, calls = run(function()
+    now = 1600
+    return {status = 200, header = {}}
+  end, {["http-php2shell.budget"] = 500}, nil, nil, function() return now end)
+  equal(#calls, 1)
+  equal(calls[1].options.timeout, 500)
+  equal(result.elapsed_ms, 600)
+  equal(result.reason_code, "REQUEST_BUDGET_EXHAUSTED")
+end)
+
+test("clock regression stops traversal conservatively", function()
+  local now = 1000
+  local result, calls = run(function()
+    now = 900
+    return {status = 200, header = {}}
+  end, nil, nil, nil, function() return now end)
+  equal(#calls, 1)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "CLOCK_CHANGED")
+end)
+
+test("a suspect version is retained when the request budget prevents completion", function()
+  local result, calls = run(response("PHP/8.3.35"), {
+    ["http-php2shell.max_requests"] = 1, ["http-php2shell.paths"] = {"/other"}})
+  equal(#calls, 1)
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "REQUEST_BUDGET_EXHAUSTED")
+  equal(result.priority, "VERIFY_PRIORITY")
+  truthy(contains(result.versions, "8.3.35"))
+end)
+
+test("IP targets do not invent a TLS server name", function()
+  local result, calls = run(response("PHP/8.3.36", {ssl = true}), nil,
+    {ip = "2001:db8::1"}, {number = 8443, service = "https"})
+  equal(result.vhost, "2001:db8::1")
+  equal(result.http_host, "[2001:db8::1]:8443")
+  equal(result.tls_sni, "")
+  equal(calls[1].host.ip, "2001:db8::1")
+end)
+
+for _, spec in ipairs({{"budget", 0}, {"budget", 60001}, {"max_requests", 0},
+    {"max_requests", 21}, {"redirects", -1}, {"redirects", 6}, {"samples", 0}, {"samples", 4}}) do
+  test("invalid " .. spec[1] .. " limit " .. spec[2] .. " is rejected before HTTP", function()
+    local result, calls = run(response("PHP/8.3.36"), {["http-php2shell." .. spec[1]] = spec[2]})
+    equal(#calls, 0)
+    equal(result.reason_code, "INVALID_ARGUMENT")
+  end)
+end
+
+for i, value in ipairs({"/one,/two", {"/ok", "//outside.example"}, {named = "/ok"}, {true}, {"/a b"}}) do
+  test("invalid path array rejected before HTTP #" .. i, function()
+    local result, calls = run(response("PHP/8.3.36"), {["http-php2shell.paths"] = value})
+    equal(#calls, 0)
+    equal(result.reason_code, "INVALID_ARGUMENT")
   end)
 end
 

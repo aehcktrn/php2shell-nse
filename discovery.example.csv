@@ -1,0 +1,7 @@
+hostname,type,value
+application.example.com,A,192.0.2.10
+api.example.org,AAAA,2001:db8::10
+portail.example.com,CNAME,front.example.com
+archive.example.com,A,192.0.2.20
+service.sandbox.example.com,A,192.0.2.30
+outside.example.net,A,198.51.100.10

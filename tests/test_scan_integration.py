@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Run the campaign CLI end to end against synthetic loopback services only.
+
+Run explicitly with: python3 tests/test_scan_integration.py
+NMAP and NMAP_DATADIR select the real Nmap executable and its data directory.
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+import csv
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+
+from integration import LocalServer
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class ScanCLIIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.nmap = os.environ.get("NMAP") or shutil.which("nmap")
+        if not cls.nmap or not Path(cls.nmap).is_file():
+            raise RuntimeError("Install Nmap or set NMAP=/path/to/nmap")
+        if not (ROOT / "scan.py").is_file():
+            raise RuntimeError("Missing campaign CLI: scan.py")
+        cls.temp = tempfile.TemporaryDirectory(prefix="php2shell-campaign-integration-")
+        cls.base = Path(cls.temp.name)
+        cls.counter = 0
+        cls.tls_context = None
+        openssl = shutil.which("openssl")
+        if openssl:
+            cert, key = cls.base / "fixture.crt", cls.base / "fixture.key"
+            subprocess.run(
+                [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                 "-subj", "/CN=localhost", "-keyout", str(key), "-out", str(cert)],
+                check=True, capture_output=True, timeout=20,
+            )
+            cls.tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            cls.tls_context.load_cert_chain(cert, key)
+
+            def capture_sni(tls_socket, server_name, _context):
+                tls_socket._test_sni = server_name
+
+            cls.tls_context.set_servername_callback(capture_sni)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    @contextmanager
+    def serve(self, *, tls=False):
+        server = LocalServer()
+        if tls:
+            server.socket = self.tls_context.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield server
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def run_campaign(self, port, *extra_args):
+        type(self).counter += 1
+        run = self.base / f"input-{self.counter}"
+        run.mkdir()
+        targets = run / "targets.txt"
+        targets.write_text("# Local synthetic fixture only\nlocalhost\n", encoding="utf-8")
+        paths = run / "paths.txt"
+        paths.write_text("/old\n", encoding="utf-8")
+        output = self.base / f"campaign-{self.counter}"
+        command = [
+            sys.executable, str(ROOT / "scan.py"), str(targets),
+            "--profile", "rapide", "--ports", str(port),
+            "--families", "ipv4", "--workers", "1", "--target-timeout", "60",
+            "--paths-file", str(paths), "--output", str(output),
+            "--nmap", self.nmap, *extra_args,
+        ]
+        completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=90)
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+        self.assertTrue((output / "manifest.json").is_file(), completed.stdout)
+        return output, json.loads((output / "manifest.json").read_text()), completed
+
+    def assert_report_matches_manifest(self, output, manifest, port):
+        self.assertEqual(manifest["status"], "COMPLETED")
+        self.assertEqual(len(manifest["targets"]), 1)
+        target = manifest["targets"][0]
+        self.assertEqual(target["hostname"], "localhost")
+        self.assertEqual(target["dns_status"], "RESOLVED")
+        self.assertEqual(target["addresses"], ["127.0.0.1"])
+        self.assertEqual(len(target["endpoints"]), 1)
+        endpoint = target["endpoints"][0]
+        self.assertEqual(endpoint["ip"], "127.0.0.1")
+        self.assertEqual(endpoint["status"], "COMPLETED")
+        self.assertTrue((output / endpoint["xml"]).is_file())
+        report = json.loads((output / "report.json").read_text())
+        rows = [row for row in report["rows"] if row["row_type"] == "ASSESSMENT"]
+        self.assertEqual(len(rows), 1, report)
+        row = rows[0]
+        self.assertEqual(row["hostname"], "localhost")
+        self.assertEqual(row["ip"], "127.0.0.1")
+        self.assertEqual(str(row["port"]), str(port))
+        self.assertEqual(row["state"], "POTENTIALLY_VULNERABLE")
+        self.assertIn("8.3.35", row["versions"])
+        self.assertTrue(row["reason_code"])
+        with (output / "report.csv").open(newline="", encoding="utf-8") as stream:
+            csv_rows = list(csv.DictReader(stream))
+        self.assertEqual(len(csv_rows), len(report["rows"]))
+        self.assertEqual(csv_rows[0]["hostname"], "localhost")
+        self.assertTrue((output / "changes.csv").is_file())
+        return report, row
+
+    def test_http_campaign_then_disappearance_never_means_patched(self):
+        with self.serve() as server:
+            port = server.server_port
+            output, manifest, _ = self.run_campaign(port)
+            self.assert_report_matches_manifest(output, manifest, port)
+            with server.record_lock:
+                requests = [item for item in server.requests if item["path"] == "/old"]
+            self.assertTrue(requests)
+            self.assertTrue(all(item["host"] == f"localhost:{port}" for item in requests))
+        # The listener is now closed. The same name/IP/port is scanned again.
+        second, second_manifest, _ = self.run_campaign(port, "--previous", str(output / "report.json"))
+        self.assertEqual(second_manifest["status"], "COMPLETED")
+        report = json.loads((second / "report.json").read_text())
+        self.assertTrue(report["rows"], "A closed service must remain represented in coverage")
+        self.assertTrue(all(row["state"] != "PATCHED_VERSION_ADVERTISED" for row in report["rows"]))
+        self.assertFalse(any(row.get("inventory_patch_status") == "PATCH_CONFIRMED" for row in report["rows"]))
+        self.assertTrue(report["changes"], "The previous service must appear in the comparison")
+        self.assertIn("NO_LONGER_OBSERVED", json.dumps(report["changes"]))
+
+    def test_tls_campaign_preserves_sni_and_separate_inventory_proof(self):
+        if self.tls_context is None:
+            self.skipTest("openssl is required for the local TLS fixture")
+        with self.serve(tls=True) as server:
+            port = server.server_port
+            inventory = self.base / "runtime-proof.json"
+            inventory.write_text(json.dumps({
+                "schema_version": "1",
+                "records": [{
+                    "hostname": "localhost", "port": port, "scheme": "https", "ip": "127.0.0.1",
+                    "authenticated": True, "source": "synthetic authenticated inventory",
+                    "evidence_reference": "fixture://package-and-active-worker-proof",
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                    "covers_all_backends": True,
+                    "instances": [{
+                        "id": "synthetic-web-worker", "runtime": "php-fpm", "version": "8.3.35",
+                        "package": "synthetic-php-with-vendor-backports", "active_runtime_verified": True,
+                        "cves": {"CVE-2026-109618": "fixed", "CVE-2026-109619": "fixed"},
+                    }],
+                }],
+            }), encoding="utf-8")
+            output, manifest, _ = self.run_campaign(port, "--inventory", str(inventory))
+            _, row = self.assert_report_matches_manifest(output, manifest, port)
+            self.assertEqual(row["inventory_patch_status"], "PATCH_CONFIRMED")
+            # The inventory backport proof does not overwrite the observed old banner.
+            self.assertEqual(row["state"], "POTENTIALLY_VULNERABLE")
+            with server.record_lock:
+                requests = [item for item in server.requests if item["path"] == "/old"]
+            self.assertTrue(requests)
+            for item in requests:
+                self.assertEqual(item["host"], f"localhost:{port}")
+                self.assertEqual(item["sni"], "localhost")
+
+    def test_dry_run_resolves_and_writes_plan_without_contacting_http(self):
+        with self.serve() as server:
+            output, manifest, _ = self.run_campaign(server.server_port, "--dry-run")
+            self.assertEqual(manifest["status"], "PLANNED")
+            self.assertEqual(manifest["targets"][0]["hostname"], "localhost")
+            self.assertEqual(manifest["targets"][0]["addresses"], ["127.0.0.1"])
+            self.assertFalse((output / "report.json").exists())
+            with server.record_lock:
+                self.assertEqual(server.requests, [])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

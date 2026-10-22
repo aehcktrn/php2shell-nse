@@ -5,6 +5,11 @@ scan-results/
 results/
 /perimetre.txt
 /domaines.txt
+/scopes.txt
+/exclusions.txt
+/paths.txt
+/runtime-inventory.json
+/discovery.csv
 /php2shell.nmap
 /php2shell.gnmap
 /php2shell.xml

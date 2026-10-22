@@ -1,0 +1,6 @@
+# Copier vers exclusions.txt et adapter les exemples au perimetre.
+# Un nom exact exclut seulement ce nom.
+archive.example.com
+# *.zone exclut ses sous-domaines, pas la zone elle-meme.
+*.sandbox.example.com
+# Ajouter aussi sandbox.example.com pour exclure le nom de la zone.

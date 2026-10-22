@@ -1,0 +1,6 @@
+# Copier vers scopes.txt et remplacer les domaines reserves ci-dessous.
+# Un domaine autorise par ligne : le nom et ses sous-domaines sont inclus.
+# Ce fichier filtre les cibles ; il ne decouvre pas les sous-domaines a lui seul.
+# Obligatoire avec --discover-from. La propriete est declaree par l'operateur.
+example.com
+example.org

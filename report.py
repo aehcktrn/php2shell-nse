@@ -9,18 +9,27 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import csv
+from datetime import datetime, timezone
+import hashlib
+import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unicodedata
 import xml.etree.ElementTree as ET
+from typing import Any
+
+from runtime_inventory import InventoryError, assess_runtime, load_inventory
 
 
 FIELDS = (
     "row_type", "ip", "hostname", "port", "protocol", "service", "state",
     "verdict", "versions", "fixed_versions", "priority", "remediation",
-    "verification", "http_status", "reason",
+    "verification", "http_status", "reason", "reason_code", "next_action",
+    "php_detected", "path", "scheme", "http_host", "tls_sni", "requests_made",
+    "observed_at", "campaign_id", "source_xml", "inventory_patch_status",
+    "inventory_source", "inventory_observed_at", "inventory_reason", "address_family", "scan_ports",
 )
 SCRIPT_ID = "http-php2shell"
 STATES = ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED", "UNKNOWN")
@@ -103,7 +112,43 @@ def _port_identity(port: ET.Element) -> dict[str, str]:
             "protocol": port.get("protocol", ""), "service": name}
 
 
-def _assessment(script: ET.Element) -> dict[str, str]:
+def _details(parent: ET.Element, key: str) -> list[dict[str, Any]]:
+    """Decode bounded structured NSE tables without saving response bodies."""
+    tables = [item for item in parent if item.get("key") == key]
+    if not tables:
+        return []
+    if len(tables) != 1 or tables[0].tag != "table":
+        raise ValueError("invalid structured details")
+    count = 0
+    def decode(node: ET.Element, depth: int = 0) -> Any:
+        nonlocal count
+        count += 1
+        if count > 10000 or depth > 12:
+            raise ValueError("structured evidence limits exceeded")
+        if node.tag == "elem" and not len(node):
+            return node.text or ""
+        if node.tag != "table":
+            raise ValueError("invalid structured detail element")
+        if not len(node):
+            return []
+        keyed = [child.get("key") is not None for child in node]
+        if all(keyed):
+            result = {}
+            for child in node:
+                if child.get("key") in result:
+                    raise ValueError("duplicate structured detail key")
+                result[child.get("key")] = decode(child, depth + 1)
+            return result
+        if any(keyed):
+            raise ValueError("mixed structured detail keys")
+        return [decode(child, depth + 1) for child in node]
+    decoded = decode(tables[0])
+    if not isinstance(decoded, list) or any(not isinstance(item, dict) for item in decoded):
+        raise ValueError("structured detail list expected")
+    return decoded
+
+
+def _assessment(script: ET.Element) -> dict[str, Any]:
     if _scalar(script, "error"):
         raise ValueError("script reported an error")
     state = _scalar(script, "state")
@@ -140,6 +185,21 @@ def _assessment(script: ET.Element) -> dict[str, str]:
         "priority": priority, "remediation": remediation,
         "verification": _scalar(script, "verification") or VERIFY_RUNTIME,
         "http_status": _scalar(script, "http_status"), "reason": reason,
+        "reason_code": _scalar(script, "reason_code"),
+        "next_action": _scalar(script, "next_action") or _scalar(script, "verification") or VERIFY_RUNTIME,
+        "php_detected": _scalar(script, "php_detected", "UNKNOWN"),
+        "path": _scalar(script, "path"), "scheme": _scalar(script, "scheme"),
+        "http_host": _scalar(script, "http_host"), "tls_sni": _scalar(script, "tls_sni"),
+        "requests_made": _scalar(script, "requests_made"),
+        "elapsed_ms": _scalar(script, "elapsed_ms"),
+        "budget_exhausted": _scalar(script, "budget_exhausted"),
+        "traversal_complete": _scalar(script, "traversal_complete"),
+        "traversal_reason_code": _scalar(script, "traversal_reason_code"),
+        "script_version": _scalar(script, "script_version"),
+        "evidence": _details(script, "evidence"),
+        "observations": _details(script, "observations"),
+        "notes": _array(script, "notes"),
+        "exploitability": "NOT_TESTED", "potentially_vulnerable_evidence": suspect,
     }
     vhost = _scalar(script, "vhost")
     if vhost:
@@ -149,7 +209,7 @@ def _assessment(script: ET.Element) -> dict[str, str]:
     return values
 
 
-def _coverage(reason: str) -> dict[str, str]:
+def _coverage(reason: str, reason_code: str = "SERVICE_NOT_ASSESSED") -> dict[str, str]:
     return {
         "row_type": "COVERAGE", "state": "NOT_ASSESSED",
         "verdict": "ABSENCE D'EVALUATION PHP2SHELL", "priority": "REVIEW_COVERAGE",
@@ -158,11 +218,11 @@ def _coverage(reason: str) -> dict[str, str]:
             "Cette ligne ne prouve ni presence de PHP, ni vulnerabilite, ni correction. "
             "Un service non web peut normalement ne pas etre evalue par ce NSE."
         ),
-        "reason": reason,
+        "reason": reason, "reason_code": reason_code, "php_detected": "UNKNOWN",
     }
 
 
-def parse_report(source: Path) -> list[dict[str, str]]:
+def parse_report(source: Path) -> list[dict[str, Any]]:
     """Read a completed XML scan and retain assessments plus coverage gaps."""
     try:
         root = ET.parse(source).getroot()
@@ -176,6 +236,11 @@ def parse_report(source: Path) -> list[dict[str, str]]:
             "Scan incomplet ou termine en erreur: runstats/finished exit=success requis. "
             "Aucun rapport de couverture complet ne peut etre produit."
         )
+    observed_at = ""
+    try:
+        observed_at = datetime.fromtimestamp(int(finished[0].get("time", "")), timezone.utc).isoformat()
+    except (ValueError, OverflowError, OSError):
+        pass
     rows = []
     for host in root.findall("host"):
         host_identity = _host_identity(host)
@@ -196,7 +261,11 @@ def parse_report(source: Path) -> list[dict[str, str]]:
                     values = _coverage(
                         "Resultat http-php2shell invalide ou en erreur; evaluation indisponible."
                     )
-            rows.append({**host_identity, **_port_identity(port), **values})
+            row = {**host_identity, **_port_identity(port), **values,
+                   "observed_at": observed_at, "source_xml": str(source)}
+            if not row.get("scheme") and row["row_type"] == "ASSESSMENT":
+                row["scheme"] = "https" if row["service"].startswith("ssl/") or row["service"] == "https" else "http"
+            rows.append(row)
         if len(rows) == before:
             host_status = host.find("status")
             status = host_status.get("state", "unknown") if host_status is not None else "unknown"
@@ -204,7 +273,8 @@ def parse_report(source: Path) -> list[dict[str, str]]:
                 "Aucun port TCP ouvert represente; statut Nmap de l'hote: " + status
                 + ". Un hote filtre, non joignable ou non teste n'est pas declare corrige."
             )
-            rows.append({**host_identity, **_coverage(reason)})
+            rows.append({**host_identity, **_coverage(reason, "NO_OPEN_TCP_PORT"),
+                         "observed_at": observed_at, "source_xml": str(source)})
     return rows
 
 
@@ -244,6 +314,265 @@ def write_report(rows: list[dict[str, str]], destination: Path, source: Path) ->
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+CHANGE_FIELDS = ("change", "hostname", "ip", "port", "protocol", "path", "previous_state",
+                 "current_state", "previous_versions", "current_versions", "previous_inventory_patch_status",
+                 "current_inventory_patch_status", "reason")
+
+
+def _atomic_text(destination: Path, write) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", prefix=".php2shell-",
+                                         suffix=".tmp", dir=destination.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            write(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _write_csv(rows: list[dict[str, Any]], destination: Path, fields: tuple[str, ...]) -> None:
+    def write(stream):
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: safe_cell(row.get(key, "")) for key in fields})
+    _atomic_text(destination, write)
+
+
+def _report_key(row: dict[str, Any]) -> tuple[str, ...]:
+    # A campaign evaluates a service with a set of paths. A changed observed
+    # path is itself compared; it must not make the old service disappear.
+    return tuple(str(row.get(key, "")) for key in ("hostname", "ip", "port", "protocol"))
+
+
+def compare_reports(current: dict[str, Any], previous: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compare observed services; missing observations never imply correction."""
+    if not isinstance(previous, dict) or str(previous.get("schema_version")) != "1" \
+            or not isinstance(previous.get("rows"), list):
+        raise ReportError("Rapport precedent invalide: schema_version='1' et rows=[...] requis.")
+    if any(not isinstance(row, dict) for row in previous["rows"]):
+        raise ReportError("Lignes du rapport precedent invalides.")
+    def index(rows):
+        output = {}
+        for row in rows:
+            if not row.get("port"):
+                continue
+            key = _report_key(row)
+            if key in output:
+                raise ReportError("Plusieurs lignes pour le meme service dans une comparaison.")
+            output[key] = row
+        return output
+    old, new = index(previous["rows"]), index(current["rows"])
+    compared = ("row_type", "state", "versions", "reason_code", "path", "scheme", "php_detected",
+                "inventory_patch_status")
+    changes = []
+    for key in sorted(old.keys() | new.keys()):
+        before, after = old.get(key), new.get(key)
+        identity = after or before
+        change = {field: identity.get(field, "") for field in ("hostname", "ip", "port", "protocol", "path")}
+        if before is None:
+            change.update(change="NEW", reason="Service nouvellement represente dans cette campagne.")
+        elif after is None:
+            change.update(change="NO_LONGER_OBSERVED",
+                          reason="Service absent des observations courantes; disparition ou couverture differente, correction non etablie.")
+        elif all(before.get(field, "") == after.get(field, "") for field in compared):
+            change.update(change="UNCHANGED", reason="Etat et preuves comparees inchanges.")
+        else:
+            change.update(change="CHANGED", reason="Etat, version, contexte de mesure ou preuve serveur modifies.")
+        change.update(previous_state=(before or {}).get("state", ""), current_state=(after or {}).get("state", ""),
+                      previous_versions=(before or {}).get("versions", ""), current_versions=(after or {}).get("versions", ""),
+                      previous_inventory_patch_status=(before or {}).get("inventory_patch_status", ""),
+                      current_inventory_patch_status=(after or {}).get("inventory_patch_status", ""))
+        changes.append(change)
+    return changes
+
+
+def _safe_xml_path(base_dir: Path, value: object) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ReportError("Chemin XML absent du manifeste.")
+    candidate = (base_dir / value).resolve()
+    if not candidate.is_relative_to(base_dir.resolve()):
+        raise ReportError("Le XML doit rester dans le repertoire de campagne.")
+    return candidate
+
+
+def _campaign_coverage(hostname: str, endpoint: dict[str, Any] | None, reason: str,
+                       code: str, campaign_id: str, observed_at: str) -> dict[str, Any]:
+    endpoint = endpoint or {}
+    return {"hostname": hostname, "ip": endpoint.get("ip", ""), **_coverage(reason, code),
+            "campaign_id": campaign_id, "observed_at": observed_at,
+            "source_xml": endpoint.get("xml", ""), "scan_status": endpoint.get("status", ""),
+            "address_family": endpoint.get("family", ""), "scan_ports": endpoint.get("ports", "")}
+
+
+def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None = None,
+                          previous: Path | None = None, max_inventory_age_hours: float = 24) -> dict:
+    """Reconcile every requested name with endpoint results and local evidence.
+
+    Only successful, completed XML is admitted as assessment evidence. Missing
+    or failed records are represented by explicit coverage rows. Inventory
+    conclusions are separate from the network state and conditional on supplied
+    evidence; no network connection is made by this function.
+    """
+    if not isinstance(manifest, dict) or str(manifest.get("schema_version")) != "1" \
+            or not isinstance(manifest.get("targets"), list):
+        raise ReportError("Manifeste invalide: schema_version='1' et targets=[...] requis.")
+    base_dir = Path(base_dir)
+    campaign_id = str(manifest.get("campaign_id", ""))
+    observed_at = str(manifest.get("finished_at") or manifest.get("started_at") or "")
+    try:
+        # Freshness is judged at report generation, not an arbitrary historical
+        # manifest date; an old scan cannot make an old runtime proof current.
+        now = datetime.now(timezone.utc)
+        inventory_data = load_inventory(Path(inventory)) if inventory is not None else None
+        assess_runtime({}, None, now=now, max_age_hours=max_inventory_age_hours)
+    except InventoryError as exc:
+        raise ReportError(str(exc)) from exc
+    rows, attempted_names, evaluated_names = [], set(), set()
+    endpoint_count = attempted_count = completed_count = 0
+    processing_complete = True
+    seen_names = set()
+    for target in manifest["targets"]:
+        if not isinstance(target, dict) or not isinstance(target.get("hostname"), str) \
+                or not target["hostname"] or not isinstance(target.get("endpoints", []), list):
+            raise ReportError("Cible du manifeste invalide.")
+        name = target["hostname"]
+        if name in seen_names:
+            raise ReportError("Nom de cible duplique dans le manifeste.")
+        seen_names.add(name)
+        endpoints = target.get("endpoints", [])
+        if not endpoints:
+            code = "DNS_ERROR" if target.get("dns_status") == "DNS_ERROR" else (
+                "NO_DNS_ADDRESS" if target.get("dns_status") == "NO_ADDRESS" else "TARGET_NOT_ATTEMPTED")
+            reason = target.get("dns_error") or "Aucune adresse du domaine n'a ete evaluee."
+            rows.append(_campaign_coverage(name, None, str(reason), code, campaign_id, observed_at))
+            processing_complete = False
+            continue
+        # One failed DNS family must remain visible even when the other family
+        # resolved successfully. NO_ADDRESS is a normal lack of A/AAAA records.
+        families = target.get("dns_families", {})
+        if not isinstance(families, dict):
+            raise ReportError("Resultats DNS par famille invalides.")
+        if target.get("dns_status") == "RESOLVED":
+            for family, dns in families.items():
+                if isinstance(dns, dict) and dns.get("status") in ("ERROR", "TIMEOUT"):
+                    detail = str(dns.get("error") or dns["status"])
+                    rows.append(_campaign_coverage(name, {"family": family},
+                                "Resolution DNS " + str(family) + " indisponible: " + detail,
+                                "DNS_FAMILY_ERROR", campaign_id, observed_at))
+                    processing_complete = False
+        declared_addresses = target.get("addresses", [])
+        if not isinstance(declared_addresses, list) or any(not isinstance(ip, str) for ip in declared_addresses):
+            raise ReportError("Liste d'adresses du manifeste invalide.")
+        endpoint_ips = [endpoint.get("ip") for endpoint in endpoints if isinstance(endpoint, dict)]
+        for missing_ip in dict.fromkeys(ip for ip in declared_addresses if ip not in endpoint_ips):
+            rows.append(_campaign_coverage(name, {"ip": missing_ip},
+                        "Adresse resolue absente des executions planifiees.", "ADDRESS_NOT_ATTEMPTED", campaign_id, observed_at))
+            processing_complete = False
+        for endpoint in endpoints:
+            if not isinstance(endpoint, dict) or not isinstance(endpoint.get("ip"), str):
+                raise ReportError("Adresse du manifeste invalide.")
+            endpoint_count += 1
+            status = endpoint.get("status", "PLANNED")
+            if status in ("RUNNING", "COMPLETED", "FAILED", "TIMEOUT"):
+                attempted_names.add(name)
+                attempted_count += 1
+            stamp = str(endpoint.get("finished_at") or observed_at)
+            if status != "COMPLETED" or endpoint.get("returncode", 0) != 0:
+                code = {"TIMEOUT": "SCAN_TIMEOUT", "FAILED": "SCAN_FAILED", "RUNNING": "SCAN_INCOMPLETE",
+                        "SKIPPED": "SCAN_SKIPPED"}.get(status, "SCAN_NOT_ATTEMPTED")
+                rows.append(_campaign_coverage(name, endpoint, str(endpoint.get("error") or
+                          "Execution de scan non terminee avec succes."), code, campaign_id, stamp))
+                processing_complete = False
+                continue
+            try:
+                xml = _safe_xml_path(base_dir, endpoint.get("xml"))
+                parsed = parse_report(xml)
+                # Each runner job targets one fixed IP and one Host/SNI. Reject
+                # foreign records instead of silently attaching them to a name.
+                foreign = [row for row in parsed if row.get("ip") != endpoint["ip"]]
+                if foreign:
+                    raise ReportError("Le XML contient une adresse differente de la cible du manifeste.")
+                for row in parsed:
+                    if row["row_type"] == "ASSESSMENT" and row.get("hostname") not in ("", name, endpoint["ip"]):
+                        raise ReportError("Le XML annonce un hote virtuel different du manifeste.")
+            except ReportError as exc:
+                rows.append(_campaign_coverage(name, endpoint, str(exc), "INVALID_SCAN_XML", campaign_id, stamp))
+                processing_complete = False
+                continue
+            completed_count += 1
+            if not parsed:
+                rows.append(_campaign_coverage(name, endpoint, "Le XML ne contient aucun enregistrement de la cible attendue.",
+                                               "TARGET_MISSING_FROM_XML", campaign_id, stamp))
+                processing_complete = False
+                continue
+            for row in parsed:
+                row.update(hostname=name, campaign_id=campaign_id, observed_at=row.get("observed_at") or stamp,
+                           source_xml=str(endpoint["xml"]), scan_status=status, target_sources=target.get("sources", []),
+                           address_family=endpoint.get("family", ""), scan_ports=endpoint.get("ports", ""))
+                if row["row_type"] == "ASSESSMENT":
+                    evaluated_names.add(name)
+                rows.append(row)
+    for row in rows:
+        try:
+            row.update(assess_runtime(row, inventory_data, now=now, max_age_hours=max_inventory_age_hours))
+        except InventoryError as exc:
+            raise ReportError(str(exc)) from exc
+    counts = Counter(row["state"] for row in rows if row["row_type"] == "ASSESSMENT")
+    runtime_counts = Counter(row["inventory_patch_status"] for row in rows if row.get("port"))
+    targets = manifest["targets"]
+    summary = {
+        "targets_total": len(targets), "targets_resolved": sum(target.get("dns_status") == "RESOLVED" for target in targets),
+        "targets_attempted": len(attempted_names), "targets_evaluated": len(evaluated_names),
+        "endpoints_total": endpoint_count, "endpoints_attempted": attempted_count, "endpoints_completed": completed_count,
+        "assessments": sum(counts.values()), "assessment_counts": dict(counts),
+        "coverage_rows": sum(row["row_type"] == "COVERAGE" for row in rows),
+        "inventory_counts": dict(runtime_counts), "processing_complete": processing_complete and manifest.get("status") == "COMPLETED",
+        "excluded_candidates": len(manifest.get("excluded_candidates", [])),
+    }
+    result = {"schema_version": "1", "tool_version": "0.3.0",
+              "campaign": {key: manifest.get(key) for key in ("campaign_id", "started_at", "finished_at", "status", "profile", "ports", "address_families", "http", "limits", "scope")},
+              "generated_at": now.isoformat(), "summary": summary, "rows": rows, "changes": [],
+              "excluded_candidates": manifest.get("excluded_candidates", []),
+              "limitations": [
+                  "La couverture concerne les noms, adresses et ports explicitement traites; elle ne prouve pas l'inventaire des backends.",
+                  "Une absence d'evaluation ou de signal reseau ne confirme pas l'application du correctif.",
+                  "Les preuves serveur importees restent des attestations dont l'authenticite et l'exhaustivite sont a valider par l'operateur.",
+              ]}
+    if inventory_data:
+        result["inventory"] = {key: inventory_data[key] for key in ("filename", "sha256", "trust_note")}
+        result["inventory"]["max_age_hours"] = max_inventory_age_hours
+    if previous is not None:
+        try:
+            raw = Path(previous).read_bytes()
+            if len(raw) > 128 * 1024 * 1024:
+                raise ReportError("Rapport precedent trop volumineux.")
+            old = json.loads(raw)
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise ReportError(f"Rapport precedent JSON illisible: {exc}") from exc
+        result["changes"] = compare_reports(result, old)
+        result["comparison"] = {"filename": Path(previous).name, "sha256": hashlib.sha256(raw).hexdigest(),
+                                "previous_campaign": old.get("campaign", {}),
+                                "counts": dict(Counter(item["change"] for item in result["changes"]))}
+    return result
+
+
+def write_campaign_report(report: dict, output_dir: Path) -> None:
+    """Write each artifact atomically; publish JSON last as completion marker."""
+    output_dir = Path(output_dir)
+    # Validate serialization before touching an existing report.
+    rendered = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    _write_csv(report["rows"], output_dir / "report.csv", FIELDS)
+    _write_csv(report.get("changes", []), output_dir / "changes.csv", CHANGE_FIELDS)
+    _atomic_text(output_dir / "report.json", lambda stream: stream.write(rendered))
 
 
 def main(argv: list[str] | None = None) -> int:

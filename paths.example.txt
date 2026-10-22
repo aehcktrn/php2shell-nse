@@ -1,0 +1,7 @@
+# Copier vers paths.txt et garder seulement les chemins applicatifs utiles.
+# Chemins locaux ; aucun schema, hote, fragment ou espace.
+# Le chemin initial (--path, / par defaut) et ces chemins partagent le budget.
+# 10 chemins supplementaires maximum ; le repli /index.php est automatique.
+/index.php
+/app/index.php
+/portail/
