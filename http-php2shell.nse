@@ -55,7 +55,7 @@ https://www.php.net/
 -- |_  Verification : Apres mise a jour, redemarrer les workers web ou redeployer les conteneurs; verifier le runtime actif et les backports fournisseur.
 
 author = "aehcktrn"
-license = "MIT; see https://github.com/aehcktrn/php2shell-nse/blob/main/LICENSE"
+license = "MIT; see https://github.com/aehcktrn/php2shell-scanner/blob/main/LICENSE"
 categories = {"discovery", "safe"}
 
 portrule = shortport.http

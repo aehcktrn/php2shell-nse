@@ -11,7 +11,7 @@ Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajo
 Prérequis : **Nmap, Python 3.10 ou ultérieur et Git**. Le lanceur utilise uniquement la bibliothèque standard Python. Le NSE reste autonome et ne demande aucune installation Lua supplémentaire pour fonctionner dans Nmap.
 
 ```bash
-git clone https://github.com/aehcktrn/php2shell-nse.git php2shell-scanner
+git clone https://github.com/aehcktrn/php2shell-scanner.git
 cd php2shell-scanner
 cp domaines.example.txt domaines.txt
 ```
