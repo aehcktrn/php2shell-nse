@@ -86,7 +86,7 @@ local POTENTIAL = "POTENTIALLY_VULNERABLE"
 local PATCHED = "PATCHED_VERSION_ADVERTISED"
 local UNKNOWN = "UNKNOWN"
 local FIXES = {[2] = 35, [3] = 36, [4] = 27, [5] = 12}
-local DEFAULT_USER_AGENT = "php2shell-scanner/0.4.5 http-php2shell/0.3.2 (+https://github.com/aehcktrn/php2shell-scanner)"
+local DEFAULT_USER_AGENT = "php2shell-scanner/0.4.6 http-php2shell/0.3.3 (+https://github.com/aehcktrn/php2shell-scanner)"
 local MAX_HEADER_BYTES = 8192
 local MAX_EVIDENCE = 32
 -- RFC HTTP product-token characters. A fragment of Not-PHP or Not.PHP is
@@ -98,7 +98,7 @@ local function output()
   result.state = UNKNOWN
   result.detection_method = "HTTP response headers (version-based)"
   result.exploitability = "NOT_TESTED"
-  result.script_version = "0.3.2"
+  result.script_version = "0.3.3"
   result.schema_version = "1"
   result.advisory_date = "2026-10-21"
   result.cves = {"CVE-2026-109618", "CVE-2026-109619"}
@@ -665,6 +665,9 @@ action = function(host, port)
       if not destination then
         observation.redirect_followed = false
         observation.redirect_reason = why
+        if safe_destination and why == "Redirect leaves the current origin." then
+          observation.redirect_scope = "HORS_PERIMETRE_DU_CONTROLE"
+        end
         if observation.state == UNKNOWN and #observation.versions == 0 then
           observation.reason_code, observation.reason = "REDIRECT_NOT_ASSESSED", why
         end

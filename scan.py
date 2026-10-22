@@ -33,7 +33,7 @@ from report import (ReportError, build_campaign_report, compact_rows,
 from discovery import discover_root
 
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024

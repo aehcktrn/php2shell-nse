@@ -132,8 +132,49 @@ class CompactReportTests(unittest.TestCase):
                 self.assertEqual(self.compact(redirect, destination)["vulnerable"], "INDETERMINE")
         foreign_redirect = deepcopy(redirect)
         foreign_redirect["observations"][0]["redirect_to"] = "https://other.example.com/"
-        self.assertEqual(self.compact(foreign_redirect, assessment(port="443", scheme="https"))["vulnerable"],
-                         "INDETERMINE")
+        result = self.compact(foreign_redirect, assessment(port="443", scheme="https"))
+        self.assertEqual(result["vulnerable"], "INDETERMINE")
+        self.assertIn("HORS PÉRIMÈTRE DU CONTRÔLE", result["explication"])
+        self.assertIn("https://other.example.com/", result["explication"])
+
+    def test_unassessed_redirect_destinations_are_deduplicated_and_bounded(self):
+        row = assessment(
+            state="UNKNOWN", version="", reason_code="REDIRECT_NOT_ASSESSED",
+            observations=[
+                {"reason_code": "REDIRECT_NOT_ASSESSED", "redirect_to": "https://one.example.net/"},
+                {"reason_code": "REDIRECT_NOT_ASSESSED", "redirect_to": "https://one.example.net/"},
+                {"reason_code": "REDIRECT_NOT_ASSESSED", "redirect_to": "https://two.example.net/path"},
+                {"reason_code": "REDIRECT_NOT_ASSESSED", "redirect_to": "https://three.example.net/"},
+            ],
+        )
+        result = self.compact(row)
+        self.assertIn("destinations non évaluées", result["explication"])
+        self.assertEqual(result["explication"].count("https://one.example.net/"), 1)
+        self.assertIn("https://two.example.net/path", result["explication"])
+        self.assertIn("(+1 autre)", result["explication"])
+        self.assertLessEqual(len(result["explication"]), 360)
+
+    def test_out_of_scope_redirect_remains_visible_when_source_has_version_evidence(self):
+        result = self.compact(assessment(observations=[{
+            "reason_code": "FIXED_VERSION_ADVERTISED",
+            "redirect_to": "https://outside.example.net/",
+            "redirect_followed": "false",
+            "redirect_reason": "Redirect leaves the current origin.",
+        }]))
+        self.assertEqual(result["vulnerable"], "NON")
+        self.assertIn("HORS PÉRIMÈTRE DU CONTRÔLE", result["explication"])
+        self.assertIn("https://outside.example.net/", result["explication"])
+
+    def test_old_compact_redirect_explanation_remains_accepted(self):
+        old = details([assessment(
+            state="UNKNOWN", version="", reason_code="REDIRECT_NOT_ASSESSED",
+            observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://outside.example.net/"}],
+        )])
+        compact = report.compact_rows(old["rows"], include_redirect_destinations=False)
+        self.save("report.json", compact)
+        self.save("raw/report-details.json", old)
+        self.assertEqual(report.load_campaign_report(self.base / "report.json"), old)
 
     def test_port_summary_preserves_mixed_service_versions_and_verdicts(self):
         for unknown_https in (False, True):

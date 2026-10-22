@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.6 — 2026-10-23
+
+- Les redirections quittant l'origine contrôlée affichent désormais leur destination expurgée dans les rapports principaux avec la mention **HORS PÉRIMÈTRE DU CONTRÔLE — destination non évaluée**.
+- Le bilan technique expose aussi `redirect_destinations` et `redirect_evaluation_scope`; le NSE marque chaque observation concernée sans suivre ni résoudre la destination.
+- Les rapports compacts 0.4.5 dépourvus de cette nouvelle mention restent acceptés pour la comparaison et le recontrôle.
+
+Le lanceur passe à **0.4.6** et le NSE à **0.3.3**. Le périmètre réseau, les seuils PHP et les règles de décision des verdicts sont inchangés.
+
 ## 0.4.5 — 2026-10-23
 
 - Exclusion systématique avant Nmap des adresses DNS non globales, avec conservation explicite des adresses rejetées et du motif `NO_PUBLIC_ADDRESS` dans les rapports de couverture.

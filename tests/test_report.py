@@ -83,6 +83,10 @@ class ReportTests(unittest.TestCase):
         element(item, "elem", "CORRIGER OU VERIFIER LE BACKPORT", key="verdict")
         element(item, "elem", "Installer PHP >= 8.3.36.", key="remediation")
         element(item, "elem", "Verifier les workers actifs.", key="verification")
+        observations = element(item, "table", key="observations")
+        observation = element(observations, "table")
+        element(observation, "elem", "REDIRECT_NOT_ASSESSED", key="reason_code")
+        element(observation, "elem", "https://outside.example.test/path?[redacted]", key="redirect_to")
         rows = report.parse_report(self.save())
         self.assertEqual(len(rows), 1)
         row = rows[0]
@@ -93,11 +97,15 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(row["service"], "ssl/http")
         self.assertEqual(row["fixed_versions"], "8.3.36")
         self.assertEqual(row["remediation"], "Installer PHP >= 8.3.36.")
+        self.assertEqual(row["redirect_destinations"], "https://outside.example.test/path?[redacted]")
+        self.assertEqual(row["redirect_evaluation_scope"], "HORS_PERIMETRE_DU_CONTROLE")
         report.write_report(rows, self.destination, self.source, detailed=True)
         with self.destination.open(encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
             self.assertEqual(tuple(reader.fieldnames), report.FIELDS)
-            self.assertEqual(next(reader)["verification"], "Verifier les workers actifs.")
+            exported = next(reader)
+            self.assertEqual(exported["verification"], "Verifier les workers actifs.")
+            self.assertEqual(exported["redirect_evaluation_scope"], "HORS_PERIMETRE_DU_CONTROLE")
 
     def test_open_nonweb_and_web_ports_without_nse_are_coverage(self):
         item = host(self.root)

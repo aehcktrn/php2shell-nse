@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.5**, module NSE **0.3.2**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.6**, module NSE **0.3.3**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -74,7 +74,7 @@ Les rapports principaux contiennent exactement **quatre champs**, dans cet ordre
 
 Ces lignes illustrent le format. **`php` contient les versions observées**, séparées par ` | ` lorsqu'il y en a plusieurs, ou `INCONNUE` lorsqu'aucune version n'est disponible. Dans une campagne `scan.py`, chaque nom DNS retenu garde sa propre ligne, même s'il partage une IP avec une autre cible. Un export XML autonome reprend le vhost explicite ou l'identité de l'entrée Nmap, avec l'IP en l'absence de nom ; plusieurs alias d'une même entrée restent groupés, car ils ne prouvent pas des tests distincts de chaque vhost.
 
-**L'explication liste les ports ayant une évaluation NSE**, même indéterminée, puis le motif du résultat. Les ports ouverts pertinents sans évaluation PHP sont signalés séparément. Les listes sont triées, dédoublonnées et bornées ; au-delà de dix ports, le nombre restant est indiqué. Les ports fermés ou filtrés ne figurent pas dans cette liste d'évaluations : leurs états restent dans les fichiers Nmap de `raw/`. Un port cité dans le motif de vulnérabilité désigne le service qui justifie le résultat, pas le seul port contrôlé.
+**L'explication liste les ports ayant une évaluation NSE**, même indéterminée, puis le motif du résultat. Les ports ouverts pertinents sans évaluation PHP sont signalés séparément. Lorsqu'une redirection quitte l'origine contrôlée et n'est donc pas suivie, sa destination expurgée est affichée avec la mention **HORS PÉRIMÈTRE DU CONTRÔLE — destination non évaluée**. Cette mention décrit la limite de l'évaluation HTTP courante : elle ne signifie pas nécessairement que le nom est absent du périmètre DNS autorisé ou d'une autre cible de la campagne. Les listes sont triées, dédoublonnées et bornées ; au-delà de dix ports, le nombre restant est indiqué. Les ports fermés ou filtrés ne figurent pas dans cette liste d'évaluations : leurs états restent dans les fichiers Nmap de `raw/`. Un port cité dans le motif de vulnérabilité désigne le service qui justifie le résultat, pas le seul port contrôlé.
 
 - **`OUI`** : au moins un service annonce clairement une version concernée, sans preuve valide de correction, ou un inventaire atteste un runtime encore affecté. L'explication précise le correctif ou la preuve disponible. Une version annoncée ne démontre pas l'exploitabilité.
 - **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une redirection HTTP vers le même nom en HTTPS est couverte lorsque ce service de destination a été évalué séparément sur la même adresse. Une ancienne version avec un backport attesté peut donc apparaître en `NON`, avec la version conservée et l'attestation expliquée.
@@ -125,7 +125,7 @@ Les états suivants sont conservés dans `raw/report-details.json` et dans la so
 | `HTTP_ACCESS_DENIED` | Vérifier les règles d'accès. |
 | `RATE_LIMITED` | Ralentir et recontrôler après le délai imposé. |
 | `NO_HTTP_RESPONSE` | Vérifier réseau, TLS et disponibilité. |
-| `REDIRECT_NOT_ASSESSED` | Contrôler explicitement la destination dans le périmètre. |
+| `REDIRECT_NOT_ASSESSED` | Destination affichée comme **HORS PÉRIMÈTRE DU CONTRÔLE** et non évaluée ; la contrôler séparément si elle appartient au périmètre autorisé. |
 | `CONFLICTING_VERSIONS` | Vérifier les chemins et runtimes associés aux versions. |
 | `UNRECOGNIZED_BUILD` | Identifier le build et ses correctifs fournisseur. |
 | `REQUEST_BUDGET_EXHAUSTED` | Couverture HTTP partielle : ajuster budget ou chemins. |

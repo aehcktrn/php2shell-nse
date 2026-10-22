@@ -29,6 +29,7 @@ FIELDS = (
     "verdict", "versions", "fixed_versions", "priority", "remediation",
     "verification", "http_status", "reason", "reason_code", "next_action",
     "php_detected", "path", "scheme", "http_host", "tls_sni", "requests_made",
+    "redirect_destinations", "redirect_evaluation_scope",
     "observed_at", "campaign_id", "source_xml", "inventory_patch_status",
     "inventory_source", "inventory_observed_at", "inventory_reason", "address_family", "scan_ports",
 )
@@ -184,6 +185,7 @@ def _assessment(script: ET.Element) -> dict[str, Any]:
             "Verifier en priorite les versions suspectes et les backports de chaque "
             "worker; les preuves sont insuffisantes ou contradictoires."
         )
+    observations = _details(script, "observations")
     values = {
         "row_type": "ASSESSMENT", "state": state,
         "verdict": _scalar(script, "verdict") or VERDICTS[state],
@@ -204,10 +206,15 @@ def _assessment(script: ET.Element) -> dict[str, Any]:
         "traversal_reason_code": _scalar(script, "traversal_reason_code"),
         "script_version": _scalar(script, "script_version"),
         "evidence": _details(script, "evidence"),
-        "observations": _details(script, "observations"),
+        "observations": observations,
         "notes": _array(script, "notes"),
         "exploitability": "NOT_TESTED", "potentially_vulnerable_evidence": suspect,
     }
+    redirect_destinations = _unassessed_redirect_destinations([values])
+    values["redirect_destinations"] = " | ".join(redirect_destinations)
+    values["redirect_evaluation_scope"] = (
+        "HORS_PERIMETRE_DU_CONTROLE" if redirect_destinations else ""
+    )
     vhost = _scalar(script, "vhost")
     if vhost:
         # The explicit Host/SNI name is the application actually assessed. The
@@ -299,6 +306,28 @@ def _version_values(value: object) -> list[str]:
 
 def _true(value: object) -> bool:
     return str(value).lower() in ("true", "yes", "1")
+
+
+def _unassessed_redirect_destinations(rows: list[dict[str, Any]]) -> list[str]:
+    """Return recorded, unrequested redirect targets without contacting them."""
+    destinations = []
+    for row in rows:
+        observations = row.get("observations")
+        if not isinstance(observations, list):
+            continue
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            explicitly_outside = observation.get("redirect_scope") == "HORS_PERIMETRE_DU_CONTROLE"
+            stopped_at_origin = (str(observation.get("redirect_followed", "")).lower() == "false"
+                                 and observation.get("redirect_reason") == "Redirect leaves the current origin.")
+            if (observation.get("reason_code") != "REDIRECT_NOT_ASSESSED"
+                    and not explicitly_outside and not stopped_at_origin):
+                continue
+            destination = _single_line(observation.get("redirect_to"))
+            if destination:
+                destinations.append(destination)
+    return _unique(destinations)
 
 
 # A missing NSE assessment on a positively identified non-web service is
@@ -536,17 +565,37 @@ def _port_summary(rows: list[dict[str, Any]]) -> str:
     return " ".join(parts)
 
 
+def _redirect_summary(rows: list[dict[str, Any]]) -> str:
+    destinations = _unassessed_redirect_destinations(rows)
+    if not destinations:
+        return ""
+    displayed = [_short(destination, 100) for destination in destinations[:2]]
+    listing = ", ".join(displayed)
+    if len(destinations) > len(displayed):
+        listing += f" (+{len(destinations) - len(displayed)} autre"
+        listing += "s" if len(destinations) - len(displayed) > 1 else ""
+        listing += ")"
+    label = "destination non évaluée" if len(destinations) == 1 else "destinations non évaluées"
+    return _short(f"HORS PÉRIMÈTRE DU CONTRÔLE — {label} : {listing}.", 245)
+
+
 def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str,
-                         *, port_rows: list[dict[str, Any]] | None = None) -> str:
+                         *, port_rows: list[dict[str, Any]] | None = None,
+                         include_redirect_destinations: bool = True) -> str:
     reason = _legacy_compact_explanation(rows, verdicts, verdict)
     ports = _port_summary(port_rows if port_rows is not None else rows)
-    if not ports:
+    redirect = _redirect_summary(rows) if include_redirect_destinations else ""
+    prefix = " ".join(part for part in (ports, redirect) if part)
+    if not prefix:
         return _short(reason, MAX_COMPACT_EXPLANATION)
-    # Keep both coverage lists visible even when a supplied reason is verbose.
-    return ports + " " + _short(reason, MAX_COMPACT_EXPLANATION - len(ports) - 1)
+    # Keep coverage and out-of-scope destinations visible even when a supplied
+    # reason is verbose.
+    remaining = MAX_COMPACT_EXPLANATION - len(prefix) - 1
+    return prefix if remaining <= 0 else prefix + " " + _short(reason, remaining)
 
 
-def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False) -> list[dict[str, str]]:
+def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False,
+                 include_redirect_destinations: bool = True) -> list[dict[str, str]]:
     """Aggregate IPs and ports into four fields per hostname (or XML IP).
 
     OUI includes an affected advertised version and says so explicitly. NON
@@ -578,7 +627,10 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
         if legacy_explanation:
             explanation = _legacy_compact_explanation(conclusive, verdicts, verdict)
         else:
-            explanation = _compact_explanation(conclusive, verdicts, verdict, port_rows=relevant)
+            explanation = _compact_explanation(
+                conclusive, verdicts, verdict, port_rows=relevant,
+                include_redirect_destinations=include_redirect_destinations,
+            )
         output.append({"cible": target, "php": " | ".join(versions) or "INCONNUE", "vulnerable": verdict,
                        "explication": _short(explanation, MAX_COMPACT_EXPLANATION)})
     return output
@@ -624,7 +676,8 @@ def _validate_detailed(value: object) -> dict[str, Any]:
             or any(not isinstance(row, dict) for row in value["rows"])):
         raise ReportError("Rapport détaillé invalide : schema_version='1' et rows=[objets] requis.")
     string_fields = ("hostname", "ip", "protocol", "service", "service_method", "row_type", "state", "versions",
-                     "fixed_versions", "reason", "reason_code", "traversal_reason_code", "inventory_patch_status")
+                     "fixed_versions", "reason", "reason_code", "traversal_reason_code", "inventory_patch_status",
+                     "redirect_destinations", "redirect_evaluation_scope")
     for row in value["rows"]:
         if set(COMPACT_FIELDS).issubset(row):
             raise ReportError("Rapport détaillé invalide : une ligne compacte ne contient pas les observations par service.")
@@ -668,6 +721,7 @@ def load_campaign_report(path: Path) -> dict[str, Any]:
     except ReportError as exc:
         raise ReportError(f"Rapport compact : compagnon détaillé requis et valide ({companion}): {exc}") from exc
     if (compact_rows(details["rows"]) != compact
+            and compact_rows(details["rows"], include_redirect_destinations=False) != compact
             and compact_rows(details["rows"], legacy_explanation=True) != compact):
         raise ReportError("Rapport compact incohérent avec raw/report-details.json ; conserver les fichiers de la même campagne.")
     return details

@@ -293,6 +293,10 @@ class NSEIntegration(unittest.TestCase):
         self.assertEqual(self.field(script, "reason_code"), "REDIRECT_NOT_ASSESSED")
         observations = self.observations(script)
         self.assertTrue(observations)
+        self.assertEqual(self.field(observations[0], "redirect_scope"),
+                         "HORS_PERIMETRE_DU_CONTROLE")
+        self.assertEqual(self.field(observations[0], "redirect_to"),
+                         "http://outside.example.invalid/fixed")
         self.assertTrue(all(self.field(item, "vhost") == "127.0.0.1" for item in observations))
         self.assertNotIn("/fixed", [self.field(item, "path") for item in observations])
 
