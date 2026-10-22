@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.0**, module NSE **0.3.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.1**, module NSE **0.3.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -40,6 +40,8 @@ python3 scan.py domaines.txt --output results/campagne-initiale
 ```
 
 Le dossier doit être **nouveau ou vide** : les résultats précédents ne sont pas écrasés.
+
+Ouvrez **`report.csv`** pour lire le résultat : **une ligne par domaine ou sous-domaine**, avec quatre colonnes `cible`, `php`, `vulnerable`, `explication`. Le même tableau est disponible dans `report.json`, avec un objet par ligne. Les IP, ports et chemins d'une même cible sont regroupés.
 
 ## Découverte automatique des sous-domaines
 
@@ -172,7 +174,7 @@ L'import `--discover-from` lit uniquement les **exports fournis** et n'interroge
 | Rapide | `python3 scan.py domaines.txt --profile rapide` | TCP 80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000 et 9443. |
 | Recontrôle | `python3 scan.py --profile recontrole --previous results/campagne-initiale/report.json` | Noms et ports à revoir dans le rapport précédent, avec nouvelle résolution DNS. |
 
-Les alias `complete`, `quick` et `recheck` sont acceptés. `--ports 80,443,8000-8100` remplace les ports du profil. Le manifeste conserve la couverture demandée. Dans les rapports, `scan_ports` indique les ports effectivement demandés pour chaque couple nom/IP ; `campaign.ports` reste la sélection par défaut et peut différer des ports retenus lors d'un recontrôle.
+Les alias `complete`, `quick` et `recheck` sont acceptés. `--ports 80,443,8000-8100` remplace les ports du profil. Le manifeste conserve la couverture demandée. Dans `raw/report-details.json`, `scan_ports` indique les ports effectivement demandés pour chaque couple nom/IP ; `campaign.ports` reste la sélection par défaut et peut différer des ports retenus lors d'un recontrôle.
 
 Le recontrôle écarte les lignes avec `inventory_patch_status=PATCH_CONFIRMED`. Une version corrigée seulement **annoncée** reste à confirmer. Il reprend les ports connus ; sans port exploitable, les ports de la campagne précédente servent de repli. Il récupère les chemins des observations et des preuves, y compris ceux ayant annoncé une version suspecte. Si un ancien chemin contenait des paramètres expurgés, fournissez son URL locale complète avec `--path` ou `--paths-file` : sinon le recontrôle s'arrête avant tout accès réseau. Il n'invente pas les valeurs et ne rejoue pas simplement le chemin sans paramètres. Un fichier de cibles peut restreindre le recontrôle ; `--scope` et `--exclude` restent applicables.
 
@@ -215,20 +217,45 @@ Les versions contradictoires sont conservées et signalées comme prioritaires. 
 
 ## Rapports et actions
 
+### Une cible, une ligne
+
+Les rapports principaux contiennent exactement **quatre champs**, dans cet ordre :
+
+| cible | php | vulnerable | explication |
+|---|---|---|---|
+| application.example.com | 8.3.35 | OUI | Version annoncée concernée ; appliquer le correctif PHP 8.3.36 ou un backport attesté. |
+| portail.example.com | 8.3.36 | NON | Version corrigée annoncée sur les services évalués. |
+| api.example.org | INCONNUE | INDETERMINE | Version PHP masquée ; vérifier le runtime actif. |
+
+Ces lignes illustrent le format. **`php` contient les versions observées**, séparées par ` | ` lorsqu'il y en a plusieurs, ou `INCONNUE` lorsqu'aucune version n'est disponible. Dans une campagne `scan.py`, chaque nom DNS retenu garde sa propre ligne, même s'il partage une IP avec une autre cible. Un export XML autonome reprend le vhost explicite ou l'identité de l'entrée Nmap, avec l'IP en l'absence de nom ; plusieurs alias d'une même entrée restent groupés, car ils ne prouvent pas des tests distincts de chaque vhost.
+
+- **`OUI`** : au moins un service annonce clairement une version concernée, sans preuve valide de correction, ou un inventaire atteste un runtime encore affecté. L'explication précise le correctif ou la preuve disponible. Une version annoncée ne démontre pas l'exploitabilité.
+- **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une ancienne version avec un backport attesté peut donc apparaître en `NON`, avec la version conservée et l'attestation expliquée.
+- **`INDETERMINE`** : version absente ou masquée, observations contradictoires, inventaire contradictoire ou contrôle incomplet. Une cause courte indique la vérification à effectuer ; l'absence de PHP identifié ne devient pas automatiquement `NON`.
+
+Une version concernée clairement observée suffit à faire ressortir la cible en `OUI`, même si d'autres services restent indéterminés. Une observation suspecte au sein d'un parcours interrompu ou contradictoire reste `INDETERMINE`. Un service reconnu comme non web, par exemple SSH, ne dégrade pas à lui seul le résultat des services PHP évalués.
+
+`report.csv` contient une ligne d'en-tête, puis une ligne physique par cible. `report.json` est une **liste JSON simple**, avec un objet de quatre champs par ligne, sans enveloppe technique ni observations imbriquées. Pour 465 cibles retenues, cela représente 465 résultats, soit 466 lignes CSV ou 467 lignes JSON avec les deux crochets. Les sous-domaines découverts ajoutent chacun leur propre résultat.
+
+### Fichiers produits
+
 | Fichier | Contenu |
 |---|---|
 | `manifest.json` | Périmètre, exclusions, empreintes des entrées, résolution A/AAAA, paramètres et état de chaque exécution. |
 | `targets.txt` | Ensemble des noms retenus et normalisés : cibles exactes, racines, imports et découverte. |
 | `discovery.json` | Si découverte automatique : journal par racine, source, provenance, limites, compteurs, rejets et motifs d'erreur ; inventaire toujours non exhaustif. |
 | `discovered.txt` | Si découverte automatique : noms concrets CT retenus, avant résolution DNS ; certains peuvent ne plus résoudre. |
-| `report.csv` | Évaluations, actions, preuves d'inventaire et absences de couverture. |
-| `report.json` | Même bilan, avec observations et preuves détaillées. |
+| `report.csv` | Synthèse à quatre colonnes, une ligne par cible. |
+| `report.json` | Même synthèse sous forme de liste JSON, un objet par ligne. |
 | `changes.csv` | Comparaison avec `--previous` ; en-têtes seuls sans comparaison. |
-| `raw/` | Résultats Nmap `.xml`, `.nmap`, `.gnmap` et journaux par couple nom/IP. |
+| `raw/report-details.json` | Bilan technique complet : évaluations par service, observations, preuves, couverture et métadonnées de campagne. Nécessaire au recontrôle et à la comparaison des nouveaux rapports. |
+| Autres fichiers de `raw/` | Résultats Nmap `.xml`, `.nmap`, `.gnmap` et journaux par couple nom/IP. |
 
-Le bilan distingue **domaines retenus après validation et dédoublonnage, résolus, tentés et évalués**. Les candidats écartés restent détaillés dans `excluded_candidates` du manifeste et du rapport JSON. Les échecs DNS, délais expirés, interruptions, XML invalides et cibles absentes d'un XML ne disparaissent pas du rapport.
+Le bilan technique distingue **domaines retenus après validation et dédoublonnage, résolus, tentés et évalués**. Les candidats écartés restent dans `excluded_candidates` du manifeste et de `raw/report-details.json`. Les échecs DNS, délais expirés, interruptions, XML invalides et cibles absentes d'un XML restent visibles dans la ligne de leur cible. Les erreurs d'une source de découverte sont consignées dans `discovery.json` et dans le bilan technique ; elles ne créent pas de cible fictive ni de résultat PHP supplémentaire.
 
-### Évaluation réseau
+### Évaluation réseau détaillée
+
+Les états suivants sont conservés dans `raw/report-details.json` et dans la sortie du NSE autonome. Le rapport principal les résume avec les preuves d'inventaire et la couverture de la cible.
 
 | État | Lecture et action |
 |---|---|
@@ -254,7 +281,7 @@ Le bilan distingue **domaines retenus après validation et dédoublonnage, réso
 | `UNRECOGNIZED_BUILD` | Identifier le build et ses correctifs fournisseur. |
 | `REQUEST_BUDGET_EXHAUSTED` | Couverture HTTP partielle : ajuster budget ou chemins. |
 
-Des motifs de campagne complètent ces résultats : `DNS_ERROR`, `DNS_FAMILY_ERROR`, `SCAN_TIMEOUT`, `SCAN_SKIPPED`, `INVALID_SCAN_XML`, etc. `next_action`, `remediation` et `verification` donnent les suites attendues. Une preuve suspecte est conservée lorsqu'une incohérence impose `UNKNOWN`.
+Des motifs de campagne complètent ces résultats : `DNS_ERROR`, `DNS_FAMILY_ERROR`, `SCAN_TIMEOUT`, `SCAN_SKIPPED`, `INVALID_SCAN_XML`, etc. Dans le bilan technique, `next_action`, `remediation` et `verification` donnent les suites attendues. Une preuve suspecte est conservée lorsqu'une incohérence impose `UNKNOWN`.
 
 ### Comparaison
 
@@ -264,7 +291,24 @@ python3 scan.py domaines.txt \
   --output results/campagne-suivante
 ```
 
+**Conservez le dossier de campagne complet.** Pour un `report.json` compact, `--previous` charge automatiquement `raw/report-details.json` dans le même dossier et vérifie que les deux rapports correspondent. Un compagnon absent ou incohérent est refusé avant les accès réseau. Les anciens rapports JSON détaillés de schéma `1` restent acceptés directement, sans fichier compagnon. Cette règle vaut aussi pour le profil `recontrole`.
+
 Les changements sont classés en `NEW`, `CHANGED`, `UNCHANGED` et `NO_LONGER_OBSERVED`, en conservant nom, IP, port et protocole. Un changement DNS peut apparaître comme un nouveau service et un ancien non observé. **La disparition d'un service ne prouve pas sa correction.** Les changements de périmètre, de ports ou de visibilité doivent être pris en compte.
+
+### Simplifier un rapport déjà produit
+
+Pour obtenir les quatre colonnes à partir d'un ancien rapport JSON, **sans relancer de scan** :
+
+```bash
+python3 report.py results/ancienne-campagne/report.json -o synthese.csv
+```
+
+La même commande accepte un nouveau rapport JSON compact ou un XML Nmap. La conversion d'un JSON compact vers CSV ne nécessite pas son fichier compagnon. Pour exporter l'ancien CSV technique à partir d'un XML ou d'un JSON détaillé, ajoutez `--detailed` :
+
+```bash
+python3 report.py results/campagne-initiale/raw/report-details.json \
+  --detailed -o details.csv
+```
 
 ## Preuves de runtimes
 
@@ -297,7 +341,7 @@ La fraîcheur maximale est de **24 heures**, réglable par `--inventory-max-age-
 | `UNVERIFIED` | Éléments insuffisants pour valider l'attestation. |
 | `NOT_PROVIDED` | Aucune attestation correspondante. |
 
-Ces conclusions sont **fondées sur l'inventaire importé**. Les références de preuve ne sont ni ouvertes ni contrôlées automatiquement. Les statuts réseau et inventaire restent séparés : une ancienne bannière peut coexister avec `PATCH_CONFIRMED` lorsqu'un backport est attesté. Confirmer les correctifs est distinct de démontrer l'exploitabilité.
+Ces conclusions sont **fondées sur l'inventaire importé**. Les références de preuve ne sont ni ouvertes ni contrôlées automatiquement. Dans le bilan technique, les statuts réseau et inventaire restent séparés : une ancienne bannière peut coexister avec `PATCH_CONFIRMED` lorsqu'un backport est attesté. Le rapport compact tient compte de cette attestation pour son résultat, tout en conservant la version annoncée dans `php`. Confirmer les correctifs est distinct de démontrer l'exploitabilité.
 
 ## NSE autonome et export compatible
 
@@ -310,7 +354,7 @@ nmap -sT -sV -Pn -p- \
   application.example.com
 ```
 
-Le parcours Nmap sur fichier et l'ancien export restent disponibles :
+Le parcours Nmap sur fichier et l'export CSV restent disponibles :
 
 ```bash
 mkdir -p results
@@ -324,7 +368,7 @@ python3 report.py results/php2shell.xml -o results/php2shell.csv
 
 Cette commande Nmap utilise IPv4 ; faites une exécution distincte avec `-6` pour IPv6. `--resolve-all` couvre les adresses de la famille choisie. Évitez `--unique` lorsque plusieurs noms partagent une IP. Les IP/CIDR restent utilisables avec Nmap directement ; `scan.py` attend des noms DNS.
 
-`report.py` refuse les XML tronqués ou sans fin de scan réussie. **Cet export autonome n'a pas de manifeste** : il ne retrouve pas les domaines absents du XML après un échec DNS. Utilisez `scan.py` pour le rapprochement complet.
+`report.py` produit les quatre colonnes compactes par défaut ; `--detailed` conserve l'ancien export technique. Il refuse les XML tronqués ou sans fin de scan réussie. **Cet export autonome n'a pas de manifeste** : il ne retrouve pas les domaines absents du XML après un échec DNS. Utilisez `scan.py` pour le rapprochement complet.
 
 ### Arguments NSE
 
@@ -390,6 +434,7 @@ Les tests utilisent des réponses simulées et des serveurs HTTP/HTTPS en boucle
 ```bash
 lua5.4 tests/unit.lua
 python3 -m unittest discover -s tests -p 'test_report.py'
+python3 -m unittest discover -s tests -p 'test_compact_report.py'
 python3 -m unittest discover -s tests -p 'test_runtime_inventory.py'
 python3 -m unittest discover -s tests -p 'test_campaign_report.py'
 python3 -m unittest discover -s tests -p 'test_scan.py'

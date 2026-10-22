@@ -93,7 +93,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(row["service"], "ssl/http")
         self.assertEqual(row["fixed_versions"], "8.3.36")
         self.assertEqual(row["remediation"], "Installer PHP >= 8.3.36.")
-        report.write_report(rows, self.destination, self.source)
+        report.write_report(rows, self.destination, self.source, detailed=True)
         with self.destination.open(encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
             self.assertEqual(tuple(reader.fieldnames), report.FIELDS)
@@ -215,7 +215,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report.safe_cell("normal host"), "normal host")
         script(port(host(self.root, name="=HYPERLINK(\"https://example.invalid\")")),
                versions=("+cmd",))
-        report.write_report(report.parse_report(self.save()), self.destination, self.source)
+        report.write_report(report.parse_report(self.save()), self.destination, self.source, detailed=True)
         with self.destination.open(encoding="utf-8", newline="") as stream:
             row = next(csv.DictReader(stream))
             self.assertTrue(row["hostname"].startswith("'="))
@@ -224,7 +224,7 @@ class ReportTests(unittest.TestCase):
     def test_csv_escaping_and_unicode_are_preserved(self):
         item = script(port(host(self.root)))
         item.find("elem[@key='reason']").text = 'Version "ancienne", vérification\nrequise.'
-        report.write_report(report.parse_report(self.save()), self.destination, self.source)
+        report.write_report(report.parse_report(self.save()), self.destination, self.source, detailed=True)
         with self.destination.open(encoding="utf-8", newline="") as stream:
             self.assertEqual(next(csv.DictReader(stream))["reason"], 'Version "ancienne", vérification\nrequise.')
 
@@ -258,7 +258,7 @@ class ReportTests(unittest.TestCase):
         self.save()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.assertEqual(report.main([str(self.source), "-o", str(self.destination)]), 0)
+            self.assertEqual(report.main([str(self.source), "-o", str(self.destination), "--detailed"]), 0)
         self.assertIn("Evaluations PHP2Shell: 1", output.getvalue())
         self.assertIn("Lignes de couverture sans evaluation: 1", output.getvalue())
         self.assertIn("ne signifie pas vulnerable", output.getvalue())
@@ -269,7 +269,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(rows, [])
         report.write_report(rows, self.destination, self.source)
         with self.destination.open(encoding="utf-8", newline="") as stream:
-            self.assertEqual(list(csv.reader(stream)), [list(report.FIELDS)])
+            self.assertEqual(list(csv.reader(stream)), [["cible", "php", "vulnerable", "explication"]])
 
 
 if __name__ == "__main__":

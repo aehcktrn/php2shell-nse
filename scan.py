@@ -27,11 +27,12 @@ import time
 from urllib.parse import quote
 import uuid
 
-from report import build_campaign_report, write_campaign_report
+from report import (ReportError, build_campaign_report, compact_rows,
+                    load_campaign_report, write_campaign_report)
 from discovery import discover_root
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -210,14 +211,9 @@ def read_previous(path: Path | None) -> dict | None:
     if path is None:
         return None
     try:
-        result = json.loads(read_text(path, 128 * 1024 * 1024))
-    except (json.JSONDecodeError, RecursionError) as exc:
-        raise InputError("Rapport precedent JSON invalide.") from exc
-    if not isinstance(result, dict) or str(result.get("schema_version")) != "1" or not isinstance(result.get("rows"), list):
-        raise InputError("Un report.json de campagne schema_version=1 est requis.")
-    if any(not isinstance(row, dict) for row in result["rows"]):
-        raise InputError("Lignes invalides dans le rapport precedent.")
-    return result
+        return load_campaign_report(path)
+    except ReportError as exc:
+        raise InputError(str(exc)) from exc
 
 
 def recheck_targets(previous: dict) -> tuple[dict[str, set[int]], dict[str, list[str]]]:
@@ -955,12 +951,14 @@ def run_campaign(args) -> int:
     print(f"Domaines: {summary.get('targets_total', len(targets))} retenus, "
           f"{summary.get('targets_resolved', 0)} resolus, {summary.get('targets_attempted', 0)} tentes, "
           f"{summary.get('targets_evaluated', 0)} avec evaluation PHP2Shell.")
-    for state, count in summary.get("assessment_counts", {}).items():
-        print(f"  {state}: {count}")
+    results = compact_rows(report["rows"])
+    print(f"Resultats par cible ({len(results)} lignes): " + ", ".join(
+        f"{verdict}={sum(row['vulnerable'] == verdict for row in results)}"
+        for verdict in ("OUI", "NON", "INDETERMINE")))
     print(f"Rapports: {output / 'report.csv'} et {output / 'report.json'}")
     if args.previous:
         print(f"Comparaison: {output / 'changes.csv'}")
-    print("Une absence d'evaluation ou de service observe ne prouve pas la correction.")
+    print("OUI/NON selon les versions observees ou les preuves serveur; INDETERMINE si la conclusion reste impossible.")
     return 130 if interrupted else 2 if failures else 0
 
 

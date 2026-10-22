@@ -29,6 +29,7 @@ jobs:
       - name: Run Python unit tests
         run: |
           python3 -m unittest discover -s tests -p 'test_report.py'
+          python3 -m unittest discover -s tests -p 'test_compact_report.py'
           python3 -m unittest discover -s tests -p 'test_runtime_inventory.py'
           python3 -m unittest discover -s tests -p 'test_campaign_report.py'
           python3 -m unittest discover -s tests -p 'test_scan.py'

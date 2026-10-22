@@ -94,6 +94,25 @@ class CampaignReportTests(unittest.TestCase):
     def build(self, data=None, **kwargs):
         return report.build_campaign_report(data or manifest(target()), self.base, **kwargs)
 
+    def assert_compact_artifacts(self, destination, expected):
+        fields = ("cible", "php", "vulnerable", "explication")
+        text = (destination / "report.json").read_text(encoding="utf-8")
+        compact = json.loads(text)
+        self.assertIsInstance(compact, list)
+        self.assertEqual(len(compact), len(expected))
+        self.assertEqual(len(text.splitlines()), len(compact) + 2)
+        for row in compact:
+            self.assertEqual(set(row), set(fields))
+            self.assertTrue(all(isinstance(value, str) for value in row.values()))
+            self.assertTrue(row["explication"])
+            self.assertTrue(all("\n" not in value and "\r" not in value for value in row.values()))
+        self.assertEqual({row["cible"]: (row["php"], row["vulnerable"]) for row in compact}, expected)
+        with (destination / "report.csv").open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            self.assertEqual(tuple(reader.fieldnames), fields)
+            self.assertEqual(list(reader), compact)
+        return compact
+
     def test_counts_distinguish_domains_addresses_and_assessments(self):
         one = target()
         ip6 = "2001:db8::10"
@@ -219,9 +238,10 @@ class CampaignReportTests(unittest.TestCase):
         self.assertNotIn("candidates", result["campaign"]["discovery"])
         destination = self.base / "output"
         report.write_campaign_report(result, destination)
-        saved = json.loads((destination / "report.json").read_text())
+        saved = json.loads((destination / "raw" / "report-details.json").read_text())
         self.assertEqual(saved["discovery"]["queries"], data["discovery"]["queries"])
         self.assertEqual(saved["discovery"]["candidates"], data["discovery"]["candidates"])
+        self.assert_compact_artifacts(destination, {"application.example.com": ("8.3.35", "OUI")})
 
     def test_zero_discovery_results_are_processed_but_never_exhaustive(self):
         data = manifest(target())
@@ -239,7 +259,7 @@ class CampaignReportTests(unittest.TestCase):
         self.assertTrue(any("Aucun nom trouve ne signifie pas aucun sous-domaine" in text
                             for text in result["limitations"]))
 
-    def test_limited_skipped_and_pending_discovery_queries_reach_csv(self):
+    def test_discovery_gaps_remain_in_details_without_inventing_compact_targets(self):
         for status, code in (("PARTIAL", "RESPONSE_SIZE_LIMIT"),
                              ("PARTIAL", "CANDIDATE_LIMIT"),
                              ("SKIPPED", "DISCOVERY_INTERRUPTED"),
@@ -251,13 +271,14 @@ class CampaignReportTests(unittest.TestCase):
                 result = self.build(data)
                 destination = self.base / "output"
                 report.write_campaign_report(result, destination)
-                with (destination / "report.csv").open(newline="") as stream:
-                    gap = next(row for row in csv.DictReader(stream) if row["protocol"] == "discovery")
+                details = json.loads((destination / "raw" / "report-details.json").read_text())
+                gap = next(row for row in details["rows"] if row["protocol"] == "discovery")
                 expected = code if code.startswith("DISCOVERY_") else "DISCOVERY_" + (code or status)
                 self.assertEqual(gap["reason_code"], expected)
                 self.assertEqual(gap["state"], "NOT_ASSESSED")
                 self.assertFalse(result["summary"]["processing_complete"])
                 self.assertEqual(result["summary"]["discovery_queries_incomplete"], 1)
+                self.assert_compact_artifacts(destination, {"application.example.com": ("8.3.35", "OUI")})
 
     def test_unattempted_discovery_roots_remain_visible(self):
         data = manifest(target())
@@ -338,9 +359,14 @@ class CampaignReportTests(unittest.TestCase):
         self.assertEqual(result["excluded_candidates"], data["excluded_candidates"])
         destination = self.base / "output"
         report.write_campaign_report(result, destination)
-        with (destination / "report.csv").open(newline="") as stream:
-            self.assertEqual([row["scan_ports"] for row in csv.DictReader(stream)], ["443", "8443", "8080"])
-        self.assertEqual(json.loads((destination / "report.json").read_text())["excluded_candidates"], data["excluded_candidates"])
+        details = json.loads((destination / "raw" / "report-details.json").read_text())
+        self.assertEqual([row["scan_ports"] for row in details["rows"]], ["443", "8443", "8080"])
+        self.assertEqual(details["excluded_candidates"], data["excluded_candidates"])
+        self.assert_compact_artifacts(destination, {
+            "application.example.com": ("8.3.35", "OUI"),
+            "other.example.com": ("8.3.35", "OUI"),
+            "timeout.example.com": ("INCONNUE", "INDETERMINE"),
+        })
 
     def test_foreign_address_or_vhost_xml_is_not_relabelled_as_target(self):
         for options in ({"ip": "192.0.2.99"}, {"name": "foreign.example.com"}):
@@ -390,19 +416,22 @@ class CampaignReportTests(unittest.TestCase):
         self.assertEqual(result["comparison"]["counts"], {"UNCHANGED": 1})
         destination = self.base / "output"
         report.write_campaign_report(result, destination)
-        parsed = json.loads((destination / "report.json").read_text())
+        parsed = json.loads((destination / "raw" / "report-details.json").read_text())
         self.assertEqual(parsed["rows"][0]["observations"], result["rows"][0]["observations"])
+        self.assertEqual(parsed["rows"][0]["path"], "/index.php")
         self.assertTrue((destination / "changes.csv").is_file())
-        with (destination / "report.csv").open(newline="") as stream:
-            self.assertEqual(next(csv.DictReader(stream))["path"], "/index.php")
+        self.assert_compact_artifacts(destination, {"application.example.com": ("8.3.35", "OUI")})
+        imported = self.build(previous=destination / "report.json")
+        self.assertEqual(imported["comparison"]["counts"], {"UNCHANGED": 1})
+        self.assertEqual(report.load_campaign_report(destination / "report.json"), parsed)
 
-    def test_csv_source_and_reason_are_formula_safe(self):
+    def test_detailed_csv_reason_is_formula_safe(self):
         item = target()
         item["endpoints"][0].update(status="FAILED", error="=HYPERLINK(\"https://example.invalid\")")
         result = self.build(manifest(item))
-        destination = self.base / "output"
-        report.write_campaign_report(result, destination)
-        with (destination / "report.csv").open(newline="") as stream:
+        destination = self.base / "detailed.csv"
+        report.write_report(result["rows"], destination, self.base / "raw" / "one.xml", detailed=True)
+        with destination.open(newline="") as stream:
             self.assertTrue(next(csv.DictReader(stream))["reason"].startswith("'="))
 
     def test_runtime_evidence_is_separate_and_network_state_unchanged(self):
@@ -420,6 +449,13 @@ class CampaignReportTests(unittest.TestCase):
         self.assertEqual(row["inventory_patch_status"], "PATCH_CONFIRMED")
         self.assertEqual(result["summary"]["inventory_counts"], {"PATCH_CONFIRMED": 1})
         self.assertEqual(len(result["inventory"]["sha256"]), 64)
+        destination = self.base / "output"
+        report.write_campaign_report(result, destination)
+        compact = self.assert_compact_artifacts(destination, {"application.example.com": ("8.3.35", "NON")})
+        self.assertIn("attest", compact[0]["explication"].lower())
+        details = json.loads((destination / "raw" / "report-details.json").read_text())
+        self.assertEqual(details["rows"][0]["state"], "POTENTIALLY_VULNERABLE")
+        self.assertEqual(details["rows"][0]["inventory_patch_status"], "PATCH_CONFIRMED")
 
     def test_bad_inventory_previous_or_manifest_fails_explicitly(self):
         bad = self.base / "bad.json"
@@ -440,11 +476,13 @@ class CampaignReportTests(unittest.TestCase):
         report.write_campaign_report(result, destination)
         initial = (destination / "report.json").read_bytes()
         initial_csv = (destination / "report.csv").read_bytes()
+        initial_details = (destination / "raw" / "report-details.json").read_bytes()
         result["invalid"] = float("nan")
         with self.assertRaises(ValueError):
             report.write_campaign_report(result, destination)
         self.assertEqual((destination / "report.json").read_bytes(), initial)
         self.assertEqual((destination / "report.csv").read_bytes(), initial_csv)
+        self.assertEqual((destination / "raw" / "report-details.json").read_bytes(), initial_details)
 
 
 if __name__ == "__main__":

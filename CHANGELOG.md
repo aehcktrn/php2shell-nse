@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1 — 2026-10-22
+
+### Rapports compacts
+
+- `report.csv` et `report.json` contiennent désormais une ligne par cible DNS, en regroupant ses IP, ports et chemins, avec seulement quatre champs : `cible`, `php`, `vulnerable`, `explication`.
+- Versions PHP observées toujours visibles, ou `INCONNUE`, et résultat `OUI`, `NON` ou `INDETERMINE` accompagné d'une explication courte sur une seule ligne.
+- Prise en compte des attestations de correction, des runtimes affectés et des contrôles manquants dans la synthèse ; une version masquée ou une absence de contrôle ne devient pas un résultat négatif.
+- JSON principal sous forme de liste simple, un objet par ligne. Le bilan détaillé reste disponible dans `raw/report-details.json` ; `changes.csv` conserve sa structure.
+- Compatibilité de `--previous` et du profil `recontrole` avec les anciens JSON détaillés et les nouveaux rapports compacts. Ces derniers nécessitent leur fichier compagnon cohérent dans le dossier de campagne.
+- Conversion hors ligne d'un XML ou d'un rapport JSON en CSV compact avec `report.py`, sans relancer de scan ; option `--detailed` pour conserver l'export CSV technique à partir des données détaillées.
+- Tests de cardinalité sur 465 cibles, d'agrégation des services, de preuve de backport, de conversion et de compatibilité du recontrôle ; ajout de la suite dédiée aux rapports compacts dans la CI.
+
+La version du lanceur passe à **0.4.1**. Le NSE autonome reste en **0.3.0** ; les seuils PHP et les codes de sortie du lanceur sont inchangés.
+
 ## 0.4.0 — 2026-10-22
 
 ### Découverte de sous-domaines

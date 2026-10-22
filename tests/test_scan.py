@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import csv
 import io
 import json
 from pathlib import Path
@@ -38,6 +39,21 @@ class CampaignInputTests(unittest.TestCase):
     def resolved(self, *_args):
         return {"dns_status": "RESOLVED", "addresses": ["192.0.2.10"], "dns_error": "",
                 "dns_families": {"ipv4": {"status": "RESOLVED", "addresses": ["192.0.2.10"]}}}
+
+    def assert_indeterminate_report(self, output, hostname):
+        compact = json.loads((output / "report.json").read_text())
+        self.assertIsInstance(compact, list)
+        self.assertEqual(len(compact), 1)
+        row = compact[0]
+        fields = ("cible", "php", "vulnerable", "explication")
+        self.assertEqual(set(row), set(fields))
+        self.assertEqual((row["cible"], row["php"], row["vulnerable"]),
+                         (hostname, "INCONNUE", "INDETERMINE"))
+        self.assertTrue(row["explication"])
+        with (output / "report.csv").open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            self.assertEqual(tuple(reader.fieldnames), fields)
+            self.assertEqual(list(reader), compact)
 
     def test_hostname_normalization_and_idna(self):
         self.assertEqual(scan.hostname("WWW.Example.COM."), "www.example.com")
@@ -204,6 +220,22 @@ class CampaignInputTests(unittest.TestCase):
             scan.run_campaign(self.args("--profile", "recontrole", "--previous", previous, "--dry-run"))
         resolver.assert_not_called()
 
+    def test_compact_previous_without_details_fails_before_network_activity(self):
+        targets = self.file("domains.txt", "app.example.com")
+        previous = self.file("previous.json", json.dumps([{
+            "cible": "app.example.com", "php": "8.3.35", "vulnerable": "OUI",
+            "explication": "Version anterieure au correctif.",
+        }]))
+        output = self.root / "unstarted"
+        with patch.object(scan, "resolve_target") as resolver, \
+             patch.object(scan, "discover_root") as provider, \
+             patch.object(scan.Processes, "run") as runner, self.assertRaises(scan.InputError):
+            scan.run_campaign(self.args(targets, "--previous", previous, "--dry-run", "--output", output))
+        resolver.assert_not_called()
+        provider.assert_not_called()
+        runner.assert_not_called()
+        self.assertFalse(output.exists())
+
     def test_dry_run_keeps_all_targets_and_redacts_arguments(self):
         targets = self.file("domains.txt", "app.example.com\n")
         output = self.root / "preview"
@@ -241,11 +273,12 @@ class CampaignInputTests(unittest.TestCase):
             code = scan.run_campaign(self.args(targets, "--output", output))
         runner.assert_not_called()
         self.assertEqual(code, 2)
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertEqual(report["summary"]["targets_total"], 1)
         self.assertEqual(report["summary"]["targets_evaluated"], 0)
         self.assertEqual(report["rows"][0]["reason_code"], "DNS_ERROR")
         self.assertEqual(report["campaign"]["status"], "PARTIAL")
+        self.assert_indeterminate_report(output, "missing.example.com")
 
     def test_nmap_failure_is_retained_and_temporary_arguments_removed(self):
         targets = self.file("domains.txt", "app.example.com")
@@ -257,9 +290,10 @@ class CampaignInputTests(unittest.TestCase):
              patch.object(scan.Processes, "run", side_effect=failed), redirect_stdout(io.StringIO()):
             code = scan.run_campaign(self.args(targets, "--output", output))
         self.assertEqual(code, 2)
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertEqual(report["rows"][0]["reason_code"], "SCAN_FAILED")
         self.assertEqual(list((output / "raw").glob("*.args")), [])
+        self.assert_indeterminate_report(output, "app.example.com")
 
     def test_dns_interruption_preserves_manifest_and_report(self):
         targets = self.file("domains.txt", "app.example.com")

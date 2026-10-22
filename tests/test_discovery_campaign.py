@@ -43,6 +43,21 @@ class DiscoveryCampaignTests(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
         return path
 
+    def assert_compact_targets(self, output, expected):
+        compact = json.loads((output / "report.json").read_text(encoding="utf-8"))
+        self.assertIsInstance(compact, list)
+        self.assertEqual(len(compact), len(expected))
+        fields = ("cible", "php", "vulnerable", "explication")
+        for row in compact:
+            self.assertEqual(set(row), set(fields))
+            self.assertTrue(all(isinstance(value, str) for value in row.values()))
+            self.assertTrue(row["explication"])
+        self.assertEqual({row["cible"]: (row["php"], row["vulnerable"]) for row in compact}, expected)
+        with (output / "report.csv").open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            self.assertEqual(tuple(reader.fieldnames), fields)
+            self.assertEqual(list(reader), compact)
+
     @staticmethod
     def resolved(*_args):
         return {"dns_status": "RESOLVED", "addresses": ["192.0.2.10"], "dns_error": "",
@@ -144,18 +159,19 @@ class DiscoveryCampaignTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([item["hostname"] for item in data["targets"]], ["example.com"])
         self.assertEqual((output / "discovered.txt").read_text(), "")
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertTrue(report["summary"]["discovery_processing_complete"])
         self.assertFalse(report["summary"]["discovery_exhaustive"])
         self.assertEqual(report["summary"]["discovery_candidates_count"], 0)
+        self.assert_compact_targets(output, {"example.com": ("8.3.36", "NON")})
 
-    def test_source_failure_keeps_successful_scans_but_campaign_and_csv_are_partial(self):
+    def test_source_failure_remains_in_details_and_does_not_duplicate_successful_target(self):
         code, output, data, _, _, runner = self.execute(
             source=source_result(status="FAILED", reason="TIMEOUT"), dry_run=False)
         self.assertEqual(code, 2)
         runner.assert_called_once()
         self.assertEqual(data["status"], "PARTIAL")
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertEqual(report["summary"]["assessments"], 1)
         self.assertFalse(report["summary"]["processing_complete"])
         discovery_rows = [row for row in report["rows"] if row["protocol"] == "discovery"]
@@ -163,9 +179,7 @@ class DiscoveryCampaignTests(unittest.TestCase):
         self.assertEqual(discovery_rows[0]["reason_code"], "DISCOVERY_TIMEOUT")
         self.assertEqual(discovery_rows[0]["state"], "NOT_ASSESSED")
         self.assertEqual(discovery_rows[0]["port"], "")
-        with (output / "report.csv").open(newline="", encoding="utf-8") as stream:
-            rows = list(csv.DictReader(stream))
-        self.assertTrue(any(row["reason_code"] == "DISCOVERY_TIMEOUT" for row in rows))
+        self.assert_compact_targets(output, {"example.com": ("8.3.36", "NON")})
 
     def test_useful_names_from_partial_source_still_get_assessed(self):
         code, output, data, _, _, runner = self.execute(
@@ -174,10 +188,13 @@ class DiscoveryCampaignTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(runner.call_count, 2)
         self.assertEqual(data["discovery"]["resolved_count"], 1)
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertEqual(report["summary"]["assessments"], 2)
         self.assertEqual(report["summary"]["discovery_status"], "PARTIAL")
         self.assertIn("DISCOVERY_PROVIDER_LIMIT_REACHED", {row["reason_code"] for row in report["rows"]})
+        self.assert_compact_targets(output, {
+            "example.com": ("8.3.36", "NON"), "app.example.com": ("8.3.36", "NON"),
+        })
 
     def test_rate_limit_stops_source_queries_and_records_remaining_roots(self):
         code, _, data, provider, _, _ = self.execute(
@@ -254,19 +271,21 @@ class DiscoveryCampaignTests(unittest.TestCase):
         self.assertEqual(dns.call_args.args[0], "example.com")
         self.assertEqual(data["discovery"]["skipped_roots"],
                          [{"root": "example.com", "reason": "SUBDOMAINS_EXCLUDED_BY_OPERATOR"}])
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertTrue(report["summary"]["discovery_processing_complete"])
         self.assertEqual(report["summary"]["discovery_roots_excluded"], 1)
         self.assertEqual(report["summary"]["discovery_coverage_rows"], 0)
+        self.assert_compact_targets(output, {"example.com": ("8.3.36", "NON")})
 
     def test_wholly_excluded_scope_neither_queries_resolves_nor_scans(self):
         exclude = self.file("exclude.txt", "example.com\n*.example.com\n")
-        code, _, data, provider, dns, runner = self.execute("--exclude", exclude, dry_run=False)
+        code, output, data, provider, dns, runner = self.execute("--exclude", exclude, dry_run=False)
         self.assertEqual(code, 0)
         provider.assert_not_called()
         dns.assert_not_called()
         runner.assert_not_called()
         self.assertEqual(data["targets"], [])
+        self.assert_compact_targets(output, {})
 
     def test_historical_names_stay_in_artifacts_after_dns_absence(self):
         def lookup(name, *_args):
@@ -284,8 +303,11 @@ class DiscoveryCampaignTests(unittest.TestCase):
         self.assertEqual(candidate["dns_status"], "NO_ADDRESS")
         self.assertEqual(data["discovery"]["unresolved_count"], 1)
         self.assertTrue(data["discovery"]["processing_complete"])
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertIn("NO_DNS_ADDRESS", {row["reason_code"] for row in report["rows"]})
+        self.assert_compact_targets(output, {
+            "example.com": ("8.3.36", "NON"), "old.example.com": ("INCONNUE", "INDETERMINE"),
+        })
 
     def test_interruption_persists_discovery_and_report_without_further_network(self):
         code, output, data, provider, dns, runner = self.execute(
@@ -335,11 +357,13 @@ class DiscoveryCampaignTests(unittest.TestCase):
         self.assertEqual((output / "discovered.txt").read_text(), "app.example.com\n")
         self.assertEqual(json.loads((output / "discovery.json").read_text()), discovery)
         self.assertTrue(discovery["finished_at"])
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertFalse(report["summary"]["processing_complete"])
-        with (output / "report.csv").open(newline="", encoding="utf-8") as stream:
-            rows = list(csv.DictReader(stream))
-        self.assertEqual(sum(row["reason_code"] == "DISCOVERY_CAMPAIGN_INTERRUPTED" for row in rows), 2)
+        self.assertEqual(sum(row["reason_code"] == "DISCOVERY_CAMPAIGN_INTERRUPTED" for row in report["rows"]), 2)
+        self.assert_compact_targets(output, {
+            "example.com": ("INCONNUE", "INDETERMINE"), "example.org": ("INCONNUE", "INDETERMINE"),
+            "example.net": ("INCONNUE", "INDETERMINE"), "app.example.com": ("INCONNUE", "INDETERMINE"),
+        })
 
     def test_interrupt_during_merge_or_snapshot_finishes_report_without_duplicate_exclusions(self):
         exclude = self.file("exclude.txt", "private.example.com\n")
@@ -377,10 +401,12 @@ class DiscoveryCampaignTests(unittest.TestCase):
                 "source": "crt.sh:example.com", "reason": "EXCLUDED_BY_OPERATOR"}])
             self.assertEqual((output / "discovered.txt").read_text(), "app.example.com\n")
             self.assertEqual(json.loads((output / "discovery.json").read_text()), data["discovery"])
-            report = json.loads((output / "report.json").read_text())
+            report = json.loads((output / "raw" / "report-details.json").read_text())
             self.assertFalse(report["summary"]["processing_complete"])
             self.assertEqual(report["summary"]["assessments"], 0)
-            self.assertTrue((output / "report.csv").is_file())
+            self.assert_compact_targets(output, {
+                "example.com": ("INCONNUE", "INDETERMINE"), "app.example.com": ("INCONNUE", "INDETERMINE"),
+            })
 
     def test_provider_exception_is_visible_and_root_scan_remains_available(self):
         code, _, data, _, dns, _ = self.execute(source=RuntimeError("fixture adapter failure"))

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Convert a completed Nmap PHP2Shell XML scan into an actionable CSV report.
+"""Export local PHP2Shell XML or JSON results as one CSV row per target.
 
-This program only reads a local XML file. It does not run Nmap or contact hosts.
-Each XML host instance is preserved, including virtual hosts sharing an IP.
+No scan or network connection is made. Detailed observations remain available
+with --detailed; the default export contains cible, php, vulnerable, explication.
 """
 from __future__ import annotations
 
@@ -31,6 +31,9 @@ FIELDS = (
     "observed_at", "campaign_id", "source_xml", "inventory_patch_status",
     "inventory_source", "inventory_observed_at", "inventory_reason", "address_family", "scan_ports",
 )
+COMPACT_FIELDS = ("cible", "php", "vulnerable", "explication")
+COMPACT_VERDICTS = ("OUI", "NON", "INDETERMINE")
+MAX_REPORT_BYTES = 128 * 1024 * 1024
 SCRIPT_ID = "http-php2shell"
 STATES = ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED", "UNKNOWN")
 PRIORITIES = {
@@ -60,7 +63,7 @@ VERIFY_RUNTIME = (
 
 
 class ReportError(ValueError):
-    """The input does not establish a completed, usable Nmap scan."""
+    """A local scan or report cannot be interpreted safely."""
 
 
 def _scalar(parent: ET.Element, key: str, default: str = "") -> str:
@@ -109,7 +112,8 @@ def _port_identity(port: ET.Element) -> dict[str, str]:
     if service is not None and service.get("tunnel") == "ssl":
         name = "ssl/" + (name or "unknown")
     return {"port": port.get("portid", ""),
-            "protocol": port.get("protocol", ""), "service": name}
+            "protocol": port.get("protocol", ""), "service": name,
+            "service_method": service.get("method", "") if service is not None else ""}
 
 
 def _details(parent: ET.Element, key: str) -> list[dict[str, Any]]:
@@ -278,6 +282,211 @@ def parse_report(source: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _single_line(value: object) -> str:
+    """Keep a compact record on one physical line, including in CSV exports."""
+    text = str(value) if value is not None else ""
+    return " ".join("".join(" " if unicodedata.category(char).startswith("C") else char
+                            for char in text).split())
+
+
+def _version_values(value: object) -> list[str]:
+    values = value if isinstance(value, (list, tuple)) else str(value or "").split("|")
+    return _unique([_single_line(item) for item in values])
+
+
+def _true(value: object) -> bool:
+    return str(value).lower() in ("true", "yes", "1")
+
+
+# A missing NSE assessment on a positively identified non-web service is
+# normal. Unknown, tcpwrapped and all HTTP variants deliberately remain gaps.
+NON_WEB_SERVICES = frozenset({
+    "ssh", "ftp", "ftp-data", "smtp", "smtps", "submission", "pop3", "pop3s",
+    "imap", "imaps", "domain", "mysql", "postgresql", "ms-sql-s", "ms-wbt-server",
+    "vnc", "redis", "ldap", "ldaps", "netbios-ssn", "microsoft-ds", "msrpc",
+    "rpcbind", "nfs", "rsync", "telnet", "kerberos-sec", "ntp", "snmp", "amqp",
+    "amqps", "mqtt", "mqtts", "memcached", "mongodb", "ajp13",
+})
+HTTP_GAP_CODES = frozenset({
+    "NO_HTTP_RESPONSE", "AUTHENTICATION_REQUIRED", "HTTP_ACCESS_DENIED", "RATE_LIMITED",
+    "REDIRECT_NOT_ASSESSED", "REDIRECT_LIMIT_REACHED", "REQUEST_BUDGET_EXHAUSTED",
+    "CLOCK_CHANGED", "EVIDENCE_LIMIT_REACHED", "INVALID_ARGUMENT",
+})
+COMPACT_REASONS = {
+    "DNS_ERROR": "Résolution DNS impossible",
+    "DNS_FAMILY_ERROR": "Résolution DNS incomplète pour une famille IP",
+    "NO_DNS_ADDRESS": "Aucune adresse IP résolue",
+    "TARGET_NOT_ATTEMPTED": "Cible non testée",
+    "ADDRESS_NOT_ATTEMPTED": "Une adresse IP résolue n'a pas été testée",
+    "SCAN_TIMEOUT": "Délai du scan Nmap dépassé",
+    "SCAN_FAILED": "Échec du scan Nmap",
+    "SCAN_INCOMPLETE": "Scan Nmap incomplet",
+    "SCAN_SKIPPED": "Scan Nmap non exécuté",
+    "SCAN_NOT_ATTEMPTED": "Scan Nmap non exécuté",
+    "INVALID_SCAN_XML": "Résultat Nmap incomplet ou invalide",
+    "TARGET_MISSING_FROM_XML": "Cible absente du résultat Nmap",
+    "NO_OPEN_TCP_PORT": "Aucun port TCP ouvert observé ; PHP non vérifié",
+    "SERVICE_NOT_ASSESSED": "Service ouvert sans évaluation PHP exploitable",
+    "NO_HTTP_RESPONSE": "Aucune réponse HTTP exploitable",
+    "AUTHENTICATION_REQUIRED": "HTTP 401 : authentification requise",
+    "HTTP_ACCESS_DENIED": "HTTP 403 : accès refusé",
+    "RATE_LIMITED": "HTTP 429 : requêtes limitées",
+    "REDIRECT_NOT_ASSESSED": "Destination de redirection non évaluée",
+    "REDIRECT_LIMIT_REACHED": "Parcours des redirections incomplet",
+    "REQUEST_BUDGET_EXHAUSTED": "Budget HTTP épuisé avant la fin des contrôles",
+    "CLOCK_CHANGED": "Parcours HTTP interrompu par un changement d'horloge",
+    "EVIDENCE_LIMIT_REACHED": "Observations trop nombreuses pour conclure",
+    "INVALID_ARGUMENT": "Paramètres du test HTTP invalides",
+    "CONFLICTING_VERSIONS": "Versions PHP contradictoires sur le même service",
+    "UNRECOGNIZED_BUILD": "Build PHP non reconnu ; correctif à vérifier côté serveur",
+    "PHP_VERSION_HIDDEN": "PHP détecté, mais sa version n'est pas annoncée",
+    "PHP_NOT_IDENTIFIED": "PHP non identifié ; absence de vulnérabilité non établie",
+}
+
+
+def _non_web_coverage(row: dict[str, Any]) -> bool:
+    service = str(row.get("service", "")).lower().removeprefix("ssl/")
+    return (row.get("row_type") == "COVERAGE"
+            and row.get("reason_code") == "SERVICE_NOT_ASSESSED"
+            and row.get("service_method") == "probed"
+            and row.get("inventory_patch_status") not in ("PATCH_MISSING_CONFIRMED", "CONFLICT")
+            and service in NON_WEB_SERVICES)
+
+
+def _http_gap(row: dict[str, Any]) -> bool:
+    return (_true(row.get("budget_exhausted"))
+            or str(row.get("traversal_complete", "")).lower() in ("false", "no", "0")
+            or row.get("reason_code") in HTTP_GAP_CODES
+            or row.get("traversal_reason_code") in HTTP_GAP_CODES)
+
+
+def _suspect(row: dict[str, Any]) -> bool:
+    evidence = row.get("evidence")
+    return (row.get("state") == "POTENTIALLY_VULNERABLE"
+            or _true(row.get("potentially_vulnerable_evidence"))
+            or any(isinstance(item, dict) and item.get("state") == "POTENTIALLY_VULNERABLE"
+                   for item in (evidence if isinstance(evidence, list) else [])))
+
+
+def _compact_verdict(row: dict[str, Any]) -> str:
+    proof = row.get("inventory_patch_status")
+    if proof == "PATCH_MISSING_CONFIRMED":
+        return "OUI"
+    if row.get("row_type") != "ASSESSMENT" or proof == "CONFLICT" or _http_gap(row):
+        return "INDETERMINE"
+    if proof == "PATCH_CONFIRMED":
+        return "NON"
+    if _version_values(row.get("versions")):
+        if row.get("state") == "POTENTIALLY_VULNERABLE":
+            return "OUI"
+        if row.get("state") == "PATCHED_VERSION_ADVERTISED" and not _suspect(row):
+            return "NON"
+    return "INDETERMINE"
+
+
+def _short(value: object, limit: int = 150) -> str:
+    text = _single_line(value)
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _endpoint_hint(row: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    port, ip = _single_line(row.get("port")), _single_line(row.get("ip"))
+    ips = {_single_line(item.get("ip")) for item in rows if item.get("ip")}
+    if ip and (len(ips) > 1 or row.get("row_type") != "ASSESSMENT"):
+        endpoint = ("[" + ip + "]") if ":" in ip else ip
+        return " (" + _short(endpoint + (":" + port if port else ""), 75) + ")"
+    return " (port " + _short(port, 12) + ")" if port else ""
+
+
+def _unknown_reason(row: dict[str, Any]) -> str:
+    if row.get("inventory_patch_status") == "CONFLICT":
+        return "Preuves serveur contradictoires ; vérifier le runtime"
+    code = row.get("traversal_reason_code") or row.get("reason_code")
+    if code in COMPACT_REASONS:
+        return COMPACT_REASONS[code]
+    if _true(row.get("budget_exhausted")) or str(row.get("traversal_complete", "")).lower() in ("false", "no", "0"):
+        return "Parcours HTTP incomplet"
+    if row.get("reason"):
+        return _short(row["reason"])
+    return "Version ou correctifs PHP impossibles à établir"
+
+
+def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str) -> str:
+    if not rows:
+        return "Aucun service HTTP évalué ; PHP et ses correctifs restent à vérifier."
+    if verdict == "OUI":
+        positive = [row for row, value in zip(rows, verdicts) if value == "OUI"]
+        row = next((item for item in positive if item.get("inventory_patch_status") == "PATCH_MISSING_CONFIRMED"), positive[0])
+        if row.get("inventory_patch_status") == "PATCH_MISSING_CONFIRMED":
+            reason = "Correctif manquant attesté côté serveur" + _endpoint_hint(row, rows)
+            reason += "; appliquer les correctifs PHP et redémarrer les workers."
+        else:
+            reason = "Version annoncée concernée" + _endpoint_hint(row, rows)
+            fixed = _version_values(row.get("fixed_versions"))
+            action = ("mettre à jour PHP vers " + _short(" / ".join(fixed), 60)
+                      if fixed else "mettre à jour PHP")
+            reason += "; " + action + " ou vérifier le correctif fournisseur."
+        gaps = sum(value == "INDETERMINE" or _http_gap(item)
+                   or item.get("row_type") != "ASSESSMENT" for item, value in zip(rows, verdicts))
+        if gaps:
+            reason += f" Contrôles incomplets : {gaps}."
+        return reason
+    if verdict == "NON":
+        attested = [row for row in rows if row.get("inventory_patch_status") == "PATCH_CONFIRMED"]
+        if len(attested) == len(rows):
+            reason = "Correctifs attestés côté serveur sur les services évalués"
+            if any(_suspect(row) for row in rows):
+                reason += ", malgré la version annoncée"
+            return reason + "."
+        if attested:
+            return "Versions corrigées annoncées ou correctifs attestés côté serveur sur les services évalués."
+        return "Versions annoncées corrigées sur les services évalués ; runtime à confirmer côté serveur."
+    unknown = [row for row, value in zip(rows, verdicts) if value == "INDETERMINE"]
+    # Surface a concrete coverage failure before a generic hidden-version
+    # observation, without expanding one line into a catalogue of endpoints.
+    row = next((item for item in unknown if item.get("row_type") != "ASSESSMENT" or _http_gap(item)), unknown[0])
+    reason = _unknown_reason(row) + _endpoint_hint(row, rows)
+    if any(_suspect(item) for item in unknown):
+        reason += "; version concernée observée, correctif à vérifier"
+    if any(item.get("inventory_patch_status") == "PATCH_CONFIRMED" for item in rows):
+        reason += "; correctifs attestés, couverture incomplète"
+    elif any(item.get("inventory_patch_status") in ("STALE", "UNVERIFIED", "PARTIAL") for item in unknown):
+        reason += "; preuve serveur inexploitable ou partielle"
+    if len(unknown) > 1:
+        reason += f"; {len(unknown)} contrôles indéterminés"
+    return reason + "."
+
+
+def compact_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Aggregate IPs and ports into four fields per hostname (or XML IP).
+
+    OUI includes an affected advertised version and says so explicitly. NON
+    requires every assessed web service to be corrected or attested, without
+    silently discarding DNS, Nmap or HTTP coverage failures. Discovery status
+    belongs to campaign details, not to an extra target or a PHP verdict.
+    """
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ReportError("Lignes détaillées invalides : une liste d'objets est requise.")
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("protocol") == "discovery":
+            continue
+        target = _single_line(row.get("hostname") or row.get("ip"))
+        if not target:
+            raise ReportError("Ligne sans cible : hostname ou ip requis pour le rapport compact.")
+        groups.setdefault(target, []).append(row)
+    output = []
+    for target, group in groups.items():
+        versions = _unique([version for row in group for version in _version_values(row.get("versions"))])
+        relevant = [row for row in group if not _non_web_coverage(row)]
+        verdicts = [_compact_verdict(row) for row in relevant]
+        verdict = ("OUI" if "OUI" in verdicts else
+                   "NON" if verdicts and all(value == "NON" for value in verdicts) else "INDETERMINE")
+        output.append({"cible": target, "php": " | ".join(versions) or "INCONNUE", "vulnerable": verdict,
+                       "explication": _short(_compact_explanation(relevant, verdicts, verdict), 360)})
+    return output
+
+
 def safe_cell(value: object) -> str:
     """Prevent CSV formula execution, including whitespace/control prefixes."""
     text = str(value) if value is not None else ""
@@ -289,31 +498,94 @@ def safe_cell(value: object) -> str:
     return "'" + text if leading_control or dangerous else text
 
 
-def write_report(rows: list[dict[str, str]], destination: Path, source: Path) -> None:
-    """Atomically write UTF-8 CSV without replacing the input XML."""
+def _protect_source(destination: Path, source: Path) -> None:
     if destination.resolve() == source.resolve() or (
         destination.exists() and source.exists() and os.path.samefile(destination, source)
     ):
-        raise ReportError("Le fichier de sortie doit etre different du XML source.")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
+        raise ReportError("Le fichier de sortie doit etre different du fichier source.")
+
+
+def _validate_compact(rows: object) -> list[dict[str, str]]:
+    if not isinstance(rows, list):
+        raise ReportError("Rapport compact invalide : une liste de cibles est requise.")
+    seen = set()
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) != set(COMPACT_FIELDS)
+                or any(not isinstance(value, str) or not value or value != _single_line(value)
+                       for value in row.values())
+                or row.get("vulnerable") not in COMPACT_VERDICTS):
+            raise ReportError("Rapport compact invalide : cible, php, vulnerable et explication sont requis, sur une ligne.")
+        if row["cible"] in seen:
+            raise ReportError("Rapport compact invalide : plusieurs lignes pour la même cible.")
+        seen.add(row["cible"])
+    return rows
+
+
+def _validate_detailed(value: object) -> dict[str, Any]:
+    if (not isinstance(value, dict) or str(value.get("schema_version")) != "1"
+            or not isinstance(value.get("rows"), list)
+            or any(not isinstance(row, dict) for row in value["rows"])):
+        raise ReportError("Rapport détaillé invalide : schema_version='1' et rows=[objets] requis.")
+    string_fields = ("hostname", "ip", "protocol", "service", "service_method", "row_type", "state", "versions",
+                     "fixed_versions", "reason", "reason_code", "traversal_reason_code", "inventory_patch_status")
+    for row in value["rows"]:
+        if set(COMPACT_FIELDS).issubset(row):
+            raise ReportError("Rapport détaillé invalide : une ligne compacte ne contient pas les observations par service.")
+        if any(key in row and not isinstance(row[key], str) for key in string_fields):
+            raise ReportError("Ligne du rapport détaillé invalide : champs de résultat textuels requis.")
+        if row.get("protocol") != "discovery" and not _single_line(row.get("hostname") or row.get("ip")):
+            raise ReportError("Ligne du rapport détaillé sans cible : hostname ou ip requis.")
+        if "port" in row and (isinstance(row["port"], bool) or not isinstance(row["port"], (str, int))):
+            raise ReportError("Port invalide dans le rapport détaillé.")
+    return value
+
+
+def _read_json_report(path: Path) -> tuple[object, bytes]:
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="", prefix=".php2shell-report-",
-            suffix=".csv", dir=destination.parent, delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
-            writer = csv.DictWriter(stream, fieldnames=FIELDS)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({key: safe_cell(row.get(key, "")) for key in FIELDS})
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        with Path(path).open("rb") as stream:
+            raw = stream.read(MAX_REPORT_BYTES + 1)
+        if len(raw) > MAX_REPORT_BYTES:
+            raise ReportError("Rapport JSON trop volumineux : limite de 128 MiB.")
+        def invalid_constant(value):
+            raise ValueError("constante JSON invalide : " + value)
+        return json.loads(raw, parse_constant=invalid_constant), raw
+    except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+        raise ReportError(f"Rapport JSON illisible ({path}): {exc}") from exc
+
+
+def load_campaign_report(path: Path) -> dict[str, Any]:
+    """Load legacy details or a compact report with its matching fixed companion.
+
+    Comparisons and rechecks need service identities and evidence that the four
+    display fields cannot recover. The companion must match the main report;
+    no path from untrusted JSON is followed and no data is silently invented.
+    """
+    path = Path(path)
+    value, _ = _read_json_report(path)
+    if isinstance(value, dict):
+        return _validate_detailed(value)
+    compact = _validate_compact(value)
+    companion = path.parent / "raw" / "report-details.json"
+    try:
+        details = _validate_detailed(_read_json_report(companion)[0])
+    except ReportError as exc:
+        raise ReportError(f"Rapport compact : compagnon détaillé requis et valide ({companion}): {exc}") from exc
+    if compact_rows(details["rows"]) != compact:
+        raise ReportError("Rapport compact incohérent avec raw/report-details.json ; conserver les fichiers de la même campagne.")
+    return details
+
+
+def write_report(rows: list[dict[str, Any]], destination: Path, source: Path, *, detailed: bool = False) -> None:
+    """Atomically export CSV, protecting the source and all its aliases."""
+    destination, source = Path(destination), Path(source)
+    _protect_source(destination, source)
+    if detailed:
+        if rows and "cible" in rows[0]:
+            raise ReportError("Les observations détaillées sont requises pour exporter le CSV technique.")
+        _write_csv(rows, destination, FIELDS)
+    else:
+        compact = _validate_compact(rows) if rows and "cible" in rows[0] else compact_rows(rows)
+        _write_csv(compact, destination, COMPACT_FIELDS)
 
 
 CHANGE_FIELDS = ("change", "hostname", "ip", "port", "protocol", "path", "previous_state",
@@ -372,7 +644,7 @@ def compare_reports(current: dict[str, Any], previous: dict[str, Any]) -> list[d
         return output
     old, new = index(previous["rows"]), index(current["rows"])
     compared = ("row_type", "state", "versions", "reason_code", "path", "scheme", "php_detected",
-                "inventory_patch_status")
+                "inventory_patch_status", "service", "service_method")
     changes = []
     for key in sorted(old.keys() | new.keys()):
         before, after = old.get(key), new.get(key)
@@ -647,13 +919,8 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
         result["inventory"] = {key: inventory_data[key] for key in ("filename", "sha256", "trust_note")}
         result["inventory"]["max_age_hours"] = max_inventory_age_hours
     if previous is not None:
-        try:
-            raw = Path(previous).read_bytes()
-            if len(raw) > 128 * 1024 * 1024:
-                raise ReportError("Rapport precedent trop volumineux.")
-            old = json.loads(raw)
-        except (OSError, ValueError, UnicodeError) as exc:
-            raise ReportError(f"Rapport precedent JSON illisible: {exc}") from exc
+        old = load_campaign_report(Path(previous))
+        _, raw = _read_json_report(Path(previous))
         result["changes"] = compare_reports(result, old)
         result["comparison"] = {"filename": Path(previous).name, "sha256": hashlib.sha256(raw).hexdigest(),
                                 "previous_campaign": old.get("campaign", {}),
@@ -664,30 +931,57 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
 def write_campaign_report(report: dict, output_dir: Path) -> None:
     """Write each artifact atomically; publish JSON last as completion marker."""
     output_dir = Path(output_dir)
-    # Validate serialization before touching an existing report.
-    rendered = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-    _write_csv(report["rows"], output_dir / "report.csv", FIELDS)
+    # Validate both forms before touching any existing artifact. Keep evidence
+    # and service-level comparison data out of the operator's main reports.
+    details = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    compact = compact_rows(_validate_detailed(report)["rows"])
+    objects = [json.dumps(row, ensure_ascii=False, allow_nan=False) for row in compact]
+    rendered = "[\n" + ",\n".join(objects) + ("\n" if objects else "") + "]\n"
+    _atomic_text(output_dir / "raw" / "report-details.json", lambda stream: stream.write(details))
+    _write_csv(compact, output_dir / "report.csv", COMPACT_FIELDS)
     _write_csv(report.get("changes", []), output_dir / "changes.csv", CHANGE_FIELDS)
     _atomic_text(output_dir / "report.json", lambda stream: stream.write(rendered))
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("xml", type=Path, help="XML Nmap d'un scan termine avec succes")
+    parser.add_argument("source", type=Path, help="XML Nmap terminé ou rapport JSON existant")
     parser.add_argument("-o", "--output", required=True, type=Path, help="CSV UTF-8 a produire")
+    parser.add_argument("--detailed", action="store_true", help="Exporter les observations techniques et la couverture (ancien CSV)")
     args = parser.parse_args(argv)
     try:
-        rows = parse_report(args.xml)
-        write_report(rows, args.output, args.xml)
+        # Sniff only a small prefix. JSON loading has its own bounded reader;
+        # XML parsing still requires a completed, successful Nmap scan.
+        with args.source.open("rb") as stream:
+            prefix = stream.read(4096).lstrip(b"\xef\xbb\xbf \t\r\n")
+        if args.source.suffix.lower() in (".json", ".jsonl") or prefix.startswith((b"[", b"{")):
+            value, _ = _read_json_report(args.source)
+            if isinstance(value, list):
+                rows = _validate_compact(value)
+                companion = args.source.parent / "raw" / "report-details.json"
+                if companion.exists():
+                    _protect_source(args.output, companion)
+                if args.detailed:
+                    rows = load_campaign_report(args.source)["rows"]
+            else:
+                rows = _validate_detailed(value)["rows"]
+        else:
+            rows = parse_report(args.source)
+        write_report(rows, args.output, args.source, detailed=args.detailed)
     except (ReportError, OSError) as exc:
         print(f"Erreur: {exc}", file=sys.stderr)
         return 2
-    counts = Counter(row["state"] for row in rows if row["row_type"] == "ASSESSMENT")
     print(f"Rapport: {args.output}")
+    if not args.detailed:
+        compact = rows if rows and "cible" in rows[0] else compact_rows(rows)
+        counts = Counter(row["vulnerable"] for row in compact)
+        print(f"Cibles: {len(compact)} — OUI: {counts['OUI']}, NON: {counts['NON']}, INDETERMINE: {counts['INDETERMINE']}")
+        return 0
+    counts = Counter(row["state"] for row in rows if row.get("row_type") == "ASSESSMENT")
     print(f"Evaluations PHP2Shell: {sum(counts.values())}")
     for state in STATES:
         print(f"  {state}: {counts[state]}")
-    print(f"Lignes de couverture sans evaluation: {sum(row['row_type'] == 'COVERAGE' for row in rows)}")
+    print(f"Lignes de couverture sans evaluation: {sum(row.get('row_type') == 'COVERAGE' for row in rows)}")
     print("COVERAGE / NOT_ASSESSED ne signifie pas vulnerable et ne signifie pas corrige.")
     print("Chaque entree hote du XML est conservee; les comptes ne sont pas des IP uniques.")
     return 0

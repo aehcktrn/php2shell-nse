@@ -98,7 +98,26 @@ class ScanCLIIntegration(unittest.TestCase):
         self.assertTrue((output / "manifest.json").is_file(), completed.stdout)
         return output, json.loads((output / "manifest.json").read_text()), completed
 
-    def assert_report_matches_manifest(self, output, manifest, port):
+    def assert_compact_report(self, output, hostname, version, verdict):
+        text = (output / "report.json").read_text(encoding="utf-8")
+        compact = json.loads(text)
+        self.assertIsInstance(compact, list)
+        self.assertEqual(len(compact), 1)
+        self.assertEqual(len(text.splitlines()), 3)
+        row = compact[0]
+        fields = ("cible", "php", "vulnerable", "explication")
+        self.assertEqual(set(row), set(fields))
+        self.assertTrue(all(isinstance(value, str) for value in row.values()))
+        self.assertEqual((row["cible"], row["php"], row["vulnerable"]), (hostname, version, verdict))
+        self.assertTrue(row["explication"])
+        self.assertTrue(all("\n" not in value and "\r" not in value for value in row.values()))
+        with (output / "report.csv").open(newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            self.assertEqual(tuple(reader.fieldnames), fields)
+            self.assertEqual(list(reader), compact)
+        return row
+
+    def assert_report_matches_manifest(self, output, manifest, port, *, verdict="OUI"):
         self.assertEqual(manifest["status"], "COMPLETED")
         self.assertEqual(len(manifest["targets"]), 1)
         target = manifest["targets"][0]
@@ -110,7 +129,7 @@ class ScanCLIIntegration(unittest.TestCase):
         self.assertEqual(endpoint["ip"], "127.0.0.1")
         self.assertEqual(endpoint["status"], "COMPLETED")
         self.assertTrue((output / endpoint["xml"]).is_file())
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         rows = [row for row in report["rows"] if row["row_type"] == "ASSESSMENT"]
         self.assertEqual(len(rows), 1, report)
         row = rows[0]
@@ -120,10 +139,7 @@ class ScanCLIIntegration(unittest.TestCase):
         self.assertEqual(row["state"], "POTENTIALLY_VULNERABLE")
         self.assertIn("8.3.35", row["versions"])
         self.assertTrue(row["reason_code"])
-        with (output / "report.csv").open(newline="", encoding="utf-8") as stream:
-            csv_rows = list(csv.DictReader(stream))
-        self.assertEqual(len(csv_rows), len(report["rows"]))
-        self.assertEqual(csv_rows[0]["hostname"], "localhost")
+        self.assert_compact_report(output, "localhost", "8.3.35", verdict)
         self.assertTrue((output / "changes.csv").is_file())
         return report, row
 
@@ -139,14 +155,15 @@ class ScanCLIIntegration(unittest.TestCase):
         # The listener is now closed. The same name/IP/port is scanned again.
         second, second_manifest, _ = self.run_campaign(port, "--previous", str(output / "report.json"))
         self.assertEqual(second_manifest["status"], "COMPLETED")
-        report = json.loads((second / "report.json").read_text())
+        report = json.loads((second / "raw" / "report-details.json").read_text())
         self.assertTrue(report["rows"], "A closed service must remain represented in coverage")
         self.assertTrue(all(row["state"] != "PATCHED_VERSION_ADVERTISED" for row in report["rows"]))
         self.assertFalse(any(row.get("inventory_patch_status") == "PATCH_CONFIRMED" for row in report["rows"]))
         self.assertTrue(report["changes"], "The previous service must appear in the comparison")
         self.assertIn("NO_LONGER_OBSERVED", json.dumps(report["changes"]))
+        self.assert_compact_report(second, "localhost", "INCONNUE", "INDETERMINE")
 
-    def test_tls_campaign_preserves_sni_and_separate_inventory_proof(self):
+    def test_tls_confirmed_backport_is_non_despite_old_banner_and_preserves_sni(self):
         if self.tls_context is None:
             self.skipTest("openssl is required for the local TLS fixture")
         with self.serve(tls=True) as server:
@@ -168,10 +185,12 @@ class ScanCLIIntegration(unittest.TestCase):
                 }],
             }), encoding="utf-8")
             output, manifest, _ = self.run_campaign(port, "--inventory", str(inventory))
-            _, row = self.assert_report_matches_manifest(output, manifest, port)
+            _, row = self.assert_report_matches_manifest(output, manifest, port, verdict="NON")
             self.assertEqual(row["inventory_patch_status"], "PATCH_CONFIRMED")
             # The inventory backport proof does not overwrite the observed old banner.
             self.assertEqual(row["state"], "POTENTIALLY_VULNERABLE")
+            compact = json.loads((output / "report.json").read_text())
+            self.assertIn("attest", compact[0]["explication"].lower())
             with server.record_lock:
                 requests = [item for item in server.requests if item["path"] == "/old"]
             self.assertTrue(requests)
@@ -270,7 +289,7 @@ class ScanCLIIntegration(unittest.TestCase):
         script = xml.find(".//script[@id='http-php2shell']")
         self.assertIsNotNone(script)
         self.assertEqual(script.find("elem[@key='state']").text, "POTENTIALLY_VULNERABLE")
-        report = json.loads((output / "report.json").read_text())
+        report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertEqual(report["discovery"], discovery)
         self.assertTrue(report["summary"]["discovery_processing_complete"])
         self.assertFalse(report["summary"]["discovery_exhaustive"])
@@ -282,10 +301,7 @@ class ScanCLIIntegration(unittest.TestCase):
         self.assertEqual(row["target_sources"], ["crt.sh:example.test"])
         self.assertEqual(row["state"], "POTENTIALLY_VULNERABLE")
         self.assertIn("8.3.35", row["versions"])
-        with (output / "report.csv").open(newline="", encoding="utf-8") as stream:
-            csv_rows = list(csv.DictReader(stream))
-        self.assertEqual(len(csv_rows), 1)
-        self.assertEqual(csv_rows[0]["hostname"], "app.example.test")
+        self.assert_compact_report(output, "app.example.test", "8.3.35", "OUI")
 
 
 if __name__ == "__main__":
