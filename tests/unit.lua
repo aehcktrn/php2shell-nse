@@ -208,7 +208,7 @@ test("success and exhausted budgets on one port never stop other ports", functio
       equal(result.versions[1], versions[number])
       equal(result.state, number == 443 and "POTENTIALLY_VULNERABLE" or "PATCHED_VERSION_ADVERTISED")
     end
-    equal(result.script_version, "0.3.1")
+    equal(result.script_version, "0.3.2")
   end
   equal(#calls, 4)
 end)
@@ -412,6 +412,23 @@ test("bounded GET has no redirect, cache, credentials or body", function()
   equal(opts.content, nil)
   equal(opts.auth, nil)
   equal(opts.cookies, nil)
+  equal(opts.header["User-Agent"],
+    "php2shell-scanner/0.4.4 http-php2shell/0.3.2 (+https://github.com/aehcktrn/php2shell-scanner)")
+end)
+
+test("global HTTP user agent can be overridden or disabled", function()
+  local _, custom_calls = run(response("PHP/8.3.35"), {
+    ["http.useragent"] = "authorized-inventory/1.0",
+  })
+  equal(custom_calls[1].options.header["User-Agent"], "authorized-inventory/1.0")
+  local _, disabled_calls = run(response("PHP/8.3.35"), {["http.useragent"] = ""})
+  equal(disabled_calls[1].options.header["User-Agent"], nil)
+end)
+
+test("invalid global HTTP user agent is rejected before HTTP", function()
+  local result, calls = run(response("PHP/8.3.36"), {["http.useragent"] = "bad\nheader"})
+  equal(#calls, 0)
+  equal(result.reason_code, "INVALID_ARGUMENT")
 end)
 
 test("custom path and timeout are applied", function()
@@ -527,7 +544,7 @@ test("version evidence includes exact transport and request identity", function(
     {ip = "192.0.2.7", targetname = "app.example.test"}, {number = 8443, service = "https"})
   local evidence = result.evidence[1]
   equal(result.schema_version, "1")
-  equal(result.script_version, "0.3.1")
+  equal(result.script_version, "0.3.2")
   equal(result.vhost, "app.example.test")
   equal(evidence.ip, "192.0.2.7")
   equal(evidence.port, 8443)

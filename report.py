@@ -17,6 +17,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unicodedata
+from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -386,6 +387,49 @@ def _compact_verdict(row: dict[str, Any]) -> str:
     return "INDETERMINE"
 
 
+def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+    """Return true when every external-origin redirect was assessed separately.
+
+    The NSE deliberately does not cross an origin boundary. A campaign can
+    nevertheless cover a routine HTTP-to-HTTPS redirect through its separate
+    scan of the destination service. Require the same target name and IP so a
+    redirect never hides an untested backend or a foreign destination.
+    """
+    if (row.get("row_type") != "ASSESSMENT"
+            or row.get("reason_code") != "REDIRECT_NOT_ASSESSED"
+            or _true(row.get("budget_exhausted"))
+            or str(row.get("traversal_complete", "")).lower() in ("false", "no", "0")):
+        return False
+    observations = row.get("observations")
+    if not isinstance(observations, list) or not observations:
+        return False
+    target = _single_line(row.get("hostname") or row.get("ip")).lower().rstrip(".")
+    source_ip = _single_line(row.get("ip"))
+    for observation in observations:
+        if not isinstance(observation, dict) or observation.get("reason_code") != "REDIRECT_NOT_ASSESSED":
+            return False
+        try:
+            destination = urlsplit(_single_line(observation.get("redirect_to")))
+            scheme = destination.scheme.lower()
+            port = destination.port or (443 if scheme == "https" else 80 if scheme == "http" else 0)
+        except ValueError:
+            return False
+        if (scheme not in ("http", "https") or destination.username is not None
+                or destination.password is not None or not destination.hostname
+                or destination.hostname.lower().rstrip(".") != target):
+            return False
+        if not any(candidate is not row
+                   and candidate.get("row_type") == "ASSESSMENT"
+                   and _single_line(candidate.get("ip")) == source_ip
+                   and _single_line(candidate.get("hostname") or candidate.get("ip")).lower().rstrip(".") == target
+                   and _single_line(candidate.get("scheme")).lower() == scheme
+                   and _single_line(candidate.get("port")) == str(port)
+                   and _compact_verdict(candidate) != "INDETERMINE"
+                   for candidate in rows):
+            return False
+    return True
+
+
 def _short(value: object, limit: int = 150) -> str:
     text = _single_line(value)
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
@@ -491,9 +535,10 @@ def _port_summary(rows: list[dict[str, Any]]) -> str:
     return " ".join(parts)
 
 
-def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str) -> str:
+def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str,
+                         *, port_rows: list[dict[str, Any]] | None = None) -> str:
     reason = _legacy_compact_explanation(rows, verdicts, verdict)
-    ports = _port_summary(rows)
+    ports = _port_summary(port_rows if port_rows is not None else rows)
     if not ports:
         return _short(reason, MAX_COMPACT_EXPLANATION)
     # Keep both coverage lists visible even when a supplied reason is verbose.
@@ -524,12 +569,17 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
     for target, group in groups.items():
         versions = _unique([version for row in group for version in _version_values(row.get("versions"))])
         relevant = [row for row in group if not _non_web_coverage(row)]
-        verdicts = [_compact_verdict(row) for row in relevant]
+        conclusive = (relevant if legacy_explanation else
+                      [row for row in relevant if not _redirect_is_covered(row, relevant)])
+        verdicts = [_compact_verdict(row) for row in conclusive]
         verdict = ("OUI" if "OUI" in verdicts else
                    "NON" if verdicts and all(value == "NON" for value in verdicts) else "INDETERMINE")
-        explain = _legacy_compact_explanation if legacy_explanation else _compact_explanation
+        if legacy_explanation:
+            explanation = _legacy_compact_explanation(conclusive, verdicts, verdict)
+        else:
+            explanation = _compact_explanation(conclusive, verdicts, verdict, port_rows=relevant)
         output.append({"cible": target, "php": " | ".join(versions) or "INCONNUE", "vulnerable": verdict,
-                       "explication": _short(explain(relevant, verdicts, verdict), MAX_COMPACT_EXPLANATION)})
+                       "explication": _short(explanation, MAX_COMPACT_EXPLANATION)})
     return output
 
 

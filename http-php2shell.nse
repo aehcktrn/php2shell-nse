@@ -47,6 +47,8 @@ https://www.php.net/
 -- @args http-php2shell.redirects Same-origin redirect limit per path, 0..5
 --   (default: 2). Other hosts, schemes and ports are never followed.
 -- @args http-php2shell.samples Observations per supplied path, 1..3 (default: 1).
+-- @args http.useragent User-Agent sent with HTTP requests. The default identifies
+--   php2shell-scanner; an empty string disables the header.
 --
 -- @output
 -- | http-php2shell:
@@ -84,6 +86,7 @@ local POTENTIAL = "POTENTIALLY_VULNERABLE"
 local PATCHED = "PATCHED_VERSION_ADVERTISED"
 local UNKNOWN = "UNKNOWN"
 local FIXES = {[2] = 35, [3] = 36, [4] = 27, [5] = 12}
+local DEFAULT_USER_AGENT = "php2shell-scanner/0.4.4 http-php2shell/0.3.2 (+https://github.com/aehcktrn/php2shell-scanner)"
 local MAX_HEADER_BYTES = 8192
 local MAX_EVIDENCE = 32
 -- RFC HTTP product-token characters. A fragment of Not-PHP or Not.PHP is
@@ -95,7 +98,7 @@ local function output()
   result.state = UNKNOWN
   result.detection_method = "HTTP response headers (version-based)"
   result.exploitability = "NOT_TESTED"
-  result.script_version = "0.3.1"
+  result.script_version = "0.3.2"
   result.schema_version = "1"
   result.advisory_date = "2026-10-21"
   result.cves = {"CVE-2026-109618", "CVE-2026-109619"}
@@ -358,6 +361,12 @@ local function parameters()
     end
   end
   args.vhost = vhost
+  local useragent = stdnse.get_script_args("http.useragent")
+  if useragent == nil then useragent = DEFAULT_USER_AGENT end
+  if type(useragent) ~= "string" or #useragent > 256 or useragent:find("[%c]") then
+    return nil, "Invalid http.useragent: expected at most 256 characters without controls."
+  end
+  args.useragent = useragent
   return args
 end
 
@@ -549,6 +558,7 @@ action = function(host, port)
   local host_field = name:find(":", 1, true) and ("[" .. name .. "]") or name
   if port.number ~= 80 and port.number ~= 443 then host_field = host_field .. ":" .. port.number end
   local headers = {["Accept-Encoding"] = "identity", Host = host_field}
+  if args.useragent ~= "" then headers["User-Agent"] = args.useragent end
   result.vhost, result.http_host, result.path = name, host_field, public_path(args.path)
   result.ip, result.port, result.scheme = host.ip, port.number, initial_scheme(port)
   result.tls_sni = result.scheme == "https" and name ~= host.ip and name or ""

@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.3**, module NSE **0.3.1**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.4**, module NSE **0.3.2**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -77,7 +77,7 @@ Ces lignes illustrent le format. **`php` contient les versions observées**, sé
 **L'explication liste les ports ayant une évaluation NSE**, même indéterminée, puis le motif du résultat. Les ports ouverts pertinents sans évaluation PHP sont signalés séparément. Les listes sont triées, dédoublonnées et bornées ; au-delà de dix ports, le nombre restant est indiqué. Les ports fermés ou filtrés ne figurent pas dans cette liste d'évaluations : leurs états restent dans les fichiers Nmap de `raw/`. Un port cité dans le motif de vulnérabilité désigne le service qui justifie le résultat, pas le seul port contrôlé.
 
 - **`OUI`** : au moins un service annonce clairement une version concernée, sans preuve valide de correction, ou un inventaire atteste un runtime encore affecté. L'explication précise le correctif ou la preuve disponible. Une version annoncée ne démontre pas l'exploitabilité.
-- **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une ancienne version avec un backport attesté peut donc apparaître en `NON`, avec la version conservée et l'attestation expliquée.
+- **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une redirection HTTP vers le même nom en HTTPS est couverte lorsque ce service de destination a été évalué séparément sur la même adresse. Une ancienne version avec un backport attesté peut donc apparaître en `NON`, avec la version conservée et l'attestation expliquée.
 - **`INDETERMINE`** : version absente ou masquée, observations contradictoires, inventaire contradictoire ou contrôle incomplet. Une cause courte indique la vérification à effectuer ; l'absence de PHP identifié ne devient pas automatiquement `NON`.
 
 Une version concernée clairement observée suffit à faire ressortir la cible en `OUI`, même si d'autres services restent indéterminés. Une observation suspecte au sein d'un parcours interrompu ou contradictoire reste `INDETERMINE`. Un service reconnu comme non web, par exemple SSH, ne dégrade pas à lui seul le résultat des services PHP évalués.
@@ -377,6 +377,7 @@ Cette commande Nmap utilise IPv4 ; faites une exécution distincte avec `-6` pou
 | `http-php2shell.max_requests` | `5` | GET totaux, de 1 à 20. |
 | `http-php2shell.redirects` | `2` | Redirections de même origine, de 0 à 5. |
 | `http-php2shell.samples` | `1` | Observations par chemin, de 1 à 3. |
+| `http.useragent` | Identité du scanner | User-Agent HTTP ; une chaîne vide désactive l'en-tête. |
 
 Exemple avec IP et hôte virtuel :
 
@@ -389,6 +390,8 @@ nmap -sT -sV -Pn -p 443 \
 ```
 
 Les chemins locaux sont limités à 2 048 caractères ; URL complètes, `//`, espaces, contrôles, antislashs et fragments sont refusés. `http.host` est accepté si `http-php2shell.vhost` est absent. Sur un port non standard, le port est ajouté à Host, pas à SNI.
+
+Le NSE utilise par défaut un User-Agent transparent propre à `php2shell-scanner`, au lieu de l'identité générique du moteur NSE que certains WAF bloquent systématiquement. L'argument Nmap standard `http.useragent` permet de fournir une identité opérateur différente sans simuler un navigateur.
 
 ## Correctifs de référence
 

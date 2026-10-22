@@ -256,6 +256,18 @@ class CampaignInputTests(unittest.TestCase):
         self.assertEqual(result["dns_status"], "RESOLVED")
         self.assertFalse(result["dns_partial"])
 
+    def test_dns_ipv4_mapped_ipv6_is_not_scanned_twice(self):
+        payload = {"addresses": ["192.0.2.10", "::ffff:192.0.2.10"], "families": {
+            "ipv4": {"status": "RESOLVED", "addresses": ["192.0.2.10"]},
+            "ipv6": {"status": "RESOLVED", "addresses": ["::ffff:192.0.2.10"]}}}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
+        with patch.object(scan.subprocess, "run", return_value=completed):
+            result = scan.resolve_target("app.example.com", ["ipv4", "ipv6"], 1)
+        self.assertEqual(result["addresses"], ["192.0.2.10"])
+        self.assertEqual(result["dns_families"]["ipv6"],
+                         {"status": "NO_ADDRESS", "addresses": []})
+        self.assertFalse(result["dns_partial"])
+
     def test_dns_timeout_preserves_successful_family(self):
         partial = {"addresses": ["192.0.2.10"], "families": {
             "ipv4": {"status": "RESOLVED", "addresses": ["192.0.2.10"]}}}

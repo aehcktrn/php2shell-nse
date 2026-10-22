@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.4 — 2026-10-23
+
+### Compatibilité WAF et résolution DNS
+
+- Le NSE envoie désormais un User-Agent transparent propre à `php2shell-scanner`, car certains load balancers et WAF refusent systématiquement l'identité générique `Nmap Scripting Engine` avant que la réponse applicative puisse être évaluée.
+- L'argument Nmap standard `http.useragent` reste utilisable pour définir une identité opérateur différente ou désactiver l'en-tête avec une chaîne vide ; les valeurs contenant des contrôles sont refusées.
+- Les adresses IPv4-mappées en IPv6 (`::ffff:x.x.x.x`) renvoyées par certains résolveurs ne sont plus traitées comme des adresses IPv6 distinctes, ce qui évite les scans et évaluations en double.
+- Une redirection HTTP vers le même nom en HTTPS ne rend plus la synthèse indéterminée lorsque la destination a été évaluée séparément et de façon concluante sur la même adresse ; les redirections étrangères, les autres backends et les destinations indéterminées restent des lacunes.
+- Régressions unitaires couvrant le User-Agent effectif, sa validation, le filtrage défensif des IPv4-mappées et la couverture des redirections inter-services.
+
+Le lanceur passe à **0.4.4** et le NSE à **0.3.2**. Les seuils PHP, le périmètre réseau et les règles de décision des verdicts sont inchangés.
+
 ## 0.4.3 — 2026-10-22
 
 ### Visibilité et contrôle de plusieurs ports

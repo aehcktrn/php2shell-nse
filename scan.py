@@ -32,7 +32,7 @@ from report import (ReportError, build_campaign_report, compact_rows,
 from discovery import discover_root
 
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -537,7 +537,14 @@ name=sys.argv[1]; result={'addresses': [], 'families': {}}
 for label in sys.argv[2].split(','):
     family=socket.AF_INET if label=='ipv4' else socket.AF_INET6
     try:
-        values=sorted({str(ipaddress.ip_address(item[4][0])) for item in socket.getaddrinfo(name,None,family,socket.SOCK_STREAM,socket.IPPROTO_TCP) if '%' not in item[4][0]})
+        values=set()
+        for item in socket.getaddrinfo(name,None,family,socket.SOCK_STREAM,socket.IPPROTO_TCP):
+            if '%' in item[4][0]: continue
+            address=ipaddress.ip_address(item[4][0])
+            if address.version != (4 if label=='ipv4' else 6): continue
+            if address.version == 6 and address.ipv4_mapped is not None: continue
+            values.add(str(address))
+        values=sorted(values)
         result['addresses'].extend(values)
         result['families'][label]={'status':'RESOLVED' if values else 'NO_ADDRESS','addresses':values}
     except socket.gaierror as exc:
@@ -552,12 +559,29 @@ for label in sys.argv[2].split(','):
 
 def resolve_target(name: str, families: list[str], timeout: float) -> dict:
     def finish(value: dict) -> dict:
-        addresses = list(dict.fromkeys(str(ipaddress.ip_address(item)) for item in value["addresses"]))
+        cleaned_families = {}
+        for family, item in value["families"].items():
+            expected_version = 4 if family == "ipv4" else 6
+            cleaned = []
+            for raw_address in item.get("addresses", []):
+                address = ipaddress.ip_address(raw_address)
+                if address.version != expected_version or (
+                        address.version == 6 and address.ipv4_mapped is not None):
+                    continue
+                cleaned.append(str(address))
+            normalized = dict(item)
+            normalized["addresses"] = sorted(dict.fromkeys(cleaned))
+            if normalized.get("status") == "RESOLVED" and not normalized["addresses"]:
+                normalized["status"] = "NO_ADDRESS"
+            cleaned_families[family] = normalized
+        value["families"] = cleaned_families
+        addresses = list(dict.fromkeys(
+            address for item in cleaned_families.values() for address in item["addresses"]))
         errors = "; ".join(f"{family}: {item.get('error', item['status'])}"
-                           for family, item in value["families"].items()
+                           for family, item in cleaned_families.items()
                            if item["status"] in ("ERROR", "TIMEOUT"))
         return {"dns_status": "RESOLVED" if addresses else "DNS_ERROR" if errors else "NO_ADDRESS",
-                "addresses": addresses, "dns_families": value["families"],
+                "addresses": addresses, "dns_families": cleaned_families,
                 "dns_partial": bool(addresses and errors),
                 "dns_error": errors, "resolved_at": utcnow()}
 

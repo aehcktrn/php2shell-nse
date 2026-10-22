@@ -97,6 +97,44 @@ class CompactReportTests(unittest.TestCase):
         self.assertTrue(result["explication"].startswith("Ports évalués : 80,443."))
         self.assertIn("2 contrôles indéterminés", result["explication"])
 
+    def test_same_ip_http_to_https_redirect_is_covered_by_assessed_destination(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://app.example.com:443/"}],
+        )
+        for destination_state, version, expected in (
+                ("PATCHED_VERSION_ADVERTISED", "8.3.36", "NON"),
+                ("POTENTIALLY_VULNERABLE", "8.3.35", "OUI")):
+            with self.subTest(destination_state=destination_state):
+                result = self.compact(
+                    redirect,
+                    assessment(port="443", scheme="https", state=destination_state, version=version,
+                               reason_code=("FIXED_VERSION_ADVERTISED" if expected == "NON"
+                                            else "AFFECTED_VERSION_ADVERTISED")),
+                )
+                self.assertEqual(result["vulnerable"], expected)
+                self.assertTrue(result["explication"].startswith("Ports évalués : 80,443."))
+
+    def test_redirect_requires_conclusive_destination_on_same_ip_and_name(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://app.example.com/"}],
+        )
+        for destination in (
+                assessment(port="443", scheme="https", state="UNKNOWN", version="",
+                           reason_code="PHP_VERSION_HIDDEN"),
+                assessment(port="443", scheme="https", ip="192.0.2.11")):
+            with self.subTest(destination=destination):
+                self.assertEqual(self.compact(redirect, destination)["vulnerable"], "INDETERMINE")
+        foreign_redirect = deepcopy(redirect)
+        foreign_redirect["observations"][0]["redirect_to"] = "https://other.example.com/"
+        self.assertEqual(self.compact(foreign_redirect, assessment(port="443", scheme="https"))["vulnerable"],
+                         "INDETERMINE")
+
     def test_port_summary_preserves_mixed_service_versions_and_verdicts(self):
         for unknown_https in (False, True):
             with self.subTest(unknown_https=unknown_https):
