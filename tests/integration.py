@@ -240,12 +240,17 @@ class NSEIntegration(unittest.TestCase):
     def test_https_virtual_host_and_sni(self):
         if self.httpsd is None:
             self.skipTest("openssl is required to create the local TLS fixture")
+        with self.httpsd.record_lock:
+            before = len(self.httpsd.requests)
         state, _, _ = self.scan("/vhost", server=self.httpsd, vhost=VHOST)
         self.assertEqual(state, "PATCHED_VERSION_ADVERTISED")
         with self.httpsd.record_lock:
-            self.assertIn(VHOST, self.httpsd.sni_names)
-            self.assertTrue(any(item["host"].split(":", 1)[0] == VHOST
-                                for item in self.httpsd.requests))
+            requests = [entry for entry in self.httpsd.requests[before:]
+                        if entry["path"] == "/vhost"]
+        self.assertTrue(requests, "The NSE GET was not received by the TLS fixture")
+        for entry in requests:
+            self.assertEqual(entry["host"], f"{VHOST}:{self.httpsd.server_port}")
+            self.assertEqual(entry["sni"], VHOST, "SNI on the NSE GET connection")
 
     def test_service_detection_selects_http_on_an_arbitrary_port(self):
         state, _, output = self.scan("/old", discover=True)
