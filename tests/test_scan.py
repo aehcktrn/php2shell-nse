@@ -120,6 +120,13 @@ class CampaignInputTests(unittest.TestCase):
         self.assertNotIn("\\u", arguments)
         self.assertIn("/caf%C3%A9", arguments)
 
+    def test_single_path_omits_empty_optional_nse_array(self):
+        arguments = scan.nse_arguments("app.example.com", ["/"], self.args())
+        self.assertIn('http-php2shell.path="/"', arguments)
+        self.assertNotIn("http-php2shell.paths=", arguments)
+        multiple = scan.nse_arguments("app.example.com", ["/", "/legacy"], self.args())
+        self.assertIn('http-php2shell.paths={"/legacy"}', multiple)
+
     def test_paths_reject_foreign_origins_fragments_and_controls(self):
         for value in ("https://app.example/path", "//app.example/path", "/a#fragment", "/a\nb", "/a b", "/a\\b"):
             with self.subTest(value=value), self.assertRaises(scan.InputError):

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 — 2026-10-22
+
+### Découverte de sous-domaines
+
+- Option `--discover-subdomains roots.txt` : collecte passive des noms de certificats publics via crt.sh, sans clé d'API ni dépendance Python supplémentaire.
+- Racines utilisées comme périmètre implicite et ajoutées aux cibles ; combinaison avec cibles exactes, imports locaux, périmètre explicite et exclusions.
+- Validation des entrées avant accès réseau et filtrage des candidats avant résolution DNS ; les zones entièrement exclues ne sont pas interrogées.
+- Normalisation IDNA, dédoublonnage, conservation des noms historiques et suivi des certificats génériques sans inventer de noms d'hôtes.
+- Requêtes séquentielles avec délai par requête, budget global, plafond de noms et limite de taille de réponse ; erreurs et plafonds visibles, sans nouvelle tentative automatique.
+- Fichiers `discovery.json` et `discovered.txt` avec journal des requêtes, provenance, compteurs et limites. La réussite d'une source ne constitue jamais un inventaire exhaustif.
+- Le mode plan peut interroger crt.sh et résoudre les noms, sans lancer Nmap ; les erreurs de découverte rendent la campagne partielle.
+- Fichier de racines d'exemple, documentation et tests de découverte isolés du service public dans la CI.
+- Les lignes de couverture d'une source de découverte ne deviennent pas des cibles réseau lors d'un recontrôle.
+- Correction du passage d'un chemin HTTP unique : l'argument NSE de chemins supplémentaires est omis lorsqu'il est vide, pour éviter un rejet par Nmap.
+
+La version du lanceur passe à **0.4.0**. Le NSE autonome reste en **0.3.0** : cette évolution ne modifie ni la détection ni les seuils de correction.
+
 ## 0.3.0 — 2026-10-22
 
 ### Parcours HTTP

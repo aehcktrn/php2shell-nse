@@ -6,9 +6,10 @@ NMAP and NMAP_DATADIR select the real Nmap executable and its data directory.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import csv
 from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
@@ -19,11 +20,15 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 from integration import LocalServer
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import scan
 
 
 class ScanCLIIntegration(unittest.TestCase):
@@ -183,6 +188,104 @@ class ScanCLIIntegration(unittest.TestCase):
             self.assertFalse((output / "report.json").exists())
             with server.record_lock:
                 self.assertEqual(server.requests, [])
+
+    def test_discovery_scans_only_retained_subdomain_with_real_nmap_and_host(self):
+        # Discovery and DNS are deterministic; only the loopback Nmap/NSE
+        # transport is real. No public CT service or DNS server is contacted.
+        type(self).counter += 1
+        inputs = self.base / f"discovery-input-{self.counter}"
+        inputs.mkdir()
+        roots, excluded = inputs / "roots.txt", inputs / "exclude.txt"
+        roots.write_text("example.test\n", encoding="utf-8")
+        excluded.write_text("example.test\n", encoding="utf-8")
+        output = self.base / f"discovery-campaign-{self.counter}"
+        now = datetime.now(timezone.utc).isoformat()
+        source_result = {
+            "root": "example.test", "source": "crt.sh", "status": "COMPLETED",
+            "reason_code": "OK", "processing_complete": True, "exhaustive": False,
+            "started_at": now, "finished_at": now,
+            "candidates": ["example.test", "app.example.test"], "candidate_count": 2,
+            "excluded_candidates": [], "warnings": ["PASSIVE_SOURCE_NOT_EXHAUSTIVE"],
+        }
+        fixture_dns = {name: "127.0.0.1" for name in source_result["candidates"]}
+
+        def resolve_fixture(name, families, timeout):
+            address = fixture_dns[name]
+            return {"dns_status": "RESOLVED", "addresses": [address],
+                    "dns_families": {"ipv4": {"status": "RESOLVED", "addresses": [address]}},
+                    "dns_partial": False, "dns_error": "", "resolved_at": now}
+
+        messages = io.StringIO()
+        with self.serve() as server:
+            port = server.server_port
+            arguments = [
+                "--discover-subdomains", str(roots), "--exclude", str(excluded),
+                "--profile", "rapide", "--ports", str(port), "--families", "ipv4",
+                "--workers", "1", "--target-timeout", "60", "--path", "/old",
+                "--output", str(output), "--nmap", self.nmap,
+            ]
+            with patch.object(scan, "discover_root", return_value=source_result) as discover, \
+                    patch.object(scan, "resolve_target", side_effect=resolve_fixture) as resolve, \
+                    redirect_stdout(messages), redirect_stderr(messages):
+                status = scan.main(arguments)
+            self.assertEqual(status, 0, messages.getvalue())
+            discover.assert_called_once()
+            self.assertEqual(discover.call_args.args, ("example.test",))
+            resolve.assert_called_once_with("app.example.test", ["ipv4"], 15)
+            with server.record_lock:
+                requests = [item for item in server.requests if item["path"] == "/old"]
+            self.assertTrue(requests, (output / "raw" / "000001.xml").read_text())
+            self.assertTrue(all(item["host"] == f"app.example.test:{port}" for item in requests))
+
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["status"], "COMPLETED")
+        self.assertEqual(manifest["scope"]["domains"], ["example.test"])
+        self.assertEqual(manifest["scope"]["excluded_hosts"], ["example.test"])
+        self.assertEqual([item["hostname"] for item in manifest["targets"]], ["app.example.test"])
+        target = manifest["targets"][0]
+        self.assertEqual(target["sources"], ["crt.sh:example.test"])
+        self.assertEqual(target["addresses"], ["127.0.0.1"])
+        self.assertTrue(any(item["hostname"] == "example.test" and item["reason"] == "EXCLUDED_BY_OPERATOR"
+                            for item in manifest["excluded_candidates"]))
+        for name in ("targets.txt", "discovered.txt"):
+            self.assertEqual((output / name).read_text(), "app.example.test\n")
+        discovery = json.loads((output / "discovery.json").read_text())
+        self.assertEqual(discovery, manifest["discovery"])
+        self.assertEqual(discovery["queries"][0]["source"], "crt.sh")
+        self.assertEqual(discovery["queries"][0]["root"], "example.test")
+        self.assertFalse(discovery["exhaustive"])
+        candidates = {item["hostname"]: item for item in discovery["candidates"]}
+        self.assertFalse(candidates["example.test"]["retained"])
+        self.assertTrue(candidates["app.example.test"]["retained"])
+        self.assertEqual(candidates["app.example.test"]["sources"], ["crt.sh:example.test"])
+        self.assertEqual(candidates["app.example.test"]["addresses"], ["127.0.0.1"])
+
+        self.assertEqual(len(target["endpoints"]), 1)
+        endpoint = target["endpoints"][0]
+        self.assertEqual(endpoint["status"], "COMPLETED")
+        self.assertEqual(endpoint["command"][-1], "127.0.0.1")
+        self.assertIn("-n", endpoint["command"])
+        xml = ET.parse(output / endpoint["xml"]).getroot()
+        self.assertEqual(xml.find("host/address").get("addr"), "127.0.0.1")
+        script = xml.find(".//script[@id='http-php2shell']")
+        self.assertIsNotNone(script)
+        self.assertEqual(script.find("elem[@key='state']").text, "POTENTIALLY_VULNERABLE")
+        report = json.loads((output / "report.json").read_text())
+        self.assertEqual(report["discovery"], discovery)
+        self.assertTrue(report["summary"]["discovery_processing_complete"])
+        self.assertFalse(report["summary"]["discovery_exhaustive"])
+        rows = [row for row in report["rows"] if row["row_type"] == "ASSESSMENT"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["hostname"], row["ip"], str(row["port"])),
+                         ("app.example.test", "127.0.0.1", str(port)))
+        self.assertEqual(row["target_sources"], ["crt.sh:example.test"])
+        self.assertEqual(row["state"], "POTENTIALLY_VULNERABLE")
+        self.assertIn("8.3.35", row["versions"])
+        with (output / "report.csv").open(newline="", encoding="utf-8") as stream:
+            csv_rows = list(csv.DictReader(stream))
+        self.assertEqual(len(csv_rows), 1)
+        self.assertEqual(csv_rows[0]["hostname"], "app.example.test")
 
 
 if __name__ == "__main__":

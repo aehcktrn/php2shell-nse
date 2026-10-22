@@ -1,7 +1,8 @@
 # Copier ce fichier vers domaines.txt et remplacer les exemples ci-dessous.
 # Un nom DNS exact par ligne ; commentaires a partir de #.
 # Sans https://, port, chemin, joker * ou suffixe CIDR.
-# Chaque sous-domaine a controler doit etre liste explicitement.
+# Ce fichier contient les cibles exactes ; il ne decouvre pas leurs enfants.
+# Pour la decouverte automatique : --discover-subdomains roots.txt.
 # Nmap utilise cette liste comme perimetre et ne verifie pas sa propriete.
 # Les noms example.com / example.org sont reserves a la documentation.
 application.example.com

@@ -1,0 +1,9 @@
+# Copier vers roots.txt et remplacer les domaines reserves ci-dessous.
+# Un domaine racine par ligne, avec au moins deux labels DNS ; maximum 1000.
+# Sans https://, port, chemin, joker * ou suffixe CIDR.
+# Chaque racine autorise ce nom et ses sous-domaines, sauf --scope explicite.
+# Les racines sont transmises a crt.sh pour rechercher les certificats publics.
+# La propriete des domaines est declaree par l'operateur.
+# Usage : python3 scan.py --discover-subdomains roots.txt
+example.com
+example.org

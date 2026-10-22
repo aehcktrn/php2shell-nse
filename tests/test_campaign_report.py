@@ -68,6 +68,20 @@ def manifest(*targets):
             "address_families": ["ipv4", "ipv6"], "targets": list(targets)}
 
 
+def discovery(root="example.com"):
+    now = datetime.now(timezone.utc).isoformat()
+    return {"enabled": True, "mode": "passive", "source": "crt.sh", "roots": [root],
+            "status": "COMPLETED", "processing_complete": True, "exhaustive": False,
+            "started_at": now, "finished_at": now,
+            "candidates_count": 1, "retained_count": 1, "resolved_count": 1, "unresolved_count": 0,
+            "candidates": [{"hostname": "application.example.com", "sources": ["crt.sh:example.com"],
+                            "dns_status": "RESOLVED", "addresses": ["192.0.2.10"]}],
+            "queries": [{"root": root, "source": "crt.sh", "status": "COMPLETED",
+                         "processing_complete": True, "exhaustive": False, "candidate_count": 1,
+                         "rejected_count": 0, "rejection_counts": {}, "excluded_candidates": [],
+                         "warnings": [], "started_at": now, "finished_at": now}]}
+
+
 class CampaignReportTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -163,6 +177,144 @@ class CampaignReportTests(unittest.TestCase):
         self.assertEqual(row["source_xml"], "raw/one.xml")
         self.assertEqual(row["observations"][0]["evidence"][0]["version"], "8.3.35")
         self.assertEqual(row["target_sources"], ["input:domaines.txt"])
+
+    def test_successful_scan_cannot_hide_discovery_failure(self):
+        data = manifest(target())
+        data["tool_version"] = "0.4.0"
+        data["discovery"] = discovery()
+        data["discovery"]["queries"][0].update(status="FAILED", processing_complete=False,
+                                               reason_code="HTTP_429", error="Source rate limited")
+        original = deepcopy(data)
+        result = self.build(data)
+        self.assertEqual(result["tool_version"], "0.4.0")
+        self.assertEqual(result["summary"]["assessments"], 1)
+        self.assertEqual(result["summary"]["endpoints_completed"], 1)
+        self.assertFalse(result["summary"]["processing_complete"])
+        self.assertFalse(result["summary"]["discovery_processing_complete"])
+        self.assertEqual(result["summary"]["discovery_status"], "PARTIAL")
+        self.assertEqual(result["summary"]["discovery_queries_incomplete"], 1)
+        gap = next(row for row in result["rows"] if row["protocol"] == "discovery")
+        self.assertEqual((gap["row_type"], gap["state"], gap["reason_code"]),
+                         ("COVERAGE", "NOT_ASSESSED", "DISCOVERY_HTTP_429"))
+        self.assertEqual((gap["hostname"], gap["service"], gap["port"], gap["ip"]),
+                         ("example.com", "crt.sh", "", ""))
+        self.assertEqual(gap["exploitability"], "NOT_TESTED")
+        self.assertEqual(gap["inventory_patch_status"], "NOT_PROVIDED")
+        self.assertIn("Relancer", gap["next_action"])
+        self.assertEqual(data, original)
+
+    def test_discovery_ledger_and_candidate_provenance_are_written(self):
+        item = target()
+        item["sources"].append("crt.sh:example.com")
+        data = manifest(item)
+        data["discovery"] = discovery()
+        result = self.build(data)
+        self.assertEqual(result["discovery"], data["discovery"])
+        self.assertEqual(result["summary"]["discovery_candidates_count"], 1)
+        self.assertEqual(result["summary"]["discovery_retained_count"], 1)
+        self.assertEqual(result["summary"]["discovery_resolved_count"], 1)
+        self.assertEqual(result["summary"]["discovery_unresolved_count"], 0)
+        self.assertEqual(result["rows"][0]["target_sources"], item["sources"])
+        self.assertNotIn("queries", result["campaign"]["discovery"])
+        self.assertNotIn("candidates", result["campaign"]["discovery"])
+        destination = self.base / "output"
+        report.write_campaign_report(result, destination)
+        saved = json.loads((destination / "report.json").read_text())
+        self.assertEqual(saved["discovery"]["queries"], data["discovery"]["queries"])
+        self.assertEqual(saved["discovery"]["candidates"], data["discovery"]["candidates"])
+
+    def test_zero_discovery_results_are_processed_but_never_exhaustive(self):
+        data = manifest(target())
+        data["discovery"] = discovery()
+        data["discovery"].update(candidates=[], candidates_count=0, retained_count=0,
+                                 resolved_count=0, unresolved_count=0)
+        data["discovery"]["queries"][0]["candidate_count"] = 0
+        result = self.build(data)
+        self.assertTrue(result["summary"]["processing_complete"])
+        self.assertTrue(result["summary"]["discovery_processing_complete"])
+        self.assertFalse(result["summary"]["discovery_exhaustive"])
+        self.assertFalse(result["discovery"]["exhaustive"])
+        self.assertEqual(result["summary"]["discovery_candidates_count"], 0)
+        self.assertEqual(result["summary"]["coverage_rows"], 0)
+        self.assertTrue(any("Aucun nom trouve ne signifie pas aucun sous-domaine" in text
+                            for text in result["limitations"]))
+
+    def test_limited_skipped_and_pending_discovery_queries_reach_csv(self):
+        for status, code in (("PARTIAL", "RESPONSE_SIZE_LIMIT"),
+                             ("PARTIAL", "CANDIDATE_LIMIT"),
+                             ("SKIPPED", "DISCOVERY_INTERRUPTED"),
+                             ("RUNNING", "")):
+            with self.subTest(status=status, code=code):
+                data = manifest(target())
+                data["discovery"] = discovery()
+                data["discovery"]["queries"][0].update(status=status, processing_complete=False, reason_code=code)
+                result = self.build(data)
+                destination = self.base / "output"
+                report.write_campaign_report(result, destination)
+                with (destination / "report.csv").open(newline="") as stream:
+                    gap = next(row for row in csv.DictReader(stream) if row["protocol"] == "discovery")
+                expected = code if code.startswith("DISCOVERY_") else "DISCOVERY_" + (code or status)
+                self.assertEqual(gap["reason_code"], expected)
+                self.assertEqual(gap["state"], "NOT_ASSESSED")
+                self.assertFalse(result["summary"]["processing_complete"])
+                self.assertEqual(result["summary"]["discovery_queries_incomplete"], 1)
+
+    def test_unattempted_discovery_roots_remain_visible(self):
+        data = manifest(target())
+        data["discovery"] = discovery()
+        data["discovery"]["roots"].append("example.org")
+        result = self.build(data)
+        gap = next(row for row in result["rows"] if row.get("protocol") == "discovery")
+        self.assertEqual(gap["hostname"], "example.org")
+        self.assertEqual(gap["reason_code"], "DISCOVERY_NOT_ATTEMPTED")
+        self.assertEqual(result["summary"]["discovery_queries_unattempted"], 1)
+        self.assertFalse(result["summary"]["processing_complete"])
+
+    def test_deliberately_excluded_roots_are_not_unattempted_failures(self):
+        data = manifest(target())
+        data["discovery"] = discovery()
+        data["discovery"].update(queries=[], skipped_roots=[
+            {"root": "example.com", "reason": "SUBDOMAINS_EXCLUDED_BY_OPERATOR"}])
+        result = self.build(data)
+        self.assertTrue(result["summary"]["discovery_processing_complete"])
+        self.assertTrue(result["summary"]["processing_complete"])
+        self.assertEqual(result["summary"]["discovery_roots_excluded"], 1)
+        self.assertEqual(result["summary"]["discovery_queries_unattempted"], 0)
+        self.assertEqual(result["summary"]["discovery_coverage_rows"], 0)
+
+    def test_aggregate_discovery_limit_cannot_be_hidden_by_complete_queries(self):
+        data = manifest(target())
+        data["discovery"] = discovery()
+        data["discovery"].update(status="PARTIAL", processing_complete=False, reason_code="TOTAL_BUDGET_EXHAUSTED")
+        result = self.build(data)
+        self.assertFalse(result["summary"]["processing_complete"])
+        self.assertEqual(result["summary"]["discovery_queries_completed"], 1)
+        self.assertEqual(result["summary"]["discovery_queries_incomplete"], 0)
+        self.assertEqual(result["summary"]["discovery_coverage_rows"], 1)
+        self.assertEqual(result["rows"][-1]["reason_code"], "DISCOVERY_TOTAL_BUDGET_EXHAUSTED")
+
+    def test_old_manifests_and_disabled_discovery_keep_existing_results(self):
+        old = self.build()
+        self.assertTrue(old["summary"]["processing_complete"])
+        self.assertNotIn("discovery", old)
+        self.assertNotIn("discovery_status", old["summary"])
+        data = manifest(target())
+        data["discovery"] = {"enabled": False}
+        disabled = self.build(data)
+        self.assertEqual(disabled["rows"], old["rows"])
+        self.assertNotIn("discovery_status", disabled["summary"])
+        self.assertEqual(disabled["limitations"], old["limitations"])
+
+    def test_malformed_discovery_ledgers_fail_explicitly(self):
+        for invalid in ([], {"enabled": "true"}, {"enabled": True, "roots": [], "queries": []},
+                        {**discovery(), "candidates_count": -1},
+                        {**discovery(), "queries": [{"root": "foreign.example.org"}]},
+                        {**discovery(), "skipped_roots": [{"root": "example.com", "reason": "TIMEOUT"}]}):
+            with self.subTest(invalid=invalid):
+                data = manifest(target())
+                data["discovery"] = invalid
+                with self.assertRaises(report.ReportError):
+                    self.build(data)
 
     def test_recheck_reports_actual_ports_and_preserves_scope_and_exclusions(self):
         first = target()

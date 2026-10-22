@@ -2,9 +2,9 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Version **0.3.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.0**, module NSE **0.3.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
-Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
+Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
 ## Installation et première campagne
 
@@ -41,9 +41,66 @@ python3 scan.py domaines.txt --output results/campagne-initiale
 
 Le dossier doit être **nouveau ou vide** : les résultats précédents ne sont pas écrasés.
 
+## Découverte automatique des sous-domaines
+
+Préparez un fichier de domaines racines à partir de [roots.example.txt](roots.example.txt) :
+
+```bash
+cp roots.example.txt roots.txt
+```
+
+Remplacez les domaines réservés par les vôtres, un par ligne, puis lancez :
+
+```bash
+python3 scan.py --discover-subdomains roots.txt
+```
+
+Le lanceur interroge **crt.sh**, qui indexe les certificats publics des journaux Certificate Transparency, puis normalise et dédoublonne les noms concrets obtenus. Il résout les cibles retenues et poursuit avec le profil Nmap habituel. Aucun compte, clé d'API ou paquet Python supplémentaire n'est nécessaire. Les domaines racines sont eux-mêmes ajoutés aux cibles.
+
+**`roots.txt` autorise les racines et leurs descendants par défaut.** Il contient au maximum **1 000 racines**, chacune avec au moins deux labels DNS, par exemple `example.com` ou `zone.example.org` ; les règles de syntaxe des noms exacts s'appliquent. Avec `--scope scopes.txt`, chaque racine interrogée doit être couverte par ce périmètre explicite, qui filtre aussi les cibles exactes et les imports combinés. Toutes les entrées explicites sont validées avant les accès réseau ; le filtrage du périmètre et des exclusions précède la résolution DNS des cibles.
+
+Pour ajouter des noms déjà connus ou provenant d'un export :
+
+```bash
+python3 scan.py domaines.txt \
+  --discover-subdomains roots.txt \
+  --scope scopes.txt \
+  --discover-from discovery.csv \
+  --exclude exclusions.txt \
+  --output results/decouverte
+```
+
+Une exclusion exacte de `example.com` empêche le scan de ce nom mais laisse la découverte de ses enfants active. L'exclusion `*.example.com` suffit à supprimer la requête de découverte pour cette racine, tout en laissant `example.com` scannable si ce nom n'est pas exclu séparément. Les racines situées dans une zone exclue ne sont pas interrogées. Le profil `recontrole` ne se combine pas avec `--discover-subdomains` ; utilisez une campagne normale avec `--previous` pour découvrir à nouveau et comparer les résultats.
+
+### Préparer un plan et borner la découverte
+
+```bash
+python3 scan.py --discover-subdomains roots.txt \
+  --dry-run --output results/plan-decouverte
+```
+
+Avec cette option, **`--dry-run` effectue les requêtes HTTPS vers crt.sh et la résolution DNS des cibles**, puis produit le plan ; il ne lance pas Nmap. Les racines interrogées sont transmises à crt.sh. La collecte de certificats ne contacte pas les applications découvertes ; le scan des services commence ensuite, en dehors du mode plan.
+
+| Limite de découverte | Défaut | Réglage |
+|---|---|---|
+| Délai total d'une requête, résolution de la source et lecture incluses | 30 s | `--discovery-timeout`, de 1 à 120 |
+| Budget de toute la phase de découverte | 300 s | `--discovery-budget`, de 1 à 3 600 |
+| Noms CT uniques par campagne, avant filtrage du périmètre et des exclusions | 10 000 | `--discovery-max-names`, de 1 à 100 000 |
+| Réponse par racine | 8 Mio | Limite fixe |
+
+Le plafond effectif de noms CT est également limité aux places restantes parmi les **100 000 cibles maximum** de la campagne, racines, cibles exactes et imports compris. Sa valeur est enregistrée dans `limits.effective_max_names` de `discovery.json`.
+
+Une seule requête est effectuée par racine, séquentiellement, sans nouvelle tentative ni redirection. Les noms découverts ne déclenchent pas de nouvelles recherches de certificats. Les erreurs de source, limitations de débit, délais et plafonds atteints sont conservés dans `discovery.json` ; une campagne partielle sort avec le code `2`. Une interruption conserve le bilan disponible et sort avec `130`.
+
+### Lire les limites de l'inventaire
+
+La découverte reste **non exhaustive**, y compris après une réponse réussie : chaque résultat porte `exhaustive: false`. Les noms internes ou sans certificat public et les hôtes seulement couverts par un certificat générique peuvent manquer. Un SAN `*.example.com` est enregistré comme certificat générique et ne devient pas un nom d'hôte inventé. Aucune recherche par dictionnaire n'est effectuée.
+
+Les certificats historiques peuvent fournir des noms qui ne répondent plus au DNS : ils restent dans `discovered.txt` avant résolution, et `NO_DNS_ADDRESS` reste visible dans le bilan de couverture partielle. Une réponse vide ne démontre pas l'absence de sous-domaines. crt.sh applique aussi ses propres limites ; le lanceur signale les plafonds détectables et l'incertitude de troncature lorsqu'il manque les compteurs nécessaires. Voir l'[interface JSON décrite par le mainteneur](https://groups.google.com/g/crtsh/c/bybDhKDszkg) et l'[implémentation de crt.sh](https://github.com/crtsh/certwatch_db/blob/master/fnc/web_apis.fnc).
+
 ## Préparer le périmètre et importer des noms
 
-`domaines.txt` contient des cibles exactes : inscrire `example.com` ne découvre pas automatiquement ses sous-domaines. Pour compléter les cibles à partir d'exports DNS ou applicatifs, préparez les domaines autorisés et les exclusions :
+`domaines.txt` contient des cibles exactes : inscrire `example.com` dans ce fichier seul ne découvre pas ses sous-domaines. La découverte automatique se demande avec `--discover-subdomains roots.txt`. Pour compléter les cibles à partir d'exports DNS ou applicatifs, préparez les domaines autorisés et les exclusions :
 
 ```bash
 cp scopes.example.txt scopes.txt
@@ -62,7 +119,7 @@ python3 scan.py domaines.txt \
   --output results/plan
 ```
 
-`--dry-run` valide les entrées, **résout les noms** et écrit `manifest.json` et `targets.txt`. Il ne lance pas Nmap et ne fait aucune requête HTTP. Une campagne ultérieure réalise sa propre résolution ; le plan décrit les adresses observées à l'instant de sa création.
+`--dry-run` valide les entrées, **résout les noms** et écrit `manifest.json` et `targets.txt`. Il ne lance pas Nmap. Sans `--discover-subdomains`, il ne fait aucune requête HTTP ; avec cette option, il interroge crt.sh et produit également les fichiers de découverte. Une campagne ultérieure réalise sa propre résolution ; le plan décrit les adresses observées à l'instant de sa création.
 
 Pour exécuter, reprenez les mêmes entrées sans `--dry-run`, avec un autre dossier :
 
@@ -74,7 +131,7 @@ python3 scan.py domaines.txt \
   --output results/campagne-complete
 ```
 
-Le fichier de cibles est facultatif si `--discover-from` fournit les noms. Plusieurs options `--discover-from` peuvent être combinées.
+Le fichier de cibles est facultatif si `--discover-from` ou `--discover-subdomains` fournit les noms. Plusieurs options `--discover-from` peuvent être combinées.
 
 ### Règles de périmètre
 
@@ -88,7 +145,7 @@ Pour exclure une zone entière, ajoutez son nom exact et `*.zone`. Les noms hors
 
 ### Formats d'import
 
-`--discover-from` exige `--scope` et accepte des fichiers **locaux** :
+`--discover-from` exige un périmètre, fourni par `--scope` ou par les racines de `--discover-subdomains`, et accepte des fichiers **locaux** :
 
 - **TXT** : un nom DNS complet par ligne, commentaires `#`.
 - **CSV/TSV** : colonne `hostname`, `fqdn`, `name`, `domain` ou `host`, avec virgule, point-virgule ou tabulation. Plusieurs colonnes de noms contradictoires rendent l'entrée ambiguë.
@@ -105,7 +162,7 @@ api.example.org,AAAA,2001:db8::10
 portail.example.com,CNAME,front.example.com
 ```
 
-Cette découverte repose sur les **exports fournis**. Elle n'interroge pas de service de découverte sur Internet et ne constitue pas un inventaire des backends derrière un frontal.
+L'import `--discover-from` lit uniquement les **exports fournis** et n'interroge pas de service de découverte sur Internet. Ni les imports ni les certificats publics ne constituent un inventaire des backends derrière un frontal.
 
 ## Profils et limites
 
@@ -161,7 +218,9 @@ Les versions contradictoires sont conservées et signalées comme prioritaires. 
 | Fichier | Contenu |
 |---|---|
 | `manifest.json` | Périmètre, exclusions, empreintes des entrées, résolution A/AAAA, paramètres et état de chaque exécution. |
-| `targets.txt` | Noms retenus et normalisés. |
+| `targets.txt` | Ensemble des noms retenus et normalisés : cibles exactes, racines, imports et découverte. |
+| `discovery.json` | Si découverte automatique : journal par racine, source, provenance, limites, compteurs, rejets et motifs d'erreur ; inventaire toujours non exhaustif. |
+| `discovered.txt` | Si découverte automatique : noms concrets CT retenus, avant résolution DNS ; certains peuvent ne plus résoudre. |
 | `report.csv` | Évaluations, actions, preuves d'inventaire et absences de couverture. |
 | `report.json` | Même bilan, avec observations et preuves détaillées. |
 | `changes.csv` | Comparaison avec `--previous` ; en-têtes seuls sans comparaison. |
@@ -314,19 +373,19 @@ Pour `8.6.0`, alpha, bêta et RC1 à RC3 précèdent le correctif ; RC4 et les R
 
 Le NSE fait des GET ordinaires, sans déclencher volontairement d'épuisement mémoire ou d'exécution de code. **Les sondes de ports et de services `-sV` de Nmap s'y ajoutent.** Ce trafic actif apparaît dans les journaux et interagit avec les services.
 
-Le scan TCP vise les IP résolues. Host/SNI sélectionnent l'application lors des échanges web ; **une liste de domaines n'isole pas le scan TCP sur un frontal mutualisé**. Backends cachés, noms absents des exports, services non reconnus, caches, versions masquées et restrictions d'accès limitent les observations. Les exclusions de détection de services de Nmap restent applicables même avec tous les ports TCP.
+Le scan TCP vise les IP résolues. Host/SNI sélectionnent l'application lors des échanges web ; **une liste de domaines n'isole pas le scan TCP sur un frontal mutualisé**. Backends cachés, noms absents des entrées et des certificats publics, services non reconnus, caches, versions masquées et restrictions d'accès limitent les observations. Les exclusions de détection de services de Nmap restent applicables même avec tous les ports TCP.
 
 Le corps lu est limité à 64 Kio et n'est pas utilisé comme preuve. Corps et cookies ne sont pas conservés par le NSE. Les valeurs de paramètres sont expurgées des chemins et redirections enregistrés et du manifeste. Les fichiers temporaires d'arguments sont supprimés à la fin du traitement, y compris en mode plan ; les entrées d'origine restent chez l'opérateur. Les CSV neutralisent les cellules pouvant être interprétées comme des formules.
 
 | Sortie du lanceur | Sens |
 |---|---|
 | `0` | Campagne techniquement terminée, ou plan produit. **Ne signifie pas que les services sont corrigés.** |
-| `2` | Entrée invalide, erreur ou couverture incomplète ; consulter le manifeste et le rapport disponible. |
+| `2` | Entrée invalide, erreur ou couverture incomplète, y compris une découverte partielle ; consulter le manifeste, `discovery.json` et le rapport disponibles. |
 | `130` | Interruption ; bilan partiel conservé lorsque possible. |
 
 ## Tests
 
-Les tests utilisent des réponses simulées et des serveurs HTTP/HTTPS en boucle locale. Prérequis de développement : **Lua 5.4, Python 3.10+, OpenSSL et Nmap**.
+Les tests utilisent des réponses simulées et des serveurs HTTP/HTTPS en boucle locale. Les tests de découverte ne dépendent pas du service crt.sh public. Prérequis de développement : **Lua 5.4, Python 3.10+, OpenSSL et Nmap**.
 
 ```bash
 lua5.4 tests/unit.lua
@@ -334,6 +393,8 @@ python3 -m unittest discover -s tests -p 'test_report.py'
 python3 -m unittest discover -s tests -p 'test_runtime_inventory.py'
 python3 -m unittest discover -s tests -p 'test_campaign_report.py'
 python3 -m unittest discover -s tests -p 'test_scan.py'
+python3 -m unittest discover -s tests -p 'test_discovery.py'
+python3 -m unittest discover -s tests -p 'test_discovery_campaign.py'
 python3 tests/integration.py
 python3 tests/test_scan_integration.py
 ```

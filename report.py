@@ -413,6 +413,90 @@ def _campaign_coverage(hostname: str, endpoint: dict[str, Any] | None, reason: s
             "address_family": endpoint.get("family", ""), "scan_ports": endpoint.get("ports", "")}
 
 
+def _discovery_report(manifest: dict, campaign_id: str, observed_at: str
+                      ) -> tuple[dict | None, list[dict], dict]:
+    """Reconcile passive-source processing without claiming exhaustive discovery."""
+    discovery = manifest.get("discovery")
+    if discovery is None:
+        return None, [], {}
+    if not isinstance(discovery, dict) or not isinstance(discovery.get("enabled"), bool):
+        raise ReportError("Decouverte du manifeste invalide.")
+    if not discovery["enabled"]:
+        return dict(discovery), [], {}
+    roots, queries = discovery.get("roots"), discovery.get("queries")
+    if not isinstance(roots, list) or not roots or any(not isinstance(root, str) or not root for root in roots) \
+            or len(set(roots)) != len(roots) or not isinstance(queries, list):
+        raise ReportError("Racines et requetes de decouverte invalides.")
+    skipped_roots = discovery.get("skipped_roots", [])
+    if not isinstance(skipped_roots, list) or any(
+            not isinstance(item, dict) or item.get("root") not in roots
+            or item.get("reason") != "SUBDOMAINS_EXCLUDED_BY_OPERATOR" for item in skipped_roots):
+        raise ReportError("Racines exclues de la decouverte invalides.")
+    excluded_roots = {item["root"] for item in skipped_roots}
+    if len(excluded_roots) != len(skipped_roots):
+        raise ReportError("Racine exclue de la decouverte dupliquee.")
+    source = str(discovery.get("source") or "source passive")
+    rows, seen, completed = [], set(), 0
+
+    def coverage(root: str, query: dict, code: str) -> dict:
+        provider = str(query.get("source") or source)
+        if not code.startswith("DISCOVERY_"):
+            code = "DISCOVERY_" + code
+        detail = str(query.get("error") or query.get("reason") or code)
+        reason = f"Decouverte incomplete pour {root or 'le perimetre'} via {provider}: {detail}"
+        action = "Relancer la decouverte ou completer les noms avec un export DNS/applicatif dans le perimetre autorise."
+        row = _campaign_coverage(root, None, reason, code, campaign_id,
+                                 str(query.get("finished_at") or discovery.get("finished_at") or observed_at))
+        row.update(protocol="discovery", service=provider, port="", scan_status=str(query.get("status") or "PARTIAL"),
+                   verdict="DECOUVERTE DES SOUS-DOMAINES INCOMPLETE", remediation=action, next_action=action,
+                   verification="Cette ligne de decouverte ne prouve ni presence de PHP, ni vulnerabilite, ni correction.",
+                   target_sources=[f"{provider}:{root}"], exploitability="NOT_TESTED")
+        return row
+
+    for query in queries:
+        if not isinstance(query, dict) or not isinstance(query.get("root"), str) or query["root"] not in roots \
+                or query["root"] in excluded_roots:
+            raise ReportError("Requete de decouverte invalide ou hors des racines declarees.")
+        identity = (query["root"], str(query.get("source") or source))
+        if identity in seen:
+            raise ReportError("Requete de decouverte dupliquee dans le manifeste.")
+        seen.add(identity)
+        if query.get("status") == "COMPLETED" and query.get("processing_complete") is True:
+            completed += 1
+        else:
+            code = str(query.get("reason_code") or
+                       (query.get("status") if query.get("status") != "COMPLETED" else "INCOMPLETE") or "INCOMPLETE")
+            rows.append(coverage(query["root"], query, code))
+    covered_roots = {root for root, _ in seen}
+    unattempted = 0
+    for root in roots:
+        if root not in covered_roots and root not in excluded_roots:
+            unattempted += 1
+            rows.append(coverage(root, {"status": "SKIPPED"}, "NOT_ATTEMPTED"))
+    complete = (discovery.get("status") == "COMPLETED" and discovery.get("processing_complete") is True
+                and not rows)
+    if not complete and not rows:
+        rows.append(coverage("", discovery, str(discovery.get("reason_code") or "INCOMPLETE")))
+    normalized = dict(discovery)
+    normalized.update(processing_complete=complete, exhaustive=False)
+    if not complete and discovery.get("status") == "COMPLETED":
+        normalized["status"] = "PARTIAL"
+    summary = {
+        "discovery_status": normalized.get("status", "PARTIAL"),
+        "discovery_processing_complete": complete, "discovery_exhaustive": False,
+        "discovery_roots_total": len(roots), "discovery_queries_total": len(queries),
+        "discovery_roots_excluded": len(excluded_roots), "discovery_queries_completed": completed,
+        "discovery_queries_incomplete": len(queries) - completed,
+        "discovery_queries_unattempted": unattempted, "discovery_coverage_rows": len(rows),
+    }
+    for field in ("candidates_count", "retained_count", "resolved_count", "unresolved_count"):
+        value = discovery.get(field)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ReportError("Compteur de decouverte invalide: " + field)
+        summary["discovery_" + field] = value
+    return normalized, rows, summary
+
+
 def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None = None,
                           previous: Path | None = None, max_inventory_age_hours: float = 24) -> dict:
     """Reconcile every requested name with endpoint results and local evidence.
@@ -428,6 +512,7 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
     base_dir = Path(base_dir)
     campaign_id = str(manifest.get("campaign_id", ""))
     observed_at = str(manifest.get("finished_at") or manifest.get("started_at") or "")
+    discovery, discovery_rows, discovery_summary = _discovery_report(manifest, campaign_id, observed_at)
     try:
         # Freshness is judged at report generation, not an arbitrary historical
         # manifest date; an old scan cannot make an old runtime proof current.
@@ -438,7 +523,7 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
         raise ReportError(str(exc)) from exc
     rows, attempted_names, evaluated_names = [], set(), set()
     endpoint_count = attempted_count = completed_count = 0
-    processing_complete = True
+    processing_complete = discovery_summary.get("discovery_processing_complete", True)
     seen_names = set()
     for target in manifest["targets"]:
         if not isinstance(target, dict) or not isinstance(target.get("hostname"), str) \
@@ -521,6 +606,7 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
                 if row["row_type"] == "ASSESSMENT":
                     evaluated_names.add(name)
                 rows.append(row)
+    rows.extend(discovery_rows)
     for row in rows:
         try:
             row.update(assess_runtime(row, inventory_data, now=now, max_age_hours=max_inventory_age_hours))
@@ -537,8 +623,9 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
         "coverage_rows": sum(row["row_type"] == "COVERAGE" for row in rows),
         "inventory_counts": dict(runtime_counts), "processing_complete": processing_complete and manifest.get("status") == "COMPLETED",
         "excluded_candidates": len(manifest.get("excluded_candidates", [])),
+        **discovery_summary,
     }
-    result = {"schema_version": "1", "tool_version": "0.3.0",
+    result = {"schema_version": "1", "tool_version": str(manifest.get("tool_version") or "0.3.0"),
               "campaign": {key: manifest.get(key) for key in ("campaign_id", "started_at", "finished_at", "status", "profile", "ports", "address_families", "http", "limits", "scope")},
               "generated_at": now.isoformat(), "summary": summary, "rows": rows, "changes": [],
               "excluded_candidates": manifest.get("excluded_candidates", []),
@@ -547,6 +634,15 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
                   "Une absence d'evaluation ou de signal reseau ne confirme pas l'application du correctif.",
                   "Les preuves serveur importees restent des attestations dont l'authenticite et l'exhaustivite sont a valider par l'operateur.",
               ]}
+    if discovery is not None:
+        result["discovery"] = discovery
+        result["campaign"]["discovery"] = {key: value for key, value in discovery.items()
+                                            if key not in ("queries", "candidates")}
+        if discovery.get("enabled"):
+            result["limitations"].append(
+                "La decouverte passive observe des noms publies par la source; meme terminee sans erreur, "
+                "elle ne prouve pas l'exhaustivite des sous-domaines. Aucun nom trouve ne signifie pas aucun sous-domaine."
+            )
     if inventory_data:
         result["inventory"] = {key: inventory_data[key] for key in ("filename", "sha256", "trust_note")}
         result["inventory"]["max_age_hours"] = max_inventory_age_hours

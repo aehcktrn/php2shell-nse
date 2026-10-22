@@ -2,7 +2,8 @@
 """Run a scoped PHP2Shell Nmap campaign and reconcile every requested hostname.
 
 Python standard library only. Nmap performs service discovery; the NSE uses
-ordinary bounded HTTP requests. Discovery imports local DNS/application exports.
+ordinary bounded HTTP requests. Optional passive crt.sh discovery and local
+DNS/application imports feed the same explicit scope checks.
 """
 from __future__ import annotations
 
@@ -27,13 +28,16 @@ from urllib.parse import quote
 import uuid
 
 from report import build_campaign_report, write_campaign_report
+from discovery import discover_root
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
 MAX_TARGETS = 100000
+MAX_DISCOVERY_ROOTS = 1000
+DISCOVERY_RESPONSE_BYTES = 8 * 1024 * 1024
 PROFILES = {"rapide": "quick", "quick": "quick", "complet": "complete",
             "complete": "complete", "recontrole": "recheck", "recheck": "recheck"}
 HOST_FIELDS = ("hostname", "fqdn", "name", "domain", "host")
@@ -221,6 +225,10 @@ def recheck_targets(previous: dict) -> tuple[dict[str, set[int]], dict[str, list
     for row in previous["rows"]:
         if not isinstance(row, dict) or row.get("inventory_patch_status") == "PATCH_CONFIRMED":
             continue
+        # A failed passive-source query names a namespace, not a scan target.
+        # Rechecking that coverage row could reintroduce an excluded apex.
+        if row.get("protocol") == "discovery":
+            continue
         raw_name = row.get("hostname")
         if not raw_name:
             continue
@@ -247,10 +255,12 @@ def recheck_targets(previous: dict) -> tuple[dict[str, set[int]], dict[str, list
     return ports, paths
 
 
-def collect_targets(args, rules: dict, previous: dict | None) -> tuple[list[dict], list[dict]]:
+def collect_targets(args, rules: dict, previous: dict | None,
+                    extra_candidates: list[tuple] | None = None,
+                    allow_empty: bool = False) -> tuple[list[dict], list[dict]]:
     imports = args.discover_from or []
-    if imports and not args.scope:
-        raise InputError("--discover-from exige --scope pour filtrer les domaines autorises.")
+    if imports and rules.get("mode") != "domains":
+        raise InputError("--discover-from exige --scope ou --discover-subdomains pour filtrer les domaines autorises.")
     recheck_ports, recheck_paths = recheck_targets(previous) if args.profile == "recheck" else ({}, {})
     if args.targets:
         inputs = exact_hosts(args.targets)
@@ -263,6 +273,7 @@ def collect_targets(args, rules: dict, previous: dict | None) -> tuple[list[dict
         candidates.extend(discovery_records(path))
         if len(candidates) > MAX_TARGETS:
             raise InputError("Trop de candidats (100000 maximum).")
+    candidates.extend(extra_candidates or [])
     targets, rejected = {}, []
     for raw, source, reject in candidates:
         try:
@@ -285,9 +296,202 @@ def collect_targets(args, rules: dict, previous: dict | None) -> tuple[list[dict
         if args.profile == "recheck":
             target["recheck_ports"] = sorted(recheck_ports[name])
             target["recheck_paths"] = recheck_paths[name]
-    if not targets:
+    if len(targets) > MAX_TARGETS:
+        raise InputError("Trop de cibles distinctes (100000 maximum).")
+    if not targets and not allow_empty:
         raise InputError("Aucune cible retenue. Verifier les noms, le perimetre, les exclusions et le rapport precedent.")
     return list(targets.values()), rejected
+
+
+def read_discovery_roots(path: Path | None) -> list[tuple[str, str]]:
+    """Root files authorize namespaces; exact-target files keep their old meaning."""
+    if path is None:
+        return []
+    roots = {}
+    for name, source in exact_hosts(path):
+        if len(name.split(".")) < 2:
+            raise InputError(f"{path}: domaine de decouverte complet attendu (au moins deux labels DNS).")
+        roots.setdefault(name, source.replace("input:", "root:", 1))
+        if len(roots) > MAX_DISCOVERY_ROOTS:
+            raise InputError(f"{MAX_DISCOVERY_ROOTS} domaines racines maximum par campagne.")
+    if not roots:
+        raise InputError("Le fichier des domaines de decouverte est vide.")
+    return list(roots.items())
+
+
+def prepare_request_paths(targets: list[dict], paths: list[str]) -> dict[str, list[str]]:
+    request_paths = {}
+    for target in targets:
+        selected = list(paths)
+        for old_path in target.get("recheck_paths", []):
+            if "?" in old_path:
+                base_path = old_path.split("?", 1)[0]
+                if not any("?" in supplied and supplied.split("?", 1)[0] == base_path for supplied in paths):
+                    raise InputError(f"{target['hostname']}: parametres de {base_path} masques dans le rapport precedent; fournir le chemin complet via --path ou --paths-file.")
+            elif old_path not in selected:
+                selected.append(old_path)
+        if len(selected) > 11:
+            raise InputError("Trop de chemins de recontrole combines (11 maximum); preciser un perimetre plus petit.")
+        request_paths[target["hostname"]] = selected
+        target["requested_paths"] = [public_path(path) for path in selected]
+    return request_paths
+
+
+def persist_discovery(output: Path, manifest: dict) -> None:
+    atomic_json(output / "discovery.json", manifest["discovery"])
+    atomic_json(output / "manifest.json", manifest)
+
+
+def interrupt_discovery(discovery: dict, roots: list[tuple[str, str]], rules: dict) -> None:
+    """Finish the local ledger without issuing any further source requests."""
+    finished = utcnow()
+    recorded = {query["root"] for query in discovery["queries"]}
+    excluded = {item["root"] for item in discovery["skipped_roots"]}
+    for query in discovery["queries"]:
+        if query["status"] == "RUNNING":
+            query.update(status="FAILED", reason_code="CAMPAIGN_INTERRUPTED",
+                         processing_complete=False, finished_at=finished)
+    for root, _ in roots:
+        if root in recorded or root in excluded:
+            continue
+        if any(root == zone or root.endswith("." + zone) for zone in rules["excluded_subdomains"]):
+            discovery["skipped_roots"].append({"root": root, "reason": "SUBDOMAINS_EXCLUDED_BY_OPERATOR"})
+        else:
+            discovery["queries"].append({"root": root, "source": "crt.sh", "status": "SKIPPED",
+                "reason_code": "CAMPAIGN_INTERRUPTED", "processing_complete": False,
+                "exhaustive": False, "candidate_count": 0, "started_at": None, "finished_at": finished})
+    partial = discovery["candidates"] or any(query["status"] == "COMPLETED" for query in discovery["queries"])
+    discovery.update(status="PARTIAL" if partial else "FAILED", reason_code="CAMPAIGN_INTERRUPTED",
+                     processing_complete=False, exhaustive=False, finished_at=finished)
+
+
+def run_discovery(args, roots: list[tuple[str, str]], rules: dict,
+                  output: Path, manifest: dict) -> tuple[list[tuple], list[dict], bool]:
+    """Keep a query ledger even when the source fails before returning names."""
+    discovery = manifest["discovery"]
+    started = time.monotonic()
+    effective_limit = min(args.discovery_max_names, MAX_TARGETS - len(manifest["targets"]))
+    discovery["limits"]["effective_max_names"] = effective_limit
+    limit_reason = "NAME_LIMIT_REACHED" if effective_limit == args.discovery_max_names else "TARGET_LIMIT_REACHED"
+    names: dict[str, list[str]] = {}
+    interrupted, stop_reason, query = False, None, None
+    try:
+        for root, _ in roots:
+            if any(root == zone or root.endswith("." + zone) for zone in rules["excluded_subdomains"]):
+                discovery["skipped_roots"].append({"root": root, "reason": "SUBDOMAINS_EXCLUDED_BY_OPERATOR"})
+                continue
+            query = {"root": root, "source": "crt.sh", "status": "RUNNING",
+                     "reason_code": "QUERY_PENDING", "processing_complete": False,
+                     "exhaustive": False, "candidate_count": 0,
+                     "started_at": None, "finished_at": None}
+            discovery["queries"].append(query)
+            remaining = args.discovery_budget - (time.monotonic() - started)
+            if stop_reason is None and remaining <= 0:
+                stop_reason = "DISCOVERY_BUDGET_EXHAUSTED"
+            if stop_reason is None and len(names) >= effective_limit:
+                stop_reason = limit_reason
+            if stop_reason is not None:
+                query.update(status="SKIPPED", reason_code=stop_reason, finished_at=utcnow())
+                persist_discovery(output, manifest)
+                query = None
+                continue
+            query["started_at"] = utcnow()
+            persist_discovery(output, manifest)
+            print(f"Decouverte crt.sh: {root}...", flush=True)
+            try:
+                result = discover_root(root, timeout=min(args.discovery_timeout, remaining),
+                                       max_names=effective_limit,
+                                       max_bytes=DISCOVERY_RESPONSE_BYTES)
+            except Exception as exc:
+                result = {"status": "FAILED", "reason_code": "PROVIDER_ERROR", "candidates": [],
+                          "processing_complete": False, "finished_at": utcnow(),
+                          "error_type": type(exc).__name__}
+            query.update({key: value for key, value in result.items() if key != "candidates"})
+            query.update(root=root, source="crt.sh", exhaustive=False)
+            source = "crt.sh:" + root
+            for name in result.get("candidates", []):
+                if name not in names:
+                    if len(names) >= effective_limit:
+                        query.update(status="PARTIAL", reason_code=limit_reason, processing_complete=False)
+                        stop_reason = limit_reason
+                        break
+                    names[name] = [source]
+                elif source not in names[name]:
+                    names[name].append(source)
+            if query.get("reason_code") == "RATE_LIMITED":
+                # A rate limit is a request to stop, not an invitation to hammer the
+                # same public source with all remaining root names.
+                stop_reason = "RATE_LIMITED"
+            discovery["candidates_count"] = len(names)
+            discovery["candidates"] = [{"hostname": name, "sources": sources}
+                                       for name, sources in sorted(names.items())]
+            print(f"  {query['status']}: {query.get('candidate_count', 0)} noms; {query.get('reason_code', '')}", flush=True)
+            persist_discovery(output, manifest)
+            query = None
+        complete = all(item.get("status") == "COMPLETED" and item.get("processing_complete", True)
+                       for item in discovery["queries"])
+        discovery["processing_complete"] = complete
+        discovery["status"] = "COMPLETED" if complete else "PARTIAL" if names or any(
+            item.get("status") == "COMPLETED" for item in discovery["queries"]) else "FAILED"
+        discovery["finished_at"] = utcnow()
+        persist_discovery(output, manifest)
+    except KeyboardInterrupt:
+        interrupted = True
+        # A received response may still have been only partly merged or saved.
+        if query is not None and query.get("status") == "COMPLETED":
+            query.update(status="PARTIAL", reason_code="CAMPAIGN_INTERRUPTED",
+                         processing_complete=False, finished_at=utcnow())
+        discovery["candidates_count"] = len(names)
+        discovery["candidates"] = [{"hostname": name, "sources": sources}
+                                   for name, sources in sorted(names.items())]
+        interrupt_discovery(discovery, roots, rules)
+        print("Interruption de la decouverte; conservation du bilan partiel.", file=sys.stderr)
+        persist_discovery(output, manifest)
+    candidates = [(name, source, None) for name, sources in sorted(names.items()) for source in sources]
+    # Retain bounded provider rejection samples, never as resolvable targets.
+    rejected = [item for entry in discovery["queries"] for item in entry.get("excluded_candidates", [])]
+    return candidates, rejected, interrupted
+
+
+def record_discovered_targets(output: Path, manifest: dict, targets: list[dict]) -> None:
+    discovery = manifest["discovery"]
+    by_name = {target["hostname"]: target for target in targets}
+    retained = []
+    for candidate in discovery["candidates"]:
+        target = by_name.get(candidate["hostname"])
+        candidate["retained"] = target is not None
+        if target is not None:
+            retained.append(candidate["hostname"])
+            for key in ("dns_status", "addresses", "dns_error", "dns_partial", "resolved_at"):
+                if key in target:
+                    candidate[key] = target[key]
+    discovery["retained_count"] = len(retained)
+    discovery["resolved_count"] = sum(item.get("retained") and item.get("dns_status") == "RESOLVED"
+                                      for item in discovery["candidates"])
+    discovery["unresolved_count"] = sum(item.get("retained") and item.get("dns_status") in ("NO_ADDRESS", "DNS_ERROR")
+                                        for item in discovery["candidates"])
+    (output / "discovered.txt").write_text("\n".join(retained) + ("\n" if retained else ""), encoding="utf-8")
+    persist_discovery(output, manifest)
+
+
+def merge_discovered_targets(targets: list[dict], excluded: list[dict], candidates: list[tuple],
+                             rules: dict) -> list[dict]:
+    """Merge into the validated input snapshot without rereading operator files."""
+    by_name = {target["hostname"]: target for target in targets}
+    for raw, source, _ in candidates:
+        try:
+            name = hostname(raw)
+            reason = exclusion_reason(name, rules)
+        except InputError:
+            name, reason = str(raw)[:253], "INVALID_HOSTNAME"
+        if reason:
+            excluded.append({"hostname": name, "source": source, "reason": reason})
+            continue
+        target = by_name.setdefault(name, {"hostname": name, "sources": [],
+                                          "dns_status": "NOT_RESOLVED", "addresses": [], "endpoints": []})
+        if source not in target["sources"]:
+            target["sources"].append(source)
+    return list(by_name.values())
 
 
 def valid_path(value: str) -> str:
@@ -391,10 +595,13 @@ def nse_arguments(name: str, paths: list[str], args) -> str:
     # escaping is used as data here, never interpolated into a shell command.
     quoted = lambda value: json.dumps(value, ensure_ascii=True)
     values = {"vhost": quoted(name), "path": quoted(paths[0]),
-              "paths": "{" + ",".join(quoted(path) for path in paths[1:]) + "}",
               "timeout": str(args.http_timeout), "budget": str(args.http_budget),
               "max_requests": str(args.max_requests), "redirects": str(args.redirects),
               "samples": str(args.samples)}
+    # Nmap parses an empty {} argument as a table with an empty string on
+    # some versions. Omit optional paths instead of generating invalid input.
+    if paths[1:]:
+        values["paths"] = "{" + ",".join(quoted(path) for path in paths[1:]) + "}"
     return ",\n".join(f"http-php2shell.{key}={value}" for key, value in values.items()) + "\n"
 
 
@@ -499,7 +706,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--version", action="version", version=f"php2shell-scanner {VERSION}")
     result.add_argument("--profile", choices=PROFILES, default="complet", help="Complet, rapide ou recontrole")
     result.add_argument("--scope", type=Path, help="Domaines autorises, sous-domaines inclus")
-    result.add_argument("--discover-from", action="append", type=Path, default=[], help="Import local TXT/CSV/TSV/JSON, repetable; exige --scope")
+    result.add_argument("--discover-subdomains", type=Path, metavar="ROOTS_FILE", help="Decouverte passive via crt.sh depuis un fichier de domaines racines autorises")
+    result.add_argument("--discovery-timeout", type=bounded_int(1, 120), default=30, help="Delai total par requete crt.sh en secondes")
+    result.add_argument("--discovery-budget", type=bounded_int(1, 3600), default=300, help="Budget total de la phase de decouverte en secondes")
+    result.add_argument("--discovery-max-names", type=bounded_int(1, 100000), default=10000, help="Maximum de noms uniques issus de crt.sh par campagne")
+    result.add_argument("--discover-from", action="append", type=Path, default=[], help="Import local TXT/CSV/TSV/JSON, repetable; exige --scope ou --discover-subdomains")
     result.add_argument("--exclude", type=Path, help="Noms exacts ou *.domaine exclus")
     result.add_argument("--output", type=Path, help="Nouveau dossier de campagne (doit etre vide)")
     result.add_argument("--families", choices=("ipv4", "ipv6", "both"), default="both")
@@ -518,7 +729,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--inventory", type=Path, help="Preuves de runtimes authentifies au format JSON")
     result.add_argument("--inventory-max-age-hours", type=bounded_int(1, 8760), default=24)
     result.add_argument("--previous", type=Path, help="report.json precedent pour comparaison/recontrole")
-    result.add_argument("--dry-run", action="store_true", help="Resoudre et exporter le plan sans lancer Nmap")
+    result.add_argument("--dry-run", action="store_true", help="Decouverte crt.sh si activee, resolution DNS et plan sans lancer Nmap")
     result.add_argument("--nmap", default=os.environ.get("NMAP", "nmap"), help="Executable Nmap")
     result.add_argument("--nmap-datadir", default=os.environ.get("NMAP_DATADIR"), help="Repertoire des donnees Nmap")
     return result
@@ -529,8 +740,10 @@ def run_campaign(args) -> int:
     previous = read_previous(args.previous)
     if args.profile == "recheck" and previous is None:
         raise InputError("Le profil recontrole exige --previous report.json.")
-    if not args.targets and not args.discover_from and args.profile != "recheck":
-        raise InputError("Fournir un fichier de domaines ou --discover-from avec --scope.")
+    if args.discover_subdomains and args.profile == "recheck":
+        raise InputError("--discover-subdomains est incompatible avec le profil recontrole; utiliser une campagne normale avec --previous.")
+    if not args.targets and not args.discover_from and not args.discover_subdomains and args.profile != "recheck":
+        raise InputError("Fournir un fichier de cibles, --discover-subdomains roots.txt ou --discover-from avec --scope.")
     paths = [valid_path(args.path)]
     if args.paths_file:
         for line in read_text(args.paths_file).splitlines():
@@ -540,24 +753,14 @@ def run_campaign(args) -> int:
     paths = list(dict.fromkeys(paths))
     if len(paths) > 11:
         raise InputError("11 chemins maximum (chemin initial + 10 supplementaires); budget de requetes partage.")
-    rules = scope_rules(args.scope, args.exclude)
-    targets, excluded = collect_targets(args, rules, previous)
-    request_paths = {}
-    for target in targets:
-        selected = list(paths)
-        for old_path in target.get("recheck_paths", []):
-            if "?" in old_path:
-                # Do not invent values that were deliberately removed from the
-                # previous report, or silently omit the original suspect route.
-                base_path = old_path.split("?", 1)[0]
-                if not any("?" in supplied and supplied.split("?", 1)[0] == base_path for supplied in paths):
-                    raise InputError(f"{target['hostname']}: parametres de {base_path} masques dans le rapport precedent; fournir le chemin complet via --path ou --paths-file.")
-            elif old_path not in selected:
-                selected.append(old_path)
-        if len(selected) > 11:
-            raise InputError("Trop de chemins de recontrole combines (11 maximum); preciser un perimetre plus petit.")
-        request_paths[target["hostname"]] = selected
-        target["requested_paths"] = [public_path(path) for path in selected]
+    roots = read_discovery_roots(args.discover_subdomains)
+    rules = scope_rules(args.scope or args.discover_subdomains, args.exclude)
+    for root, _ in roots:
+        if not any(is_within(root, allowed) for allowed in rules["domains"]):
+            raise InputError(f"Domaine de decouverte hors du perimetre autorise: {root}")
+    seed_candidates = [(name, source, None) for name, source in roots]
+    targets, excluded = collect_targets(args, rules, previous, seed_candidates, allow_empty=bool(roots))
+    request_paths = prepare_request_paths(targets, paths)
     default_ports = args.ports or (QUICK_PORTS if args.profile == "quick" else "1-65535")
     if args.profile == "recheck" and not args.ports:
         default_ports = (previous.get("campaign") or {}).get("ports") or "1-65535"
@@ -584,29 +787,83 @@ def run_campaign(args) -> int:
                 "limits": {"workers": args.workers, "target_timeout_seconds": args.target_timeout,
                            "dns_timeout_seconds": args.dns_timeout, "nmap_max_rate": args.max_rate},
                 "targets": targets, "excluded_candidates": excluded, "inputs": []}
-    for path in [args.targets, args.scope, args.exclude, args.paths_file, args.inventory, args.previous, *args.discover_from]:
+    for path in [args.targets, args.scope, args.discover_subdomains, args.exclude, args.paths_file, args.inventory, args.previous, *args.discover_from]:
         if path:
             manifest["inputs"].append({"file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     (output / "targets.txt").write_text("\n".join(item["hostname"] for item in targets) + "\n", encoding="utf-8")
     atomic_json(output / "manifest.json", manifest)
-    print(f"Campagne {campaign_id}: {len(targets)} domaines; profil {args.profile}; familles {', '.join(families)}.", flush=True)
+    print(f"Campagne {campaign_id}: profil {args.profile}; familles {', '.join(families)}.", flush=True)
     print(f"Resultats: {output}", flush=True)
     resolution_interrupted = False
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        resolutions = {executor.submit(resolve_target, target["hostname"], families, args.dns_timeout): target
-                       for target in targets}
+    discovery_incomplete = False
+    if roots:
+        manifest["discovery"] = {"schema_version": "1", "enabled": True, "mode": "passive", "source": "crt.sh",
+            "roots": [name for name, _ in roots], "queries": [], "skipped_roots": [],
+            "started_at": utcnow(), "finished_at": None, "status": "RUNNING",
+            "processing_complete": False, "exhaustive": False,
+            "candidates": [], "candidates_count": 0, "retained_count": 0,
+            "resolved_count": 0, "unresolved_count": 0,
+            "limits": {"timeout_seconds": args.discovery_timeout, "budget_seconds": args.discovery_budget,
+                       "max_names": args.discovery_max_names, "max_response_bytes": DISCOVERY_RESPONSE_BYTES,
+                       "max_roots": MAX_DISCOVERY_ROOTS},
+            "limitations": ["Source publique de certificats; inventaire non exhaustif.",
+                "Un certificat generique ne revele pas les noms concrets qu'il peut couvrir.",
+                "Un nom historique peut ne plus resoudre; une adresse partagee ou un DNS generique ne prouve pas une application distincte."]}
+        initial_excluded_count = len(excluded)
         try:
-            for future in as_completed(resolutions):
-                resolutions[future].update(future.result())
+            persist_discovery(output, manifest)
+            (output / "discovered.txt").write_text("", encoding="utf-8")
+            candidates, source_rejected, resolution_interrupted = run_discovery(args, roots, rules, output, manifest)
+            excluded.extend(source_rejected)
+            targets = merge_discovered_targets(targets, excluded, candidates, rules)
+            manifest["targets"] = targets
+            request_paths = prepare_request_paths(targets, paths)
+            record_discovered_targets(output, manifest, targets)
         except KeyboardInterrupt:
             resolution_interrupted = True
-            print("Interruption de la resolution DNS; conservation du bilan partiel.", file=sys.stderr)
-            for future in resolutions:
-                future.cancel()
+            discovery = manifest["discovery"]
+            interrupt_discovery(discovery, roots, rules)
+            # Rebuild only the local merge from the retained ledger. This also
+            # recovers an interrupt during persistence without repeating I/O to
+            # the public source, DNS or targets, or duplicating exclusions.
+            candidates = [(item["hostname"], source, None) for item in discovery["candidates"]
+                          for source in item["sources"]]
+            del excluded[initial_excluded_count:]
+            excluded.extend(item for query in discovery["queries"] for item in query.get("excluded_candidates", []))
+            targets = merge_discovered_targets(targets, excluded, candidates, rules)
+            manifest["targets"] = targets
+            request_paths = prepare_request_paths(targets, paths)
+            record_discovered_targets(output, manifest, targets)
+            print("Interruption de la decouverte; conservation du bilan partiel.", file=sys.stderr)
+        discovery_incomplete = not manifest["discovery"]["processing_complete"]
+        print(f"Decouverte: {manifest['discovery']['status']}; {manifest['discovery']['retained_count']} noms retenus; couverture non exhaustive.", flush=True)
+    (output / "targets.txt").write_text("\n".join(item["hostname"] for item in targets) + ("\n" if targets else ""), encoding="utf-8")
+    atomic_json(output / "manifest.json", manifest)
+    if not resolution_interrupted:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            resolutions = {executor.submit(resolve_target, target["hostname"], families, args.dns_timeout): target
+                           for target in targets}
+            try:
+                for future in as_completed(resolutions):
+                    resolutions[future].update(future.result())
+            except KeyboardInterrupt:
+                resolution_interrupted = True
+                print("Interruption de la resolution DNS; conservation du bilan partiel.", file=sys.stderr)
+                for future in resolutions:
+                    future.cancel()
     if resolution_interrupted:
         for target in targets:
             if target["dns_status"] == "NOT_RESOLVED":
                 target.update(dns_status="DNS_ERROR", dns_error="CAMPAIGN_INTERRUPTED")
+    if roots:
+        try:
+            record_discovered_targets(output, manifest, targets)
+        except KeyboardInterrupt:
+            resolution_interrupted = True
+            discovery_incomplete = True
+            interrupt_discovery(manifest["discovery"], roots, rules)
+            record_discovered_targets(output, manifest, targets)
+            print("Interruption de la decouverte; conservation du bilan partiel.", file=sys.stderr)
     jobs, index = [], 0
     for target in targets:
         selected_ports = default_ports
@@ -632,7 +889,11 @@ def run_campaign(args) -> int:
         for arguments in (output / "raw").glob("*.args"):
             arguments.unlink()
         print("Plan enregistre. Aucun processus Nmap lance.")
-        return 130 if resolution_interrupted else 0
+        manifest["finished_at"] = utcnow()
+        if discovery_incomplete or resolution_interrupted:
+            manifest["status"] = "PARTIAL"
+        atomic_json(output / "manifest.json", manifest)
+        return 130 if resolution_interrupted else 2 if discovery_incomplete else 0
     manifest["status"] = "RUNNING"
     atomic_json(output / "manifest.json", manifest)
     control, interrupted = Processes(), resolution_interrupted
@@ -677,7 +938,7 @@ def run_campaign(args) -> int:
                     endpoint.update(status="FAILED", error="RUNNER_ERROR", finished_at=utcnow())
         for arguments in (output / "raw").glob("*.args"):
             arguments.unlink()
-    failures = any(item["dns_status"] != "RESOLVED" or item.get("dns_partial") for item in targets) or any(
+    failures = discovery_incomplete or any(item["dns_status"] != "RESOLVED" or item.get("dns_partial") for item in targets) or any(
         endpoint["status"] != "COMPLETED" for _, endpoint in jobs)
     manifest["status"] = "PARTIAL" if failures or interrupted else "COMPLETED"
     manifest["finished_at"] = utcnow()
