@@ -1,0 +1,30 @@
+name: NSE tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends nmap lua5.4 openssl
+
+      - name: Run unit tests
+        run: lua5.4 tests/unit.lua
+
+      - name: Run HTTP and HTTPS integration tests on loopback
+        run: python3 tests/integration.py
