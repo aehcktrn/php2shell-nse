@@ -88,7 +88,7 @@ class ScanCLIIntegration(unittest.TestCase):
         output = self.base / f"campaign-{self.counter}"
         command = [
             sys.executable, str(ROOT / "scan.py"), str(targets),
-            "--profile", "rapide", "--ports", str(port),
+            "--ports", str(port),
             "--families", "ipv4", "--workers", "1", "--target-timeout", "60",
             "--paths-file", str(paths), "--output", str(output),
             "--nmap", self.nmap, *extra_args,
@@ -96,7 +96,9 @@ class ScanCLIIntegration(unittest.TestCase):
         completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=90)
         self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
         self.assertTrue((output / "manifest.json").is_file(), completed.stdout)
-        return output, json.loads((output / "manifest.json").read_text()), completed
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["profile"], "quick")
+        return output, manifest, completed
 
     def assert_compact_report(self, output, hostname, version, verdict):
         text = (output / "report.json").read_text(encoding="utf-8")
@@ -208,15 +210,14 @@ class ScanCLIIntegration(unittest.TestCase):
             with server.record_lock:
                 self.assertEqual(server.requests, [])
 
-    def test_discovery_scans_only_retained_subdomain_with_real_nmap_and_host(self):
+    def test_single_file_discover_scans_root_and_child_with_real_nmap_and_host(self):
         # Discovery and DNS are deterministic; only the loopback Nmap/NSE
         # transport is real. No public CT service or DNS server is contacted.
         type(self).counter += 1
         inputs = self.base / f"discovery-input-{self.counter}"
         inputs.mkdir()
-        roots, excluded = inputs / "roots.txt", inputs / "exclude.txt"
-        roots.write_text("example.test\n", encoding="utf-8")
-        excluded.write_text("example.test\n", encoding="utf-8")
+        domains = inputs / "domains.txt"
+        domains.write_text("example.test\n", encoding="utf-8")
         output = self.base / f"discovery-campaign-{self.counter}"
         now = datetime.now(timezone.utc).isoformat()
         source_result = {
@@ -238,8 +239,7 @@ class ScanCLIIntegration(unittest.TestCase):
         with self.serve() as server:
             port = server.server_port
             arguments = [
-                "--discover-subdomains", str(roots), "--exclude", str(excluded),
-                "--profile", "rapide", "--ports", str(port), "--families", "ipv4",
+                str(domains), "--discover", "--ports", str(port), "--families", "ipv4",
                 "--workers", "1", "--target-timeout", "60", "--path", "/old",
                 "--output", str(output), "--nmap", self.nmap,
             ]
@@ -250,58 +250,75 @@ class ScanCLIIntegration(unittest.TestCase):
             self.assertEqual(status, 0, messages.getvalue())
             discover.assert_called_once()
             self.assertEqual(discover.call_args.args, ("example.test",))
-            resolve.assert_called_once_with("app.example.test", ["ipv4"], 15)
+            self.assertEqual(resolve.call_count, 2)
+            self.assertEqual({call.args[0] for call in resolve.call_args_list},
+                             {"example.test", "app.example.test"})
+            self.assertTrue(all(call.args[1:] == (["ipv4"], 15) for call in resolve.call_args_list))
             with server.record_lock:
                 requests = [item for item in server.requests if item["path"] == "/old"]
             self.assertTrue(requests, (output / "raw" / "000001.xml").read_text())
-            self.assertTrue(all(item["host"] == f"app.example.test:{port}" for item in requests))
+            self.assertEqual({item["host"] for item in requests},
+                             {f"example.test:{port}", f"app.example.test:{port}"})
 
         manifest = json.loads((output / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "COMPLETED")
+        self.assertEqual(manifest["profile"], "quick")
         self.assertEqual(manifest["scope"]["domains"], ["example.test"])
-        self.assertEqual(manifest["scope"]["excluded_hosts"], ["example.test"])
-        self.assertEqual([item["hostname"] for item in manifest["targets"]], ["app.example.test"])
-        target = manifest["targets"][0]
-        self.assertEqual(target["sources"], ["crt.sh:example.test"])
-        self.assertEqual(target["addresses"], ["127.0.0.1"])
-        self.assertTrue(any(item["hostname"] == "example.test" and item["reason"] == "EXCLUDED_BY_OPERATOR"
-                            for item in manifest["excluded_candidates"]))
+        self.assertEqual(manifest["scope"]["excluded_hosts"], [])
+        expected = {"example.test", "app.example.test"}
+        by_name = {item["hostname"]: item for item in manifest["targets"]}
+        self.assertEqual(set(by_name), expected)
+        self.assertEqual(by_name["app.example.test"]["sources"], ["crt.sh:example.test"])
+        self.assertIn("input:domains.txt:1", by_name["example.test"]["sources"])
+        self.assertEqual(manifest["excluded_candidates"], [])
+        self.assertEqual([item["file"] for item in manifest["inputs"]], ["domains.txt"])
+        self.assertEqual({path.name for path in inputs.iterdir()}, {"domains.txt"})
+        self.assertEqual(domains.read_text(), "example.test\n")
         for name in ("targets.txt", "discovered.txt"):
-            self.assertEqual((output / name).read_text(), "app.example.test\n")
+            self.assertEqual(set((output / name).read_text().splitlines()), expected)
         discovery = json.loads((output / "discovery.json").read_text())
         self.assertEqual(discovery, manifest["discovery"])
         self.assertEqual(discovery["queries"][0]["source"], "crt.sh")
         self.assertEqual(discovery["queries"][0]["root"], "example.test")
         self.assertFalse(discovery["exhaustive"])
         candidates = {item["hostname"]: item for item in discovery["candidates"]}
-        self.assertFalse(candidates["example.test"]["retained"])
+        self.assertTrue(candidates["example.test"]["retained"])
         self.assertTrue(candidates["app.example.test"]["retained"])
         self.assertEqual(candidates["app.example.test"]["sources"], ["crt.sh:example.test"])
         self.assertEqual(candidates["app.example.test"]["addresses"], ["127.0.0.1"])
 
-        self.assertEqual(len(target["endpoints"]), 1)
-        endpoint = target["endpoints"][0]
-        self.assertEqual(endpoint["status"], "COMPLETED")
-        self.assertEqual(endpoint["command"][-1], "127.0.0.1")
-        self.assertIn("-n", endpoint["command"])
-        xml = ET.parse(output / endpoint["xml"]).getroot()
-        self.assertEqual(xml.find("host/address").get("addr"), "127.0.0.1")
-        script = xml.find(".//script[@id='http-php2shell']")
-        self.assertIsNotNone(script)
-        self.assertEqual(script.find("elem[@key='state']").text, "POTENTIALLY_VULNERABLE")
+        for target in by_name.values():
+            self.assertEqual(target["addresses"], ["127.0.0.1"])
+            self.assertEqual(len(target["endpoints"]), 1)
+            endpoint = target["endpoints"][0]
+            self.assertEqual(endpoint["status"], "COMPLETED")
+            self.assertEqual(endpoint["command"][-1], "127.0.0.1")
+            self.assertIn("-n", endpoint["command"])
+            xml = ET.parse(output / endpoint["xml"]).getroot()
+            self.assertEqual(xml.find("host/address").get("addr"), "127.0.0.1")
+            script = xml.find(".//script[@id='http-php2shell']")
+            self.assertIsNotNone(script)
+            self.assertEqual(script.find("elem[@key='state']").text, "POTENTIALLY_VULNERABLE")
         report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertEqual(report["discovery"], discovery)
         self.assertTrue(report["summary"]["discovery_processing_complete"])
         self.assertFalse(report["summary"]["discovery_exhaustive"])
         rows = [row for row in report["rows"] if row["row_type"] == "ASSESSMENT"]
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        self.assertEqual((row["hostname"], row["ip"], str(row["port"])),
-                         ("app.example.test", "127.0.0.1", str(port)))
-        self.assertEqual(row["target_sources"], ["crt.sh:example.test"])
-        self.assertEqual(row["state"], "POTENTIALLY_VULNERABLE")
-        self.assertIn("8.3.35", row["versions"])
-        self.assert_compact_report(output, "app.example.test", "8.3.35", "OUI")
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual((row["ip"], str(row["port"])), ("127.0.0.1", str(port)))
+            self.assertEqual(row["target_sources"], by_name[row["hostname"]]["sources"])
+            self.assertEqual(row["state"], "POTENTIALLY_VULNERABLE")
+            self.assertIn("8.3.35", row["versions"])
+        text = (output / "report.json").read_text()
+        compact = json.loads(text)
+        self.assertEqual(len(text.splitlines()), 4)
+        self.assertEqual({row["cible"]: (row["php"], row["vulnerable"]) for row in compact},
+                         {name: ("8.3.35", "OUI") for name in expected})
+        with (output / "report.csv").open(newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            self.assertEqual(tuple(reader.fieldnames), ("cible", "php", "vulnerable", "explication"))
+            self.assertEqual(list(reader), compact)
 
 
 if __name__ == "__main__":

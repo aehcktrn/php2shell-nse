@@ -1,4 +1,6 @@
-# Copier vers roots.txt et remplacer les domaines reserves ci-dessous.
+# Mode avance facultatif : ancien fichier de racines distinct.
+# Usage courant : python3 scan.py domaines.txt --discover (un seul fichier).
+# Pour l'ancien mode, copier vers roots.txt et remplacer les exemples.
 # Un domaine racine par ligne, avec au moins deux labels DNS ; maximum 1000.
 # Sans https://, port, chemin, joker * ou suffixe CIDR.
 # Chaque racine autorise ce nom et ses sous-domaines, sauf --scope explicite.

@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 import csv
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -14,6 +15,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import scan
+from test_campaign_report import xml_file
+
+
+EXPECTED_QUICK_PORTS = "80,443,8000,8008,8080-8081,8443,8888,9000,9443"
 
 
 class CampaignInputTests(unittest.TestCase):
@@ -54,6 +59,75 @@ class CampaignInputTests(unittest.TestCase):
             reader = csv.DictReader(stream)
             self.assertEqual(tuple(reader.fieldnames), fields)
             self.assertEqual(list(reader), compact)
+
+    def test_single_file_runs_quick_scan_and_creates_results_without_setup(self):
+        targets = self.file("domains.txt", "app.example.com\n")
+
+        def completed(_command, endpoint, output, _timeout):
+            xml_file(output / endpoint["xml"], name="app.example.com", ip=endpoint["ip"],
+                     state="PATCHED_VERSION_ADVERTISED", version="8.3.36")
+            return {**endpoint, "status": "COMPLETED", "returncode": 0,
+                    "finished_at": scan.utcnow()}
+
+        original_directory = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with patch.object(scan, "resolve_target", side_effect=self.resolved), \
+                 patch.object(scan, "discover_root") as provider, \
+                 patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+                 patch.object(scan.Processes, "run", side_effect=completed) as runner, \
+                 redirect_stdout(io.StringIO()):
+                code = scan.run_campaign(self.args(targets))
+        finally:
+            os.chdir(original_directory)
+        self.assertEqual(code, 0)
+        provider.assert_not_called()
+        runner.assert_called_once()
+        outputs = list((self.root / "results").iterdir())
+        self.assertEqual(len(outputs), 1)
+        output = outputs[0]
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["profile"], "quick")
+        self.assertEqual(manifest["ports"], EXPECTED_QUICK_PORTS)
+        self.assertEqual(manifest["targets"][0]["endpoints"][0]["ports"], EXPECTED_QUICK_PORTS)
+        command = runner.call_args.args[0]
+        self.assertEqual(command[command.index("-p") + 1], EXPECTED_QUICK_PORTS)
+        self.assertEqual([item["file"] for item in manifest["inputs"]], ["domains.txt"])
+        self.assertEqual(manifest["scope"]["mode"], "exact")
+        self.assertEqual((output / "targets.txt").read_text(), "app.example.com\n")
+        compact = json.loads((output / "report.json").read_text())
+        self.assertEqual(len(compact), 1)
+        self.assertEqual((compact[0]["cible"], compact[0]["php"], compact[0]["vulnerable"]),
+                         ("app.example.com", "8.3.36", "NON"))
+        self.assertTrue((output / "report.csv").is_file())
+        self.assertFalse((output / "discovered.txt").exists())
+        self.assertEqual({item.name for item in self.root.iterdir()}, {"domains.txt", "results"})
+        self.assertEqual(targets.read_text(), "app.example.com\n")
+
+    def test_explicit_profiles_and_custom_ports_still_control_the_plan(self):
+        targets = self.file("domains.txt", "app.example.com\n")
+        cases = (
+            (("--profile", "complet"), "complete", "1-65535"),
+            (("--profile", "complete"), "complete", "1-65535"),
+            (("--profile", "rapide"), "quick", EXPECTED_QUICK_PORTS),
+            (("--profile", "quick"), "quick", EXPECTED_QUICK_PORTS),
+            (("--ports", "8443,443"), "quick", "443,8443"),
+            (("--profile", "complet", "--ports", "8443"), "complete", "8443"),
+        )
+        for index, (options, profile, ports) in enumerate(cases):
+            output = self.root / f"plan-{index}"
+            with self.subTest(options=options), \
+                 patch.object(scan, "resolve_target", side_effect=self.resolved), \
+                 patch.object(scan, "discover_root") as provider, \
+                 patch.object(scan.Processes, "run") as runner, redirect_stdout(io.StringIO()):
+                code = scan.run_campaign(self.args(targets, *options, "--dry-run", "--output", output))
+            self.assertEqual(code, 0)
+            provider.assert_not_called()
+            runner.assert_not_called()
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["profile"], profile)
+            self.assertEqual(manifest["ports"], ports)
+            self.assertEqual(manifest["targets"][0]["endpoints"][0]["ports"], ports)
 
     def test_hostname_normalization_and_idna(self):
         self.assertEqual(scan.hostname("WWW.Example.COM."), "www.example.com")

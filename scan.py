@@ -32,7 +32,7 @@ from report import (ReportError, build_campaign_report, compact_rows,
 from discovery import discover_root
 
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -256,7 +256,7 @@ def collect_targets(args, rules: dict, previous: dict | None,
                     allow_empty: bool = False) -> tuple[list[dict], list[dict]]:
     imports = args.discover_from or []
     if imports and rules.get("mode") != "domains":
-        raise InputError("--discover-from exige --scope ou --discover-subdomains pour filtrer les domaines autorises.")
+        raise InputError("--discover-from exige --scope ou une decouverte (--discover / --discover-subdomains) pour filtrer les domaines autorises.")
     recheck_ports, recheck_paths = recheck_targets(previous) if args.profile == "recheck" else ({}, {})
     if args.targets:
         inputs = exact_hosts(args.targets)
@@ -300,7 +300,7 @@ def collect_targets(args, rules: dict, previous: dict | None,
 
 
 def read_discovery_roots(path: Path | None) -> list[tuple[str, str]]:
-    """Root files authorize namespaces; exact-target files keep their old meaning."""
+    """Read the file selected for discovery as authorized DNS namespaces."""
     if path is None:
         return []
     roots = {}
@@ -697,18 +697,24 @@ def bounded_int(low: int, high: int):
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    result.add_argument("targets", nargs="?", type=Path, help="Fichier de noms DNS exacts, un par ligne")
+    result = argparse.ArgumentParser(
+        description="Scanner PHP2Shell : un seul fichier de domaines, scan rapide par defaut.",
+        usage="%(prog)s [DOMAINES] [--discover] [options]",
+        epilog="Exemples : python3 scan.py domaines.txt ; python3 scan.py domaines.txt --discover. Les fichiers de resultats sont crees automatiquement.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    result.add_argument("targets", nargs="?", type=Path, metavar="DOMAINES", help="Un nom DNS par ligne ; sert aussi de perimetre avec --discover")
     result.add_argument("--version", action="version", version=f"php2shell-scanner {VERSION}")
-    result.add_argument("--profile", choices=PROFILES, default="complet", help="Complet, rapide ou recontrole")
+    discovery_flags = result.add_mutually_exclusive_group()
+    discovery_flags.add_argument("--discover", action="store_true", help="Trouver et scanner les sous-domaines de DOMAINES ; enregistrer les noms dans discovered.txt")
+    result.add_argument("--profile", choices=PROFILES, default="rapide", help="Rapide (10 ports web), complet (tous les ports TCP) ou recontrole")
     result.add_argument("--scope", type=Path, help="Domaines autorises, sous-domaines inclus")
-    result.add_argument("--discover-subdomains", type=Path, metavar="ROOTS_FILE", help="Decouverte passive via crt.sh depuis un fichier de domaines racines autorises")
+    discovery_flags.add_argument("--discover-subdomains", type=Path, metavar="ROOTS_FILE", help="Compatibilite : utiliser un fichier de racines distinct a la place de DOMAINES --discover")
     result.add_argument("--discovery-timeout", type=bounded_int(1, 120), default=30, help="Delai total par requete crt.sh en secondes")
     result.add_argument("--discovery-budget", type=bounded_int(1, 3600), default=300, help="Budget total de la phase de decouverte en secondes")
     result.add_argument("--discovery-max-names", type=bounded_int(1, 100000), default=10000, help="Maximum de noms uniques issus de crt.sh par campagne")
-    result.add_argument("--discover-from", action="append", type=Path, default=[], help="Import local TXT/CSV/TSV/JSON, repetable; exige --scope ou --discover-subdomains")
+    result.add_argument("--discover-from", action="append", type=Path, default=[], help="Import local TXT/CSV/TSV/JSON, repetable; exige --scope ou une decouverte activee")
     result.add_argument("--exclude", type=Path, help="Noms exacts ou *.domaine exclus")
-    result.add_argument("--output", type=Path, help="Nouveau dossier de campagne (doit etre vide)")
+    result.add_argument("--output", type=Path, help="Dossier de campagne facultatif ; sinon creation automatique sous results/")
     result.add_argument("--families", choices=("ipv4", "ipv6", "both"), default="both")
     result.add_argument("--ports", help="Liste/ranges TCP explicites; remplace les ports du profil")
     result.add_argument("--workers", type=bounded_int(1, 32), default=4, help="Processus Nmap simultanes")
@@ -733,13 +739,16 @@ def parser() -> argparse.ArgumentParser:
 
 def run_campaign(args) -> int:
     args.profile = PROFILES[args.profile]
+    if args.discover and not args.targets:
+        raise InputError("--discover exige le fichier de domaines : python3 scan.py domaines.txt --discover.")
+    discovery_file = args.targets if args.discover else args.discover_subdomains
+    if discovery_file and args.profile == "recheck":
+        raise InputError("La decouverte (--discover / --discover-subdomains) est incompatible avec le profil recontrole; utiliser une campagne normale avec --previous.")
     previous = read_previous(args.previous)
     if args.profile == "recheck" and previous is None:
         raise InputError("Le profil recontrole exige --previous report.json.")
-    if args.discover_subdomains and args.profile == "recheck":
-        raise InputError("--discover-subdomains est incompatible avec le profil recontrole; utiliser une campagne normale avec --previous.")
     if not args.targets and not args.discover_from and not args.discover_subdomains and args.profile != "recheck":
-        raise InputError("Fournir un fichier de cibles, --discover-subdomains roots.txt ou --discover-from avec --scope.")
+        raise InputError("Fournir un fichier de domaines : python3 scan.py domaines.txt [--discover].")
     paths = [valid_path(args.path)]
     if args.paths_file:
         for line in read_text(args.paths_file).splitlines():
@@ -749,8 +758,8 @@ def run_campaign(args) -> int:
     paths = list(dict.fromkeys(paths))
     if len(paths) > 11:
         raise InputError("11 chemins maximum (chemin initial + 10 supplementaires); budget de requetes partage.")
-    roots = read_discovery_roots(args.discover_subdomains)
-    rules = scope_rules(args.scope or args.discover_subdomains, args.exclude)
+    roots = read_discovery_roots(discovery_file)
+    rules = scope_rules(args.scope or discovery_file, args.exclude)
     for root, _ in roots:
         if not any(is_within(root, allowed) for allowed in rules["domains"]):
             raise InputError(f"Domaine de decouverte hors du perimetre autorise: {root}")
@@ -833,6 +842,7 @@ def run_campaign(args) -> int:
             print("Interruption de la decouverte; conservation du bilan partiel.", file=sys.stderr)
         discovery_incomplete = not manifest["discovery"]["processing_complete"]
         print(f"Decouverte: {manifest['discovery']['status']}; {manifest['discovery']['retained_count']} noms retenus; couverture non exhaustive.", flush=True)
+        print(f"Noms decouverts: {output / 'discovered.txt'}", flush=True)
     (output / "targets.txt").write_text("\n".join(item["hostname"] for item in targets) + ("\n" if targets else ""), encoding="utf-8")
     atomic_json(output / "manifest.json", manifest)
     if not resolution_interrupted:

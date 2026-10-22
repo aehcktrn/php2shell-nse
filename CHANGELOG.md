@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.2 — 2026-10-22
+
+### Démarrage simplifié
+
+- Un seul fichier de domaines pour le parcours courant : `python3 scan.py domaines.txt`.
+- Nouveau booléen `--discover` : réutilise le fichier positionnel comme racines de découverte et périmètre implicite, puis scanne les domaines fournis et les sous-domaines retenus.
+- Le profil rapide, sur les dix ports web usuels du scanner, devient le défaut. Le profil complet reste accessible avec `--profile complet` ; `--ports` garde la priorité.
+- Liste de découverte `discovered.txt`, rapports compacts et dossier de campagne générés automatiquement ; aucun fichier de configuration supplémentaire à préparer pour l'usage courant.
+- Ancienne option `--discover-subdomains roots.txt` conservée, mutuellement exclusive avec `--discover`. Le recontrôle reste distinct de la découverte automatique.
+- README organisé autour des deux commandes usuelles, avec les réglages supplémentaires présentés comme facultatifs.
+
+La version du lanceur passe à **0.4.2**. Le NSE autonome reste en **0.3.0** ; le format des rapports compacts et les seuils PHP sont inchangés.
+
 ## 0.4.1 — 2026-10-22
 
 ### Rapports compacts

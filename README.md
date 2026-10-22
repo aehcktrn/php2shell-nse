@@ -2,218 +2,61 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.1**, module NSE **0.3.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.2**, module NSE **0.3.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
-## Installation et première campagne
+## Démarrage : un fichier, deux commandes
 
-Prérequis : **Nmap, Python 3.10 ou ultérieur et Git**. Le lanceur utilise uniquement la bibliothèque standard Python. Le NSE reste autonome et ne demande aucune installation Lua supplémentaire pour fonctionner dans Nmap.
+Prérequis : **Nmap, Python 3.10 ou ultérieur et Git**. Le lanceur utilise uniquement la bibliothèque standard Python. Le NSE fonctionne directement avec Nmap.
 
 ```bash
 git clone https://github.com/aehcktrn/php2shell-scanner.git
 cd php2shell-scanner
-cp domaines.example.txt domaines.txt
 ```
 
-Remplacez les exemples dans `domaines.txt` par les **noms DNS exacts** à contrôler, un par ligne :
+Créez **un seul fichier `domaines.txt`**, avec les domaines à contrôler, un par ligne :
 
 ```text
-# Applications du périmètre
-application.example.com
-portail.example.com
-api.example.org
+example.com
+example.org
 ```
 
-Utilisez des noms sans `https://`, port, chemin, joker ou CIDR. Les noms internationalisés sont normalisés en IDNA. Les commentaires commencent par `#`. Tous les domaines d'exemple sont réservés à la documentation et doivent être remplacés.
+Remplacez ces domaines d'exemple par les vôtres. Utilisez des noms sans `https://`, port, chemin, joker ou CIDR. Les commentaires commencent par `#` ; les noms internationalisés sont normalisés en IDNA. Le fichier peut aussi contenir des noms plus précis, comme `application.example.com`.
+
+**Scanner les noms du fichier :**
 
 ```bash
 python3 scan.py domaines.txt
 ```
 
-**Le port web n'a pas à être connu.** Par défaut, le lanceur recherche les services sur les **65 535 ports TCP**, résout **IPv4 et IPv6**, conserve chaque couple nom/IP et évalue les services HTTP/HTTPS reconnus par Nmap. Il transmet le nom de l'application dans **Host HTTP et SNI TLS**, avec l'IP issue de la résolution initiale.
-
-Les sorties sont enregistrées dans un dossier horodaté sous `results/`. Pour choisir le dossier :
+**Découvrir leurs sous-domaines et scanner l'ensemble :**
 
 ```bash
-python3 scan.py domaines.txt --output results/campagne-initiale
+python3 scan.py domaines.txt --discover
 ```
 
-Le dossier doit être **nouveau ou vide** : les résultats précédents ne sont pas écrasés.
+Le **profil rapide est activé par défaut** dans les deux cas. Il recherche les services HTTP/HTTPS sur les ports TCP **80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000 et 9443**. Nmap identifie les services ; le lanceur résout IPv4 et IPv6 et transmet le nom testé dans Host HTTP et SNI TLS. Pour couvrir les **65 535 ports TCP**, ajoutez `--profile complet`.
 
-Ouvrez **`report.csv`** pour lire le résultat : **une ligne par domaine ou sous-domaine**, avec quatre colonnes `cible`, `php`, `vulnerable`, `explication`. Le même tableau est disponible dans `report.json`, avec un objet par ligne. Les IP, ports et chemins d'une même cible sont regroupés.
+### Avec `--discover`
 
-## Découverte automatique des sous-domaines
+Le même `domaines.txt` fournit les racines de découverte et le périmètre autorisé : chaque nom autorise ses descendants. Par exemple, `example.com` inclut `api.example.com` ; `application.example.com` limite la découverte à cette branche. Le lanceur interroge **crt.sh**, normalise et dédoublonne les noms retenus, puis scanne les domaines fournis et les sous-domaines découverts. Aucun compte, clé d'API ou paquet Python supplémentaire n'est nécessaire.
 
-Préparez un fichier de domaines racines à partir de [roots.example.txt](roots.example.txt) :
+La découverte utilise les certificats publics et reste **non exhaustive** : des noms internes ou sans certificat public peuvent manquer. Les noms hors du périmètre sont écartés avant leur résolution DNS.
 
-```bash
-cp roots.example.txt roots.txt
-```
+### Lire les résultats
 
-Remplacez les domaines réservés par les vôtres, un par ligne, puis lancez :
+Le dossier horodaté sous **`results/` est créé automatiquement** et son chemin est affiché dans le terminal. Le seul fichier à fournir pour ces deux commandes est `domaines.txt` ; les rapports, listes de sortie et fichiers techniques sont générés par l'outil.
 
-```bash
-python3 scan.py --discover-subdomains roots.txt
-```
-
-Le lanceur interroge **crt.sh**, qui indexe les certificats publics des journaux Certificate Transparency, puis normalise et dédoublonne les noms concrets obtenus. Il résout les cibles retenues et poursuit avec le profil Nmap habituel. Aucun compte, clé d'API ou paquet Python supplémentaire n'est nécessaire. Les domaines racines sont eux-mêmes ajoutés aux cibles.
-
-**`roots.txt` autorise les racines et leurs descendants par défaut.** Il contient au maximum **1 000 racines**, chacune avec au moins deux labels DNS, par exemple `example.com` ou `zone.example.org` ; les règles de syntaxe des noms exacts s'appliquent. Avec `--scope scopes.txt`, chaque racine interrogée doit être couverte par ce périmètre explicite, qui filtre aussi les cibles exactes et les imports combinés. Toutes les entrées explicites sont validées avant les accès réseau ; le filtrage du périmètre et des exclusions précède la résolution DNS des cibles.
-
-Pour ajouter des noms déjà connus ou provenant d'un export :
-
-```bash
-python3 scan.py domaines.txt \
-  --discover-subdomains roots.txt \
-  --scope scopes.txt \
-  --discover-from discovery.csv \
-  --exclude exclusions.txt \
-  --output results/decouverte
-```
-
-Une exclusion exacte de `example.com` empêche le scan de ce nom mais laisse la découverte de ses enfants active. L'exclusion `*.example.com` suffit à supprimer la requête de découverte pour cette racine, tout en laissant `example.com` scannable si ce nom n'est pas exclu séparément. Les racines situées dans une zone exclue ne sont pas interrogées. Le profil `recontrole` ne se combine pas avec `--discover-subdomains` ; utilisez une campagne normale avec `--previous` pour découvrir à nouveau et comparer les résultats.
-
-### Préparer un plan et borner la découverte
-
-```bash
-python3 scan.py --discover-subdomains roots.txt \
-  --dry-run --output results/plan-decouverte
-```
-
-Avec cette option, **`--dry-run` effectue les requêtes HTTPS vers crt.sh et la résolution DNS des cibles**, puis produit le plan ; il ne lance pas Nmap. Les racines interrogées sont transmises à crt.sh. La collecte de certificats ne contacte pas les applications découvertes ; le scan des services commence ensuite, en dehors du mode plan.
-
-| Limite de découverte | Défaut | Réglage |
-|---|---|---|
-| Délai total d'une requête, résolution de la source et lecture incluses | 30 s | `--discovery-timeout`, de 1 à 120 |
-| Budget de toute la phase de découverte | 300 s | `--discovery-budget`, de 1 à 3 600 |
-| Noms CT uniques par campagne, avant filtrage du périmètre et des exclusions | 10 000 | `--discovery-max-names`, de 1 à 100 000 |
-| Réponse par racine | 8 Mio | Limite fixe |
-
-Le plafond effectif de noms CT est également limité aux places restantes parmi les **100 000 cibles maximum** de la campagne, racines, cibles exactes et imports compris. Sa valeur est enregistrée dans `limits.effective_max_names` de `discovery.json`.
-
-Une seule requête est effectuée par racine, séquentiellement, sans nouvelle tentative ni redirection. Les noms découverts ne déclenchent pas de nouvelles recherches de certificats. Les erreurs de source, limitations de débit, délais et plafonds atteints sont conservés dans `discovery.json` ; une campagne partielle sort avec le code `2`. Une interruption conserve le bilan disponible et sort avec `130`.
-
-### Lire les limites de l'inventaire
-
-La découverte reste **non exhaustive**, y compris après une réponse réussie : chaque résultat porte `exhaustive: false`. Les noms internes ou sans certificat public et les hôtes seulement couverts par un certificat générique peuvent manquer. Un SAN `*.example.com` est enregistré comme certificat générique et ne devient pas un nom d'hôte inventé. Aucune recherche par dictionnaire n'est effectuée.
-
-Les certificats historiques peuvent fournir des noms qui ne répondent plus au DNS : ils restent dans `discovered.txt` avant résolution, et `NO_DNS_ADDRESS` reste visible dans le bilan de couverture partielle. Une réponse vide ne démontre pas l'absence de sous-domaines. crt.sh applique aussi ses propres limites ; le lanceur signale les plafonds détectables et l'incertitude de troncature lorsqu'il manque les compteurs nécessaires. Voir l'[interface JSON décrite par le mainteneur](https://groups.google.com/g/crtsh/c/bybDhKDszkg) et l'[implémentation de crt.sh](https://github.com/crtsh/certwatch_db/blob/master/fnc/web_apis.fnc).
-
-## Préparer le périmètre et importer des noms
-
-`domaines.txt` contient des cibles exactes : inscrire `example.com` dans ce fichier seul ne découvre pas ses sous-domaines. La découverte automatique se demande avec `--discover-subdomains roots.txt`. Pour compléter les cibles à partir d'exports DNS ou applicatifs, préparez les domaines autorisés et les exclusions :
-
-```bash
-cp scopes.example.txt scopes.txt
-cp exclusions.example.txt exclusions.txt
-cp discovery.example.csv discovery.csv
-```
-
-Remplacez les exemples, puis préparez un plan :
-
-```bash
-python3 scan.py domaines.txt \
-  --scope scopes.txt \
-  --discover-from discovery.csv \
-  --exclude exclusions.txt \
-  --dry-run \
-  --output results/plan
-```
-
-`--dry-run` valide les entrées, **résout les noms** et écrit `manifest.json` et `targets.txt`. Il ne lance pas Nmap. Sans `--discover-subdomains`, il ne fait aucune requête HTTP ; avec cette option, il interroge crt.sh et produit également les fichiers de découverte. Une campagne ultérieure réalise sa propre résolution ; le plan décrit les adresses observées à l'instant de sa création.
-
-Pour exécuter, reprenez les mêmes entrées sans `--dry-run`, avec un autre dossier :
-
-```bash
-python3 scan.py domaines.txt \
-  --scope scopes.txt \
-  --discover-from discovery.csv \
-  --exclude exclusions.txt \
-  --output results/campagne-complete
-```
-
-Le fichier de cibles est facultatif si `--discover-from` ou `--discover-subdomains` fournit les noms. Plusieurs options `--discover-from` peuvent être combinées.
-
-### Règles de périmètre
-
-| Entrée | Effet |
+| Sortie à consulter | Contenu |
 |---|---|
-| `example.com` dans `scopes.txt` | Autorise ce nom et ses sous-domaines. |
-| `archive.example.com` dans `exclusions.txt` | Exclut ce nom exact. |
-| `*.sandbox.example.com` dans `exclusions.txt` | Exclut les sous-domaines de cette zone, **pas** `sandbox.example.com` lui-même. |
+| `report.csv` | Une ligne par cible : `cible`, `php`, `vulnerable`, `explication`. |
+| `report.json` | La même synthèse, un objet par ligne. |
+| `discovered.txt` | Avec `--discover` : liste distincte des noms découverts et retenus, un par ligne. |
 
-Pour exclure une zone entière, ajoutez son nom exact et `*.zone`. Les noms hors périmètre, invalides, ambigus ou exclus restent dans le manifeste avec leur provenance et leur motif de rejet. La propriété des domaines est déclarée par l'opérateur ; le programme ne la vérifie pas.
+`discovered.txt` conserve aussi une racine si elle apparaît dans les résultats de la source, ainsi que les noms retenus qui ne résolvent plus. `targets.txt` contient la liste complète des cibles retenues. Le fichier d'entrée reste inchangé.
 
-### Formats d'import
-
-`--discover-from` exige un périmètre, fourni par `--scope` ou par les racines de `--discover-subdomains`, et accepte des fichiers **locaux** :
-
-- **TXT** : un nom DNS complet par ligne, commentaires `#`.
-- **CSV/TSV** : colonne `hostname`, `fqdn`, `name`, `domain` ou `host`, avec virgule, point-virgule ou tabulation. Plusieurs colonnes de noms contradictoires rendent l'entrée ambiguë.
-- **JSON** : liste de noms ou d'objets avec les mêmes champs, éventuellement placée dans une propriété `records` ou `targets`.
-
-Si `type` ou `record_type` est fourni, seuls `A`, `AAAA` et `CNAME` sont retenus. Développez les noms relatifs et `@` d'un export de zone en noms complets avant l'import. Les valeurs d'adresses ou de destinations dans l'export ne remplacent pas la résolution DNS du nom retenu.
-
-Exemple, également fourni dans [discovery.example.csv](discovery.example.csv) :
-
-```csv
-hostname,type,value
-application.example.com,A,192.0.2.10
-api.example.org,AAAA,2001:db8::10
-portail.example.com,CNAME,front.example.com
-```
-
-L'import `--discover-from` lit uniquement les **exports fournis** et n'interroge pas de service de découverte sur Internet. Ni les imports ni les certificats publics ne constituent un inventaire des backends derrière un frontal.
-
-## Profils et limites
-
-| Profil | Commande | Couverture |
-|---|---|---|
-| Complet, par défaut | `python3 scan.py domaines.txt --profile complet` | TCP 1 à 65535. |
-| Rapide | `python3 scan.py domaines.txt --profile rapide` | TCP 80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000 et 9443. |
-| Recontrôle | `python3 scan.py --profile recontrole --previous results/campagne-initiale/report.json` | Noms et ports à revoir dans le rapport précédent, avec nouvelle résolution DNS. |
-
-Les alias `complete`, `quick` et `recheck` sont acceptés. `--ports 80,443,8000-8100` remplace les ports du profil. Le manifeste conserve la couverture demandée. Dans `raw/report-details.json`, `scan_ports` indique les ports effectivement demandés pour chaque couple nom/IP ; `campaign.ports` reste la sélection par défaut et peut différer des ports retenus lors d'un recontrôle.
-
-Le recontrôle écarte les lignes avec `inventory_patch_status=PATCH_CONFIRMED`. Une version corrigée seulement **annoncée** reste à confirmer. Il reprend les ports connus ; sans port exploitable, les ports de la campagne précédente servent de repli. Il récupère les chemins des observations et des preuves, y compris ceux ayant annoncé une version suspecte. Si un ancien chemin contenait des paramètres expurgés, fournissez son URL locale complète avec `--path` ou `--paths-file` : sinon le recontrôle s'arrête avant tout accès réseau. Il n'invente pas les valeurs et ne rejoue pas simplement le chemin sans paramètres. Un fichier de cibles peut restreindre le recontrôle ; `--scope` et `--exclude` restent applicables.
-
-| Réglage | Défaut | Option |
-|---|---|---|
-| Familles | IPv4 et IPv6 | `--families ipv4`, `ipv6` ou `both` |
-| Processus Nmap simultanés | 4 | `--workers`, de 1 à 32 |
-| Résolution DNS par nom | 15 s | `--dns-timeout` |
-| Durée par processus Nmap | 900 s | `--target-timeout` |
-| Délai des opérations HTTP | 5 000 ms | `--http-timeout` |
-| Budget de parcours HTTP par service | 20 000 ms | `--http-budget` |
-| GET par service | 5 au maximum | `--max-requests`, de 1 à 20 |
-| Redirections par chemin | 2 au maximum | `--redirects`, de 0 à 5 |
-| Observations par chemin | 1 | `--samples`, de 1 à 3 |
-
-Le lanceur fixe également `--script-timeout` à **22 secondes par défaut** : budget HTTP plus deux secondes. Le budget HTTP limite le lancement des requêtes et leur délai réseau restant ; le délai NSE borne le script. Ces limites ne représentent pas la durée totale de la campagne. Un scan complet peut atteindre le délai de 900 secondes sur une cible filtrée ; celle-ci sera signalée comme incomplète.
-
-`--max-rate` transmet un plafond de sondes à **chaque processus Nmap**, sans borner toutes les requêtes HTTP. L'absence d'enregistrement AAAA est normale pour un service IPv4 ; une erreur de résolution dans une famille demandée rend en revanche la couverture partielle, même si l'autre famille a été scannée. Si le délai DNS expire, les réponses déjà reçues pour une famille sont conservées.
-
-## Parcours HTTP
-
-Le parcours commence sur `/`. Si aucune version exploitable n'a été trouvée sur les chemins demandés, il peut essayer `/index.php`. Ajoutez les chemins applicatifs utiles :
-
-```bash
-cp paths.example.txt paths.txt
-python3 scan.py domaines.txt --paths-file paths.txt
-```
-
-`--path /app/` choisit le premier chemin. Le fichier ajoute jusqu'à **10 chemins**, soit **11 au total**, avec un budget commun. Cette limite s'applique également aux chemins récupérés lors d'un recontrôle : un dépassement est refusé, sans troncature silencieuse. Les caractères Unicode des chemins fournis au lanceur sont encodés en UTF-8 `%XX` pour les requêtes HTTP. Les chemins explicitement demandés sont parcourus même si un premier chemin annonce une version. Ajustez `--max-requests` selon les chemins, redirections et échantillons ; une limite atteinte est signalée.
-
-Les redirections sont suivies uniquement dans la **même origine** : même nom, protocole et port, IP toujours épinglée. HTTP vers HTTPS, un autre port ou un autre nom restent des destinations à contrôler séparément, même si elles figurent dans le périmètre autorisé.
-
-HTTP **401, 403 et 429 arrêtent le parcours**. Un `403` ne permet pas à lui seul d'identifier un WAF. Si le parcours prévu est interrompu après une première version annoncée, cette preuve est conservée mais l'évaluation reste `UNKNOWN` lorsque les autres contrôles n'ont pas abouti. Pour rechercher des réponses variables :
-
-```bash
-python3 scan.py domaines.txt --samples 2 --max-requests 8
-```
-
-Les versions contradictoires sont conservées et signalées comme prioritaires. Des réponses identiques ne prouvent pas que tous les backends ont été contrôlés.
+Pour choisir vous-même le dossier de sortie, ajoutez `--output results/ma-campagne`. Ce dossier doit être nouveau ou vide.
 
 ## Rapports et actions
 
@@ -237,14 +80,16 @@ Une version concernée clairement observée suffit à faire ressortir la cible e
 
 `report.csv` contient une ligne d'en-tête, puis une ligne physique par cible. `report.json` est une **liste JSON simple**, avec un objet de quatre champs par ligne, sans enveloppe technique ni observations imbriquées. Pour 465 cibles retenues, cela représente 465 résultats, soit 466 lignes CSV ou 467 lignes JSON avec les deux crochets. Les sous-domaines découverts ajoutent chacun leur propre résultat.
 
-### Fichiers produits
+### Fichiers produits automatiquement
+
+Tous les fichiers ci-dessous sont des sorties du scanner. Ils n'ont pas à être créés avant la première campagne.
 
 | Fichier | Contenu |
 |---|---|
 | `manifest.json` | Périmètre, exclusions, empreintes des entrées, résolution A/AAAA, paramètres et état de chaque exécution. |
 | `targets.txt` | Ensemble des noms retenus et normalisés : cibles exactes, racines, imports et découverte. |
 | `discovery.json` | Si découverte automatique : journal par racine, source, provenance, limites, compteurs, rejets et motifs d'erreur ; inventaire toujours non exhaustif. |
-| `discovered.txt` | Si découverte automatique : noms concrets CT retenus, avant résolution DNS ; certains peuvent ne plus résoudre. |
+| `discovered.txt` | Si découverte automatique : noms concrets CT retenus, y compris les racines présentes dans la source ; certains peuvent ne plus résoudre. |
 | `report.csv` | Synthèse à quatre colonnes, une ligne par cible. |
 | `report.json` | Même synthèse sous forme de liste JSON, un objet par ligne. |
 | `changes.csv` | Comparaison avec `--previous` ; en-têtes seuls sans comparaison. |
@@ -310,7 +155,151 @@ python3 report.py results/campagne-initiale/raw/report-details.json \
   --detailed -o details.csv
 ```
 
-## Preuves de runtimes
+## Options avancées — facultatives
+
+<details>
+<summary>Découverte : périmètre, limites et ancienne syntaxe</summary>
+
+Les deux formes suivantes restent disponibles :
+
+- `python3 scan.py domaines.txt --discover` : le fichier fourni sert aux cibles, aux racines de découverte et au périmètre implicite.
+- `python3 scan.py --discover-subdomains roots.txt` : ancienne syntaxe, pour conserver des racines de découverte dans un fichier séparé. Ce fichier autorise aussi les racines et leurs descendants par défaut ; voir [roots.example.txt](roots.example.txt).
+
+`--discover` exige le fichier positionnel et ne se combine pas avec `--discover-subdomains`. Les deux options sont incompatibles avec le profil `recontrole` ; utilisez une campagne normale avec `--previous` pour découvrir à nouveau et comparer les résultats.
+
+La découverte accepte au maximum **1 000 racines**, chacune avec au moins deux labels DNS. Si `--scope scopes.txt` est fourni, chaque racine doit être couverte par ce périmètre explicite, qui filtre aussi les cibles exactes et les imports combinés. Toutes les entrées explicites sont validées avant les accès réseau.
+
+Une exclusion exacte de `example.com` empêche le scan de ce nom mais laisse la découverte de ses enfants active. L'exclusion `*.example.com` supprime la requête de découverte pour cette racine, tout en laissant `example.com` scannable si ce nom n'est pas exclu séparément. Les racines situées dans une zone exclue ne sont pas interrogées.
+
+### Préparer un plan et borner la découverte
+
+```bash
+python3 scan.py domaines.txt --discover --dry-run
+```
+
+Avec cette option, **`--dry-run` effectue les requêtes HTTPS vers crt.sh et la résolution DNS des cibles**, puis produit le plan ; il ne lance pas Nmap. Les racines interrogées sont transmises à crt.sh. La collecte de certificats ne contacte pas les applications découvertes ; le scan des services commence ensuite, en dehors du mode plan.
+
+| Limite de découverte | Défaut | Réglage |
+|---|---|---|
+| Délai total d'une requête, résolution de la source et lecture incluses | 30 s | `--discovery-timeout`, de 1 à 120 |
+| Budget de toute la phase de découverte | 300 s | `--discovery-budget`, de 1 à 3 600 |
+| Noms CT uniques par campagne, avant filtrage du périmètre et des exclusions | 10 000 | `--discovery-max-names`, de 1 à 100 000 |
+| Réponse par racine | 8 Mio | Limite fixe |
+
+Le plafond effectif de noms CT est également limité aux places restantes parmi les **100 000 cibles maximum** de la campagne, racines, cibles exactes et imports compris. Sa valeur est enregistrée dans `limits.effective_max_names` de `discovery.json`.
+
+Une seule requête est effectuée par racine, séquentiellement, sans nouvelle tentative ni redirection. Les noms découverts ne déclenchent pas de nouvelles recherches de certificats. Les erreurs de source, limitations de débit, délais et plafonds atteints sont conservés dans `discovery.json` ; une campagne partielle sort avec le code `2`. Une interruption conserve le bilan disponible et sort avec `130`.
+
+### Lire les limites de l'inventaire
+
+La découverte reste **non exhaustive**, y compris après une réponse réussie : chaque résultat porte `exhaustive: false`. Les noms internes ou sans certificat public et les hôtes seulement couverts par un certificat générique peuvent manquer. Un SAN `*.example.com` est enregistré comme certificat générique et ne devient pas un nom d'hôte inventé. Aucune recherche par dictionnaire n'est effectuée.
+
+Les certificats historiques peuvent fournir des noms qui ne répondent plus au DNS : ils restent dans `discovered.txt` avant résolution, et `NO_DNS_ADDRESS` reste visible dans le bilan de couverture partielle. Une réponse vide ne démontre pas l'absence de sous-domaines. crt.sh applique aussi ses propres limites ; le lanceur signale les plafonds détectables et l'incertitude de troncature lorsqu'il manque les compteurs nécessaires. Voir l'[interface JSON décrite par le mainteneur](https://groups.google.com/g/crtsh/c/bybDhKDszkg) et l'[implémentation de crt.sh](https://github.com/crtsh/certwatch_db/blob/master/fnc/web_apis.fnc).
+
+</details>
+
+<details>
+<summary>Importer des noms ou appliquer des exclusions</summary>
+
+Les imports, exclusions et périmètres séparés servent à adapter une campagne à des besoins particuliers. Ils sont facultatifs pour le parcours à un fichier décrit ci-dessus.
+
+Pour compléter la découverte avec un export DNS ou applicatif existant :
+
+```bash
+python3 scan.py domaines.txt --discover --discover-from export-dns.csv
+```
+
+Pour importer des noms sans interroger crt.sh, le même fichier de domaines peut fournir explicitement le périmètre :
+
+```bash
+python3 scan.py domaines.txt --scope domaines.txt --discover-from export-dns.csv
+```
+
+Ajoutez `--exclude exclusions.txt` si des noms doivent être écartés. Les modèles [scopes.example.txt](scopes.example.txt), [exclusions.example.txt](exclusions.example.txt) et [discovery.example.csv](discovery.example.csv) décrivent ces formats ; leur préparation n'est requise que pour les options correspondantes.
+
+`--dry-run` valide les entrées, **résout les noms** et écrit le plan sans lancer Nmap. Avec `--discover` ou `--discover-subdomains`, il interroge aussi crt.sh et produit les fichiers de découverte. Sans découverte automatique, le plan ne fait aucune requête HTTP. Une campagne ultérieure réalise sa propre résolution.
+
+Le fichier positionnel est facultatif si `--discover-from` ou l'ancienne option `--discover-subdomains` fournit les noms. Plusieurs options `--discover-from` peuvent être combinées.
+
+### Règles de périmètre
+
+| Entrée | Effet |
+|---|---|
+| `example.com` dans `domaines.txt` avec `--discover`, ou dans le fichier `--scope` | Autorise ce nom et ses sous-domaines. |
+| `archive.example.com` dans `exclusions.txt` | Exclut ce nom exact. |
+| `*.sandbox.example.com` dans `exclusions.txt` | Exclut les sous-domaines de cette zone, **pas** `sandbox.example.com` lui-même. |
+
+Pour exclure une zone entière, ajoutez son nom exact et `*.zone`. Les noms hors périmètre, invalides, ambigus ou exclus restent dans le manifeste avec leur provenance et leur motif de rejet. La propriété des domaines est déclarée par l'opérateur ; le programme ne la vérifie pas.
+
+### Formats d'import
+
+`--discover-from` exige un périmètre, fourni par `--scope`, par le fichier positionnel avec `--discover`, ou par les racines de `--discover-subdomains`. Les imports sont des fichiers **locaux** :
+
+- **TXT** : un nom DNS complet par ligne, commentaires `#`.
+- **CSV/TSV** : colonne `hostname`, `fqdn`, `name`, `domain` ou `host`, avec virgule, point-virgule ou tabulation. Plusieurs colonnes de noms contradictoires rendent l'entrée ambiguë.
+- **JSON** : liste de noms ou d'objets avec les mêmes champs, éventuellement placée dans une propriété `records` ou `targets`.
+
+Si `type` ou `record_type` est fourni, seuls `A`, `AAAA` et `CNAME` sont retenus. Développez les noms relatifs et `@` d'un export de zone en noms complets avant l'import. Les valeurs d'adresses ou de destinations dans l'export ne remplacent pas la résolution DNS du nom retenu.
+
+`--discover-from` lit uniquement les exports fournis et n'interroge pas lui-même de service de découverte sur Internet. Ni les imports ni les certificats publics ne constituent un inventaire des backends derrière un frontal.
+
+</details>
+
+<details>
+<summary>Choisir les ports, les délais et le recontrôle</summary>
+
+| Profil | Commande | Couverture |
+|---|---|---|
+| Rapide, par défaut | `python3 scan.py domaines.txt` | TCP 80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000 et 9443. |
+| Complet, sur demande | `python3 scan.py domaines.txt --profile complet` | TCP 1 à 65535. |
+| Recontrôle | `python3 scan.py --profile recontrole --previous results/campagne-initiale/report.json` | Noms et ports à revoir dans le rapport précédent, avec nouvelle résolution DNS. |
+
+Les alias `complete`, `quick` et `recheck` sont acceptés. `--ports 80,443,8000-8100` remplace les ports du profil. Le manifeste conserve la couverture demandée. Dans `raw/report-details.json`, `scan_ports` indique les ports effectivement demandés pour chaque couple nom/IP ; `campaign.ports` reste la sélection par défaut et peut différer des ports retenus lors d'un recontrôle.
+
+Le recontrôle écarte les lignes avec `inventory_patch_status=PATCH_CONFIRMED`. Une version corrigée seulement **annoncée** reste à confirmer. Il reprend les ports connus ; sans port exploitable, les ports de la campagne précédente servent de repli. Il récupère les chemins des observations et des preuves, y compris ceux ayant annoncé une version suspecte. Si un ancien chemin contenait des paramètres expurgés, fournissez son URL locale complète avec `--path` ou `--paths-file` : sinon le recontrôle s'arrête avant tout accès réseau. Il n'invente pas les valeurs et ne rejoue pas simplement le chemin sans paramètres. Un fichier de cibles peut restreindre le recontrôle ; `--scope` et `--exclude` restent applicables.
+
+| Réglage | Défaut | Option |
+|---|---|---|
+| Familles | IPv4 et IPv6 | `--families ipv4`, `ipv6` ou `both` |
+| Processus Nmap simultanés | 4 | `--workers`, de 1 à 32 |
+| Résolution DNS par nom | 15 s | `--dns-timeout` |
+| Durée par processus Nmap | 900 s | `--target-timeout` |
+| Délai des opérations HTTP | 5 000 ms | `--http-timeout` |
+| Budget de parcours HTTP par service | 20 000 ms | `--http-budget` |
+| GET par service | 5 au maximum | `--max-requests`, de 1 à 20 |
+| Redirections par chemin | 2 au maximum | `--redirects`, de 0 à 5 |
+| Observations par chemin | 1 | `--samples`, de 1 à 3 |
+
+Le lanceur fixe également `--script-timeout` à **22 secondes par défaut** : budget HTTP plus deux secondes. Le budget HTTP limite le lancement des requêtes et leur délai réseau restant ; le délai NSE borne le script. Ces limites ne représentent pas la durée totale de la campagne. Un scan complet peut atteindre le délai de 900 secondes sur une cible filtrée ; celle-ci sera signalée comme incomplète.
+
+`--max-rate` transmet un plafond de sondes à **chaque processus Nmap**, sans borner toutes les requêtes HTTP. L'absence d'enregistrement AAAA est normale pour un service IPv4 ; une erreur de résolution dans une famille demandée rend en revanche la couverture partielle, même si l'autre famille a été scannée. Si le délai DNS expire, les réponses déjà reçues pour une famille sont conservées.
+
+</details>
+
+<details>
+<summary>Adapter les chemins et le parcours HTTP</summary>
+
+Le parcours commence automatiquement sur `/`. Si aucune version exploitable n'a été trouvée sur les chemins demandés, il peut essayer `/index.php`. Pour préciser un autre point d'entrée :
+
+```bash
+python3 scan.py domaines.txt --path /app/
+```
+
+L'option facultative `--paths-file paths.txt` accepte des chemins supplémentaires, un par ligne ; voir [paths.example.txt](paths.example.txt). Ce fichier ajoute jusqu'à **10 chemins**, soit **11 au total**, avec un budget commun. Cette limite s'applique également aux chemins récupérés lors d'un recontrôle : un dépassement est refusé, sans troncature silencieuse. Les caractères Unicode des chemins fournis au lanceur sont encodés en UTF-8 `%XX` pour les requêtes HTTP. Les chemins explicitement demandés sont parcourus même si un premier chemin annonce une version. Ajustez `--max-requests` selon les chemins, redirections et échantillons ; une limite atteinte est signalée.
+
+Les redirections sont suivies uniquement dans la **même origine** : même nom, protocole et port, IP toujours épinglée. HTTP vers HTTPS, un autre port ou un autre nom restent des destinations à contrôler séparément, même si elles figurent dans le périmètre autorisé.
+
+HTTP **401, 403 et 429 arrêtent le parcours**. Un `403` ne permet pas à lui seul d'identifier un WAF. Si le parcours prévu est interrompu après une première version annoncée, cette preuve est conservée mais l'évaluation reste `UNKNOWN` lorsque les autres contrôles n'ont pas abouti. Pour rechercher des réponses variables :
+
+```bash
+python3 scan.py domaines.txt --samples 2 --max-requests 8
+```
+
+Les versions contradictoires sont conservées et signalées comme prioritaires. Des réponses identiques ne prouvent pas que tous les backends ont été contrôlés.
+
+</details>
+
+## Preuves de runtimes — facultatives
 
 L'import relie des **attestations d'inventaire authentifié** aux services. Il ne collecte pas par SSH, ne se connecte pas aux serveurs et ne vérifie pas cryptographiquement les attestations. La fiabilité de la collecte et des références reste sous le contrôle de l'opérateur.
 
@@ -429,7 +418,7 @@ Le corps lu est limité à 64 Kio et n'est pas utilisé comme preuve. Corps et c
 
 ## Tests
 
-Les tests utilisent des réponses simulées et des serveurs HTTP/HTTPS en boucle locale. Les tests de découverte ne dépendent pas du service crt.sh public. Prérequis de développement : **Lua 5.4, Python 3.10+, OpenSSL et Nmap**.
+Les tests couvrent notamment le parcours à un seul fichier, le profil rapide par défaut, la découverte et les rapports compacts. Ils utilisent des réponses simulées et des serveurs HTTP/HTTPS en boucle locale. Les tests de découverte ne dépendent pas du service crt.sh public. Prérequis de développement : **Lua 5.4, Python 3.10+, OpenSSL et Nmap**.
 
 ```bash
 lua5.4 tests/unit.lua

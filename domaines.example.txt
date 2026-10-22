@@ -1,10 +1,11 @@
 # Copier ce fichier vers domaines.txt et remplacer les exemples ci-dessous.
 # Un nom DNS exact par ligne ; commentaires a partir de #.
 # Sans https://, port, chemin, joker * ou suffixe CIDR.
-# Ce fichier contient les cibles exactes ; il ne decouvre pas leurs enfants.
-# Pour la decouverte automatique : --discover-subdomains roots.txt.
+# Scan rapide : python3 scan.py domaines.txt
+# Avec decouverte des sous-domaines : python3 scan.py domaines.txt --discover
+# Avec --discover, ce meme fichier delimite les domaines autorises.
+# Les noms decouverts sont enregistres automatiquement dans discovered.txt.
 # Nmap utilise cette liste comme perimetre et ne verifie pas sa propriete.
 # Les noms example.com / example.org sont reserves a la documentation.
-application.example.com
-portail.example.com
-api.example.org
+example.com
+example.org

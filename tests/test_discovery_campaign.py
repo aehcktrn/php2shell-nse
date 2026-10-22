@@ -21,6 +21,9 @@ import scan
 from test_campaign_report import xml_file
 
 
+EXPECTED_QUICK_PORTS = "80,443,8000,8008,8080-8081,8443,8888,9000,9443"
+
+
 def source_result(*names, status="COMPLETED", reason=None):
     return {"status": status, "reason_code": reason or ("OK" if names else "EMPTY_RESULT"),
             "processing_complete": status == "COMPLETED", "exhaustive": False,
@@ -72,14 +75,17 @@ class DiscoveryCampaignTests(unittest.TestCase):
                  state="PATCHED_VERSION_ADVERTISED", version="8.3.36")
         return {**endpoint, "status": "COMPLETED", "returncode": 0, "finished_at": scan.utcnow()}
 
-    def execute(self, *options, roots="example.com\n", source=None, resolver=None, dry_run=True):
+    def execute(self, *options, roots="example.com\n", source=None, resolver=None, dry_run=True,
+                ports="443"):
         self.counter += 1
         output = self.base / f"campaign-{self.counter}"
         argv = [str(option) for option in options]
         if roots is not None:
             root_file = self.file(f"roots-{self.counter}.txt", roots)
             argv += ["--discover-subdomains", str(root_file)]
-        argv += ["--output", str(output), "--families", "ipv4", "--ports", "443"]
+        argv += ["--output", str(output), "--families", "ipv4"]
+        if ports is not None:
+            argv += ["--ports", ports]
         if dry_run:
             argv += ["--dry-run"]
         if source is None:
@@ -93,6 +99,76 @@ class DiscoveryCampaignTests(unittest.TestCase):
             code = scan.run_campaign(scan.parser().parse_args(argv))
         data = json.loads((output / "manifest.json").read_text())
         return code, output, data, provider, dns, runner
+
+    def test_single_file_discover_supplies_scope_scans_and_saves_distinct_names(self):
+        original = "EXAMPLE.COM.\nexample.com # duplicate\n"
+        domains = self.file("domains.txt", original)
+        code, output, data, provider, dns, runner = self.execute(
+            domains, "--discover", roots=None, ports=None, dry_run=False,
+            source=source_result("app.example.com", "app.example.com", "example.com",
+                                 "deep.api.example.com", "example.com.evil.test", "evilexample.com"))
+        self.assertEqual(code, 0)
+        provider.assert_called_once()
+        self.assertEqual(provider.call_args.args, ("example.com",))
+        expected = {"example.com", "app.example.com", "deep.api.example.com"}
+        self.assertEqual(data["profile"], "quick")
+        self.assertEqual(data["ports"], EXPECTED_QUICK_PORTS)
+        self.assertEqual(data["scope"]["domains"], ["example.com"])
+        self.assertEqual({target["hostname"] for target in data["targets"]}, expected)
+        self.assertEqual({call.args[0] for call in dns.call_args_list}, expected)
+        self.assertEqual(dns.call_count, 3)
+        self.assertEqual(runner.call_count, 3)
+        for call in runner.call_args_list:
+            self.assertEqual(call.args[1]["ports"], EXPECTED_QUICK_PORTS)
+        self.assertEqual([item["file"] for item in data["inputs"]], ["domains.txt"])
+        self.assertEqual(domains.read_text(), original)
+        self.assertNotEqual(domains, output / "discovered.txt")
+        self.assertEqual((output / "discovered.txt").read_text().splitlines(), sorted(expected))
+        self.assertEqual(set((output / "targets.txt").read_text().splitlines()), expected)
+        self.assertEqual({item["hostname"] for item in data["excluded_candidates"]},
+                         {"example.com.evil.test", "evilexample.com"})
+        self.assert_compact_targets(output, {name: ("8.3.36", "NON") for name in expected})
+
+    def test_legacy_root_option_remains_supported_with_quick_default(self):
+        code, output, data, provider, _, _ = self.execute(ports=None)
+        self.assertEqual(code, 0)
+        provider.assert_called_once()
+        self.assertEqual(data["profile"], "quick")
+        self.assertEqual(data["ports"], EXPECTED_QUICK_PORTS)
+        self.assertEqual(data["scope"]["domains"], ["example.com"])
+        self.assertEqual((output / "discovered.txt").read_text(), "app.example.com\n")
+
+    def test_invalid_discover_combinations_fail_before_network_or_output(self):
+        domains = self.file("domains.txt", "example.com\n")
+        foreign_scope = self.file("foreign-scope.txt", "example.org\n")
+        invalid = self.file("invalid.txt", "*.example.com\n")
+        previous = self.file("previous.json", '{"schema_version":"1","rows":[]}')
+        cases = (
+            ["--discover"],
+            [domains, "--discover", "--discover-subdomains", domains],
+            [domains, "--discover", "--profile", "recontrole"],
+            [domains, "--discover", "--profile", "recontrole", "--previous", previous],
+            [domains, "--discover", "--scope", foreign_scope],
+            [invalid, "--discover"],
+        )
+        for index, options in enumerate(cases):
+            output = self.base / f"invalid-output-{index}"
+            argv = [*map(str, options), "--dry-run", "--output", str(output)]
+            with self.subTest(options=options), \
+                 patch.object(scan, "discover_root") as provider, \
+                 patch.object(scan, "resolve_target") as dns, \
+                 patch.object(scan.Processes, "run") as runner, \
+                 redirect_stderr(io.StringIO()), \
+                 self.assertRaises((scan.InputError, SystemExit)) as raised:
+                scan.run_campaign(scan.parser().parse_args(argv))
+            if isinstance(raised.exception, SystemExit):
+                self.assertEqual(raised.exception.code, 2)
+            if "--profile" in options and "--previous" not in options:
+                self.assertIn("incompatible", str(raised.exception))
+            provider.assert_not_called()
+            dns.assert_not_called()
+            runner.assert_not_called()
+            self.assertFalse(output.exists())
 
     def test_one_option_seeds_roots_discovers_and_deduplicates(self):
         exact = self.file("known.txt", "APP.EXAMPLE.COM.\n")
