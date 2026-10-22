@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0 — 2026-10-23
+
+- Correction des verdicts de redirection : une destination n'est couverte qu'avec une observation concluante du même nom, de la même IP, du protocole, du port et du chemin exacts ; les paramètres expurgés restent indéterminés.
+- Conservation des preuves indépendantes sur une ligne de redirection, notamment `PATCH_MISSING_CONFIRMED`, les versions concernées et les conflits.
+- Lecture stricte des rapports compacts historiques 0.4.1 à 0.4.6 selon leur rendu d'origine, sans réutiliser leurs anciennes règles pour les nouvelles synthèses.
+- Journal local incrémental et durable `state/events.jsonl`, verrou exclusif de campagne et manifestes consolidés aux frontières de phase au lieu d'une réécriture complète après chaque endpoint.
+- Files DNS et Nmap bornées, état `RUNNING` posé au démarrage réel, limite par IP de deux processus par défaut et progression provisoire sans résultat négatif prématuré.
+- Reprise étendue à la découverte et au DNS inachevés, identité stable des tâches, validation du rattachement des XML et historique borné à trois tentatives par défaut.
+- Budget de découverte automatique de 8 secondes par racine, avec minimum de 300 secondes, plafond de 7 200 secondes et nouvelle fenêtre lors d'une reprise.
+- Écriture progressive des rapports JSON et relecture des rapports détaillés dépassant l'ancienne limite de 128 Mio.
+- Charges locales validées à 10 000 et 100 000 cibles ; scénario d'interruption/reprise, verrouillage, cardinalité, concurrence et croissance linéaire du journal couverts par les tests.
+
+Le lanceur passe à **0.5.0** et le NSE reste en **0.3.3**. Les deux commandes usuelles et le rapport principal à quatre champs sont inchangés.
+
 ## 0.4.6 — 2026-10-23
 
 - Les redirections quittant l'origine contrôlée affichent désormais leur destination expurgée dans les rapports principaux avec la mention **HORS PÉRIMÈTRE DU CONTRÔLE — destination non évaluée**.

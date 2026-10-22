@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.6**, module NSE **0.3.3**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.5.0**, module NSE **0.3.3**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -35,6 +35,14 @@ python3 scan.py domaines.txt
 ```bash
 python3 scan.py domaines.txt --discover
 ```
+
+**Reprendre simplement une campagne interrompue :**
+
+```bash
+python3 scan.py --resume results/<campagne>
+```
+
+Les fichiers d'état nécessaires sont créés automatiquement. Aucune base, aucun service externe et aucun fichier de configuration ne sont à préparer.
 
 Le **profil rapide est activé par défaut** dans les deux cas. Il recherche les services HTTP/HTTPS sur les ports TCP **80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000 et 9443**. Nmap identifie les services ; le lanceur résout IPv4 et IPv6 et transmet le nom testé dans Host HTTP et SNI TLS. Pour couvrir les **65 535 ports TCP**, ajoutez `--profile complet`.
 
@@ -77,7 +85,7 @@ Ces lignes illustrent le format. **`php` contient les versions observées**, sé
 **L'explication liste les ports ayant une évaluation NSE**, même indéterminée, puis le motif du résultat. Les ports ouverts pertinents sans évaluation PHP sont signalés séparément. Lorsqu'une redirection quitte l'origine contrôlée et n'est donc pas suivie, sa destination expurgée est affichée avec la mention **HORS PÉRIMÈTRE DU CONTRÔLE — destination non évaluée**. Cette mention décrit la limite de l'évaluation HTTP courante : elle ne signifie pas nécessairement que le nom est absent du périmètre DNS autorisé ou d'une autre cible de la campagne. Les listes sont triées, dédoublonnées et bornées ; au-delà de dix ports, le nombre restant est indiqué. Les ports fermés ou filtrés ne figurent pas dans cette liste d'évaluations : leurs états restent dans les fichiers Nmap de `raw/`. Un port cité dans le motif de vulnérabilité désigne le service qui justifie le résultat, pas le seul port contrôlé.
 
 - **`OUI`** : au moins un service annonce clairement une version concernée, sans preuve valide de correction, ou un inventaire atteste un runtime encore affecté. L'explication précise le correctif ou la preuve disponible. Une version annoncée ne démontre pas l'exploitabilité.
-- **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une redirection HTTP vers le même nom en HTTPS est couverte lorsque ce service de destination a été évalué séparément sur la même adresse. Une ancienne version avec un backport attesté peut donc apparaître en `NON`, avec la version conservée et l'attestation expliquée.
+- **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une redirection HTTP vers le même nom en HTTPS n'est couverte que si sa destination exacte — adresse, protocole, port, chemin et paramètres comparables — a été évaluée séparément. Une ancienne version avec un backport attesté peut donc apparaître en `NON`, avec la version conservée et l'attestation expliquée.
 - **`INDETERMINE`** : version absente ou masquée, observations contradictoires, inventaire contradictoire ou contrôle incomplet. Une cause courte indique la vérification à effectuer ; l'absence de PHP identifié ne devient pas automatiquement `NON`.
 
 Une version concernée clairement observée suffit à faire ressortir la cible en `OUI`, même si d'autres services restent indéterminés. Une observation suspecte au sein d'un parcours interrompu ou contradictoire reste `INDETERMINE`. Un service reconnu comme non web, par exemple SSH, ne dégrade pas à lui seul le résultat des services PHP évalués.
@@ -91,6 +99,9 @@ Tous les fichiers ci-dessous sont des sorties du scanner. Ils n'ont pas à être
 | Fichier | Contenu |
 |---|---|
 | `manifest.json` | Périmètre, exclusions, empreintes des entrées, résolution A/AAAA, paramètres et état de chaque exécution. |
+| `state/events.jsonl` | Journal incrémental de récupération, écrit à chaque transition sans réécrire tout le manifeste. |
+| `progress.json` | Progression provisoire explicitement marquée ; elle publie les positifs établis, jamais de résultat négatif avant la consolidation finale. |
+| `.campaign.lock` | Verrou local empêchant deux processus de modifier la même campagne. |
 | `targets.txt` | Ensemble des noms retenus et normalisés : cibles exactes, racines, imports et découverte. |
 | `discovery.json` | Si découverte automatique : journal par racine, source, provenance, limites, compteurs, rejets et motifs d'erreur ; inventaire toujours non exhaustif. |
 | `discovered.txt` | Si découverte automatique : noms concrets CT retenus, y compris les racines présentes dans la source ; certains peuvent ne plus résoudre. |
@@ -142,7 +153,7 @@ python3 scan.py domaines.txt \
 
 **Conservez le dossier de campagne complet.** Pour un `report.json` compact, `--previous` charge automatiquement `raw/report-details.json` dans le même dossier et vérifie que les deux rapports correspondent. Un compagnon absent ou incohérent est refusé avant les accès réseau. Les anciens rapports JSON détaillés de schéma `1` restent acceptés directement, sans fichier compagnon. Cette règle vaut aussi pour le profil `recontrole`.
 
-Les rapports compacts des versions 0.4.1 et 0.4.2 restent acceptés avec leur compagnon, même si leur explication ne listait pas encore tous les ports évalués.
+Les rapports compacts des versions 0.4.1 à 0.4.6 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent un verdict plus prudent. Les nouveaux rapports appliquent toujours les règles 0.5.0.
 
 Les changements sont classés en `NEW`, `CHANGED`, `UNCHANGED` et `NO_LONGER_OBSERVED`, en conservant nom, IP, port et protocole. Un changement DNS peut apparaître comme un nouveau service et un ancien non observé. **La disparition d'un service ne prouve pas sa correction.** Les changements de périmètre, de ports ou de visibilité doivent être pris en compte.
 
@@ -188,7 +199,7 @@ Avec cette option, **`--dry-run` effectue les requêtes HTTPS vers crt.sh et la 
 | Limite de découverte | Défaut | Réglage |
 |---|---|---|
 | Délai total d'une requête, résolution de la source et lecture incluses | 30 s | `--discovery-timeout`, de 1 à 120 |
-| Budget de toute la phase de découverte | 300 s | `--discovery-budget`, de 1 à 3 600 |
+| Budget de la session de découverte | Automatique : 8 s/racine, minimum 300 s, plafond 7 200 s | `--discovery-budget`, de 1 à 86 400, garde la priorité |
 | Noms CT uniques par campagne, avant filtrage du périmètre et des exclusions | 10 000 | `--discovery-max-names`, de 1 à 100 000 |
 | Nouvelles tentatives sur HTTP 502/503/504 | 2 | `--discovery-retries`, de 0 à 5 |
 | Backoff initial entre tentatives | 5 s | `--discovery-backoff-seconds`, de 1 à 60 |
@@ -198,7 +209,7 @@ Avec cette option, **`--dry-run` effectue les requêtes HTTPS vers crt.sh et la 
 
 Le plafond effectif de noms CT est également limité aux places restantes parmi les **100 000 cibles maximum** de la campagne, racines, cibles exactes et imports compris. Sa valeur est enregistrée dans `limits.effective_max_names` de `discovery.json`.
 
-Les racines sont traitées séquentiellement, sans redirection. Un résultat réussi récent est réutilisé pendant le cooldown pour ne pas solliciter inutilement crt.sh. Les erreurs transitoires HTTP 502/503/504 sont retentées avec un backoff exponentiel et légèrement aléatoire, dans le budget global. Si elles persistent, un cache réussi assez récent peut servir de secours ; `cache_mode`, `cache_age_seconds` et chaque tentative restent visibles dans `discovery.json`. `--refresh-discovery` force une nouvelle interrogation et désactive le repli sur cache. Les noms découverts ne déclenchent pas de nouvelles recherches de certificats. Les autres erreurs, limitations de débit, délais et plafonds atteints sont conservés dans `discovery.json` ; une campagne partielle sort avec le code `2`. Une interruption conserve le bilan disponible et sort avec `130`.
+Les racines sont traitées séquentiellement, sans redirection. Le budget automatique vaut ainsi **3 720 secondes pour 465 racines** et sa valeur maximale est affichée au lancement. Un résultat réussi récent est réutilisé pendant le cooldown pour ne pas solliciter inutilement crt.sh. Les erreurs transitoires HTTP 502/503/504 sont retentées avec un backoff exponentiel et légèrement aléatoire, dans le budget de la session. Si elles persistent, un cache réussi assez récent peut servir de secours ; `cache_mode`, `cache_age_seconds` et chaque tentative restent visibles dans `discovery.json`. `--refresh-discovery` force une nouvelle interrogation et désactive le repli sur cache. Les noms découverts ne déclenchent pas de nouvelles recherches de certificats. Les autres erreurs, limitations de débit, délais et plafonds atteints sont conservés dans `discovery.json` ; une campagne partielle sort avec le code `2`. Une interruption conserve le bilan disponible et sort avec `130`. La reprise ouvre une nouvelle fenêtre de temps et n'interroge que les racines non terminées.
 
 ### Lire les limites de l'inventaire
 
@@ -210,13 +221,15 @@ Les certificats historiques peuvent fournir des noms qui ne répondent plus au D
 
 ## Reprendre une campagne interrompue
 
-Le manifeste est mis à jour après chaque endpoint. Pour reprendre une campagne :
+L'état est enregistré au fil de l'eau dans un journal local, puis consolidé dans le manifeste. Pour reprendre une campagne :
 
 ```bash
 python3 scan.py --resume results/20261022T223344Z-9bb9cdcf
 ```
 
-La reprise valide les XML des endpoints `COMPLETED`, les réutilise sans nouveau trafic et ne relance que les endpoints incomplets, en échec ou expirés. Les commandes enregistrées dans le manifeste ne sont jamais exécutées directement : Nmap et ses arguments sont reconstruits depuis les champs validés. Les adresses non globales restent exclues, sauf dérogation explicite de laboratoire avec `--allow-non-global`. Si un chemin avec paramètres a été expurgé, une nouvelle campagne avec le chemin complet est requise. Une campagne peut rester `PARTIAL` après reprise lorsque des noms ne résolvent pas ou qu'une lacune de couverture indépendante de Nmap subsiste.
+La reprise garde le même identifiant, poursuit d'abord une découverte ou une résolution DNS inachevée, valide les XML des endpoints `COMPLETED`, les réutilise sans nouveau trafic et ne relance que les endpoints incomplets, en échec ou expirés. Une sortie absente, tronquée ou rattachée à une autre cible n'est jamais réutilisée comme succès. Les commandes enregistrées dans le manifeste ne sont jamais exécutées directement : Nmap et ses arguments sont reconstruits depuis les champs validés. Trois tentatives cumulées au maximum sont autorisées par couple nom/IP par défaut. Les adresses non globales restent exclues, sauf dérogation explicite de laboratoire avec `--allow-non-global`. Si un chemin avec paramètres a été expurgé, une nouvelle campagne avec le chemin complet est requise. Une campagne peut rester `PARTIAL` après reprise lorsque des noms ne résolvent pas ou qu'une lacune de couverture indépendante de Nmap subsiste.
+
+La **reprise** poursuit la même campagne. Le profil **recontrole** crée au contraire une nouvelle campagne, résout de nouveau les noms et produit de nouvelles observations à comparer.
 
 <details>
 <summary>Importer des noms ou appliquer des exclusions</summary>
@@ -282,6 +295,8 @@ Le recontrôle écarte les lignes avec `inventory_patch_status=PATCH_CONFIRMED`.
 |---|---|---|
 | Familles | IPv4 et IPv6 | `--families ipv4`, `ipv6` ou `both` |
 | Processus Nmap simultanés | 4 | `--workers`, de 1 à 32 |
+| Processus simultanés vers une même IP | 2 | `--workers-per-ip`, de 1 à 32 |
+| Tentatives cumulées par couple nom/IP | 3 | `--max-attempts`, de 1 à 10 |
 | Résolution DNS par nom | 15 s | `--dns-timeout` |
 | Durée par processus Nmap | 900 s | `--target-timeout` |
 | Délai des opérations HTTP | 5 000 ms | `--http-timeout` |
@@ -452,11 +467,23 @@ python3 -m unittest discover -s tests -p 'test_campaign_report.py'
 python3 -m unittest discover -s tests -p 'test_scan.py'
 python3 -m unittest discover -s tests -p 'test_discovery.py'
 python3 -m unittest discover -s tests -p 'test_discovery_campaign.py'
+python3 -m unittest discover -s tests -p 'test_campaign_state.py'
 python3 tests/integration.py
 python3 tests/test_scan_integration.py
 ```
 
 `NMAP` et `NMAP_DATADIR`, ou `--nmap` et `--nmap-datadir`, permettent de choisir l'installation. Les tests réels vérifient transport, parcours, couverture et rapports ; ils ne démontrent pas une détection exhaustive de tous les déploiements PHP. GitHub Actions exécute les lots sur Ubuntu 24.04.
+
+### Charge hors réseau validée
+
+`python3 tests/load_volume.py --durable-journal 10000 100000` mesure le planificateur, le vrai journal local synchronisé sur disque et la chaîne d'export avec des doubles réseau, sans DNS, crt.sh ni Nmap réel. Sur Apple M4, macOS arm64 et Python 3.15.0, la mesure du 23 octobre 2026 a donné :
+
+| Cibles | Soumises non terminées max. | Actives max. | Ordonnancement + journal | Erreurs simulées | Journal durable | Pic ordonnanceur | Export | Relecture | Pic rapport | Lignes finales |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 000 | 8 | 8 | 1,886 s | 9 990 échecs, 10 délais | 20 000 événements, 7,81 Mio | 14,28 Mio | 1,632 s | 1,260 s | 18,51 Mio | 10 000 |
+| 100 000 | 8 | 8 | 20,568 s | 99 900 échecs, 100 délais | 200 000 événements, 78,65 Mio | 138,77 Mio | 16,577 s | 12,820 s | 186,28 Mio | 100 000 |
+
+Le volume journalisé croît linéairement à raison de deux transitions par tâche dans ce scénario ; les pics mémoire sont ceux suivis par `tracemalloc`. Un test concentrant 200 tâches sur la même IP confirme séparément les plafonds de 8 tâches globales et 2 par IP. Ces mesures portent sur les structures locales et la consolidation, pas sur un débit Internet ni sur la durée de vrais scans. Un test distinct génère et relit effectivement un compagnon détaillé supérieur à l'ancienne limite de 128 Mio. La mémoire reste proportionnelle au nombre de cibles, car le rapport final doit conserver une ligne et ses observations par cible ; 100 000 est la limite actuelle d'une campagne.
 
 ## Sources et licence
 

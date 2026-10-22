@@ -432,19 +432,18 @@ class DiscoveryCampaignTests(unittest.TestCase):
         self.assertTrue((output / "report.json").is_file())
 
     def test_interrupt_after_source_response_keeps_names_and_finishes_remaining_roots(self):
-        original = scan.persist_discovery
+        original = scan.EventLedger.append
         interrupted = False
 
-        def persist(output, manifest):
+        def persist(ledger, kind, key, value):
             nonlocal interrupted
-            discovery = manifest["discovery"]
-            if not interrupted and discovery["candidates"]:
+            original(ledger, kind, key, value)
+            if (not interrupted and kind == "discovery" and value.get("candidates")):
                 interrupted = True
                 raise KeyboardInterrupt
-            original(output, manifest)
 
         exclude = self.file("exclude.txt", "private.example.com\n*.example.net\n")
-        with patch.object(scan, "persist_discovery", side_effect=persist):
+        with patch.object(scan.EventLedger, "append", new=persist):
             code, output, data, provider, dns, runner = self.execute(
                 "--exclude", exclude, roots="example.com\nexample.org\nexample.net\n",
                 source=source_result("app.example.com", "private.example.com"), dry_run=False)
@@ -471,6 +470,40 @@ class DiscoveryCampaignTests(unittest.TestCase):
         self.assert_compact_targets(output, {
             "example.com": ("INCONNUE", "INDETERMINE"), "example.org": ("INCONNUE", "INDETERMINE"),
             "example.net": ("INCONNUE", "INDETERMINE"), "app.example.com": ("INCONNUE", "INDETERMINE"),
+        })
+
+    def test_resume_continues_only_unfinished_discovery_roots(self):
+        first_result = source_result("app.example.com")
+        code, output, data, provider, dns, runner = self.execute(
+            roots="example.com\nexample.org\n", source=[first_result, KeyboardInterrupt()],
+            dry_run=False)
+        self.assertEqual(code, 130)
+        self.assertEqual(provider.call_count, 2)
+        dns.assert_not_called()
+        runner.assert_not_called()
+        self.assertFalse(data["discovery"]["processing_complete"])
+
+        args = scan.parser().parse_args([
+            "--resume", str(output), "--workers", "1", "--allow-non-global",
+            "--discovery-budget", "300",
+        ])
+        messages = io.StringIO()
+        with patch.object(scan, "discover_root", return_value=source_result("api.example.org")) as resumed_source, \
+             patch.object(scan, "resolve_target", side_effect=self.resolved), \
+             patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan.Processes, "run", side_effect=self.completed_scan), \
+             redirect_stdout(messages), redirect_stderr(messages):
+            resumed_code = scan.resume_campaign(args)
+        self.assertEqual(resumed_code, 0, messages.getvalue())
+        resumed_source.assert_called_once()
+        self.assertEqual(resumed_source.call_args.args[0], "example.org")
+        final = json.loads((output / "manifest.json").read_text())
+        self.assertTrue(final["discovery"]["processing_complete"])
+        self.assertEqual({target["hostname"] for target in final["targets"]},
+                         {"example.com", "example.org", "app.example.com", "api.example.org"})
+        self.assert_compact_targets(output, {
+            "example.com": ("8.3.36", "NON"), "example.org": ("8.3.36", "NON"),
+            "app.example.com": ("8.3.36", "NON"), "api.example.org": ("8.3.36", "NON"),
         })
 
     def test_interrupt_during_merge_or_snapshot_finishes_report_without_duplicate_exclusions(self):

@@ -86,7 +86,7 @@ local POTENTIAL = "POTENTIALLY_VULNERABLE"
 local PATCHED = "PATCHED_VERSION_ADVERTISED"
 local UNKNOWN = "UNKNOWN"
 local FIXES = {[2] = 35, [3] = 36, [4] = 27, [5] = 12}
-local DEFAULT_USER_AGENT = "php2shell-scanner/0.4.6 http-php2shell/0.3.3 (+https://github.com/aehcktrn/php2shell-scanner)"
+local DEFAULT_USER_AGENT = "php2shell-scanner/0.5.0 http-php2shell/0.3.3 (+https://github.com/aehcktrn/php2shell-scanner)"
 local MAX_HEADER_BYTES = 8192
 local MAX_EVIDENCE = 32
 -- RFC HTTP product-token characters. A fragment of Not-PHP or Not.PHP is

@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unicodedata
@@ -37,7 +38,6 @@ COMPACT_FIELDS = ("cible", "php", "vulnerable", "explication")
 COMPACT_VERDICTS = ("OUI", "NON", "INDETERMINE")
 MAX_COMPACT_EXPLANATION = 360
 MAX_SUMMARY_PORTS = 10
-MAX_REPORT_BYTES = 128 * 1024 * 1024
 SCRIPT_ID = "http-php2shell"
 STATES = ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED", "UNKNOWN")
 PRIORITIES = {
@@ -354,6 +354,7 @@ COMPACT_REASONS = {
     "SCAN_TIMEOUT": "Délai du scan Nmap dépassé",
     "SCAN_FAILED": "Échec du scan Nmap",
     "SCAN_INCOMPLETE": "Scan Nmap incomplet",
+    "SCAN_INTERRUPTED": "Scan Nmap interrompu",
     "SCAN_SKIPPED": "Scan Nmap non exécuté",
     "SCAN_NOT_ATTEMPTED": "Scan Nmap non exécuté",
     "INVALID_SCAN_XML": "Résultat Nmap incomplet ou invalide",
@@ -417,14 +418,47 @@ def _compact_verdict(row: dict[str, Any]) -> str:
     return "INDETERMINE"
 
 
-def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
-    """Return true when every external-origin redirect was assessed separately.
+def _redirect_destination(value: object) -> tuple[str, int, str, str] | None:
+    """Return a comparison-safe destination without weakening URL identity."""
+    try:
+        destination = urlsplit(_single_line(value))
+        scheme = destination.scheme.lower()
+        port = destination.port or (443 if scheme == "https" else 80 if scheme == "http" else 0)
+    except ValueError:
+        return None
+    if (scheme not in ("http", "https") or destination.username is not None
+            or destination.password is not None or not destination.hostname or destination.fragment):
+        return None
+    path = destination.path or "/"
+    query = destination.query
+    # Query values are deliberately redacted by the NSE. Two redacted URLs
+    # therefore never prove that the same resource was assessed.
+    if "[redacted]" in query:
+        return None
+    request_target = path + (("?" + query) if query else "")
+    return scheme, port, destination.hostname.lower().rstrip("."), request_target
 
-    The NSE deliberately does not cross an origin boundary. A campaign can
-    nevertheless cover a routine HTTP-to-HTTPS redirect through its separate
-    scan of the destination service. Require the same target name and IP so a
-    redirect never hides an untested backend or a foreign destination.
-    """
+
+def _observation_covers_path(candidate: dict[str, Any], request_target: str) -> bool:
+    if _compact_verdict(candidate) == "INDETERMINE":
+        return False
+    observations = candidate.get("observations")
+    if not isinstance(observations, list):
+        return False
+    proof = candidate.get("inventory_patch_status")
+    for observation in observations:
+        if not isinstance(observation, dict) or _single_line(observation.get("path")) != request_target:
+            continue
+        if proof in ("PATCH_CONFIRMED", "PATCH_MISSING_CONFIRMED"):
+            return True
+        if (observation.get("state") in ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED")
+                and _version_values(observation.get("versions"))):
+            return True
+    return False
+
+
+def _legacy_redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+    """Reproduce the service-level v0.4.4-v0.4.6 compatibility rule."""
     if (row.get("row_type") != "ASSESSMENT"
             or row.get("reason_code") != "REDIRECT_NOT_ASSESSED"
             or _true(row.get("budget_exhausted"))
@@ -458,6 +492,53 @@ def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]]) -> boo
                    for candidate in rows):
             return False
     return True
+
+
+def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+    """Return true when every external-origin redirect was assessed separately.
+
+    The NSE deliberately does not cross an origin boundary. A campaign can
+    nevertheless cover a routine HTTP-to-HTTPS redirect through its separate
+    scan of the destination service. Require the same target name, IP and exact
+    request target so a redirect never hides an untested path or backend.
+    """
+    if (row.get("row_type") != "ASSESSMENT"
+            or row.get("reason_code") != "REDIRECT_NOT_ASSESSED"
+            or _true(row.get("budget_exhausted"))
+            or str(row.get("traversal_complete", "")).lower() in ("false", "no", "0")):
+        return False
+    observations = row.get("observations")
+    if not isinstance(observations, list) or not observations:
+        return False
+    target = _single_line(row.get("hostname") or row.get("ip")).lower().rstrip(".")
+    source_ip = _single_line(row.get("ip"))
+    for observation in observations:
+        if not isinstance(observation, dict) or observation.get("reason_code") != "REDIRECT_NOT_ASSESSED":
+            return False
+        destination = _redirect_destination(observation.get("redirect_to"))
+        if destination is None:
+            return False
+        scheme, port, destination_name, request_target = destination
+        if destination_name != target:
+            return False
+        if not any(candidate is not row
+                   and candidate.get("row_type") == "ASSESSMENT"
+                   and _single_line(candidate.get("ip")) == source_ip
+                   and _single_line(candidate.get("hostname") or candidate.get("ip")).lower().rstrip(".") == target
+                   and _single_line(candidate.get("scheme")).lower() == scheme
+                   and _single_line(candidate.get("port")) == str(port)
+                   and _observation_covers_path(candidate, request_target)
+                   for candidate in rows):
+            return False
+    return True
+
+
+def _covered_redirect_is_navigation_only(row: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+    """Suppress only the resolved navigation gap, never independent evidence."""
+    if not _redirect_is_covered(row, rows):
+        return False
+    proof = row.get("inventory_patch_status")
+    return proof in (None, "", "NOT_PROVIDED") and not _suspect(row)
 
 
 def _short(value: object, limit: int = 150) -> str:
@@ -595,7 +676,8 @@ def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdic
 
 
 def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False,
-                 include_redirect_destinations: bool = True) -> list[dict[str, str]]:
+                 include_redirect_destinations: bool = True,
+                 redirect_coverage: str = "current") -> list[dict[str, str]]:
     """Aggregate IPs and ports into four fields per hostname (or XML IP).
 
     OUI includes an affected advertised version and says so explicitly. NON
@@ -607,6 +689,8 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
     """
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ReportError("Lignes détaillées invalides : une liste d'objets est requise.")
+    if redirect_coverage not in ("current", "legacy", "none"):
+        raise ReportError("Mode de couverture des redirections invalide.")
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if row.get("protocol") == "discovery":
@@ -619,8 +703,12 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
     for target, group in groups.items():
         versions = _unique([version for row in group for version in _version_values(row.get("versions"))])
         relevant = [row for row in group if not _non_web_coverage(row)]
-        conclusive = (relevant if legacy_explanation else
-                      [row for row in relevant if not _redirect_is_covered(row, relevant)])
+        if legacy_explanation or redirect_coverage == "none":
+            conclusive = relevant
+        elif redirect_coverage == "legacy":
+            conclusive = [row for row in relevant if not _legacy_redirect_is_covered(row, relevant)]
+        else:
+            conclusive = [row for row in relevant if not _covered_redirect_is_navigation_only(row, relevant)]
         verdicts = [_compact_verdict(row) for row in conclusive]
         verdict = ("OUI" if "OUI" in verdicts else
                    "NON" if verdicts and all(value == "NON" for value in verdicts) else "INDETERMINE")
@@ -634,6 +722,26 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
         output.append({"cible": target, "php": " | ".join(versions) or "INCONNUE", "vulnerable": verdict,
                        "explication": _short(explanation, MAX_COMPACT_EXPLANATION)})
     return output
+
+
+def _historical_compact_rows(details: dict[str, Any]) -> list[dict[str, str]] | None:
+    """Render the exact compact contract associated with a stored tool version."""
+    match = re.fullmatch(r"0\.(\d+)\.(\d+)", str(details.get("tool_version", "")))
+    if not match:
+        return None
+    minor, patch = int(match.group(1)), int(match.group(2))
+    if minor != 4:
+        return None
+    rows = details["rows"]
+    if patch <= 2:
+        return compact_rows(rows, legacy_explanation=True, redirect_coverage="none")
+    if patch == 3:
+        return compact_rows(rows, include_redirect_destinations=False, redirect_coverage="none")
+    if patch in (4, 5):
+        return compact_rows(rows, include_redirect_destinations=False, redirect_coverage="legacy")
+    if patch == 6:
+        return compact_rows(rows, redirect_coverage="legacy")
+    return None
 
 
 def safe_cell(value: object) -> str:
@@ -690,15 +798,17 @@ def _validate_detailed(value: object) -> dict[str, Any]:
     return value
 
 
-def _read_json_report(path: Path) -> tuple[object, bytes]:
+def _read_json_report(path: Path) -> tuple[object, str]:
     try:
-        with Path(path).open("rb") as stream:
-            raw = stream.read(MAX_REPORT_BYTES + 1)
-        if len(raw) > MAX_REPORT_BYTES:
-            raise ReportError("Rapport JSON trop volumineux : limite de 128 MiB.")
         def invalid_constant(value):
             raise ValueError("constante JSON invalide : " + value)
-        return json.loads(raw, parse_constant=invalid_constant), raw
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as binary:
+            for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(chunk)
+        with Path(path).open("r", encoding="utf-8-sig") as stream:
+            value = json.load(stream, parse_constant=invalid_constant)
+        return value, digest.hexdigest()
     except (OSError, ValueError, UnicodeError, RecursionError) as exc:
         raise ReportError(f"Rapport JSON illisible ({path}): {exc}") from exc
 
@@ -720,9 +830,9 @@ def load_campaign_report(path: Path) -> dict[str, Any]:
         details = _validate_detailed(_read_json_report(companion)[0])
     except ReportError as exc:
         raise ReportError(f"Rapport compact : compagnon détaillé requis et valide ({companion}): {exc}") from exc
-    if (compact_rows(details["rows"]) != compact
-            and compact_rows(details["rows"], include_redirect_destinations=False) != compact
-            and compact_rows(details["rows"], legacy_explanation=True) != compact):
+    historical = _historical_compact_rows(details)
+    expected = historical if historical is not None else compact_rows(details["rows"])
+    if expected != compact:
         raise ReportError("Rapport compact incohérent avec raw/report-details.json ; conserver les fichiers de la même campagne.")
     return details
 
@@ -993,13 +1103,14 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
                 raise ReportError("Adresse du manifeste invalide.")
             endpoint_count += 1
             status = endpoint.get("status", "PLANNED")
-            if status in ("RUNNING", "COMPLETED", "FAILED", "TIMEOUT"):
+            if status in ("RUNNING", "COMPLETED", "FAILED", "TIMEOUT", "INTERRUPTED"):
                 attempted_names.add(name)
                 attempted_count += 1
             stamp = str(endpoint.get("finished_at") or observed_at)
             if status != "COMPLETED" or endpoint.get("returncode", 0) != 0:
                 code = {"TIMEOUT": "SCAN_TIMEOUT", "FAILED": "SCAN_FAILED", "RUNNING": "SCAN_INCOMPLETE",
-                        "SKIPPED": "SCAN_SKIPPED"}.get(status, "SCAN_NOT_ATTEMPTED")
+                        "INTERRUPTED": "SCAN_INTERRUPTED", "SKIPPED": "SCAN_SKIPPED"}.get(
+                            status, "SCAN_NOT_ATTEMPTED")
                 rows.append(_campaign_coverage(name, endpoint, str(endpoint.get("error") or
                           "Execution de scan non terminee avec succes."), code, campaign_id, stamp))
                 processing_complete = False
@@ -1074,9 +1185,9 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
         result["inventory"]["max_age_hours"] = max_inventory_age_hours
     if previous is not None:
         old = load_campaign_report(Path(previous))
-        _, raw = _read_json_report(Path(previous))
+        _, previous_sha256 = _read_json_report(Path(previous))
         result["changes"] = compare_reports(result, old)
-        result["comparison"] = {"filename": Path(previous).name, "sha256": hashlib.sha256(raw).hexdigest(),
+        result["comparison"] = {"filename": Path(previous).name, "sha256": previous_sha256,
                                 "previous_campaign": old.get("campaign", {}),
                                 "counts": dict(Counter(item["change"] for item in result["changes"]))}
     return result
@@ -1087,14 +1198,26 @@ def write_campaign_report(report: dict, output_dir: Path) -> None:
     output_dir = Path(output_dir)
     # Validate both forms before touching any existing artifact. Keep evidence
     # and service-level comparison data out of the operator's main reports.
-    details = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     compact = compact_rows(_validate_detailed(report)["rows"])
-    objects = [json.dumps(row, ensure_ascii=False, allow_nan=False) for row in compact]
-    rendered = "[\n" + ",\n".join(objects) + ("\n" if objects else "") + "]\n"
-    _atomic_text(output_dir / "raw" / "report-details.json", lambda stream: stream.write(details))
+
+    def write_details(stream):
+        json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+
+    def write_compact(stream):
+        stream.write("[\n")
+        for index, row in enumerate(compact):
+            if index:
+                stream.write(",\n")
+            json.dump(row, stream, ensure_ascii=False, allow_nan=False)
+        if compact:
+            stream.write("\n")
+        stream.write("]\n")
+
+    _atomic_text(output_dir / "raw" / "report-details.json", write_details)
     _write_csv(compact, output_dir / "report.csv", COMPACT_FIELDS)
     _write_csv(report.get("changes", []), output_dir / "changes.csv", CHANGE_FIELDS)
-    _atomic_text(output_dir / "report.json", lambda stream: stream.write(rendered))
+    _atomic_text(output_dir / "report.json", write_compact)
 
 
 def main(argv: list[str] | None = None) -> int:

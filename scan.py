@@ -8,7 +8,8 @@ DNS/application imports feed the same explicit scope checks.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 from datetime import datetime, timezone
 import hashlib
@@ -31,20 +32,29 @@ import uuid
 from report import (ReportError, build_campaign_report, compact_rows,
                     load_campaign_report, parse_report, write_campaign_report)
 from discovery import discover_root
+from campaign_state import CampaignLock, EventLedger, StateError
 
 
-VERSION = "0.4.6"
+VERSION = "0.5.0"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
-MAX_MANIFEST_BYTES = 128 * 1024 * 1024
 MAX_TARGETS = 100000
 MAX_DISCOVERY_ROOTS = 1000
 DISCOVERY_RESPONSE_BYTES = 8 * 1024 * 1024
 DISCOVERY_CACHE_SCHEMA = "1"
+DISCOVERY_BUDGET_FLOOR = 300
+DISCOVERY_SECONDS_PER_ROOT = 8
+DISCOVERY_BUDGET_CAP = 7200
 PROFILES = {"rapide": "quick", "quick": "quick", "complet": "complete",
             "complete": "complete", "recontrole": "recheck", "recheck": "recheck"}
 HOST_FIELDS = ("hostname", "fqdn", "name", "domain", "host")
+
+
+def automatic_discovery_budget(root_count: int) -> int:
+    """Return a useful bounded session budget without operator configuration."""
+    return min(DISCOVERY_BUDGET_CAP,
+               max(DISCOVERY_BUDGET_FLOOR, root_count * DISCOVERY_SECONDS_PER_ROOT))
 
 
 class InputError(ValueError):
@@ -80,6 +90,17 @@ def read_text(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> str:
         return path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise InputError(f"Impossible de lire {path}: {exc}") from exc
+
+
+def read_manifest(path: Path) -> dict:
+    """Parse a campaign snapshot without retaining a second full byte copy."""
+    try:
+        def invalid_constant(value):
+            raise ValueError("constante JSON invalide: " + value)
+        with Path(path).open("r", encoding="utf-8-sig") as stream:
+            return json.load(stream, parse_constant=invalid_constant)
+    except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+        raise InputError("Manifeste de reprise JSON invalide.") from exc
 
 
 def hostname(value: object) -> str:
@@ -405,18 +426,58 @@ def interrupt_discovery(discovery: dict, roots: list[tuple[str, str]], rules: di
                      processing_complete=False, exhaustive=False, finished_at=finished)
 
 
+def discovery_progress(discovery: dict) -> dict[str, int]:
+    roots = set(discovery.get("roots", []))
+    excluded = {item.get("root") for item in discovery.get("skipped_roots", [])
+                if isinstance(item, dict)}
+    queries = [item for item in discovery.get("queries", []) if isinstance(item, dict)]
+    queried = {item.get("root") for item in queries if item.get("started_at")}
+    completed = {item.get("root") for item in queries
+                 if item.get("status") == "COMPLETED" and item.get("processing_complete") is True}
+    failures = {item.get("root") for item in queries
+                if item.get("started_at") and item.get("status") != "COMPLETED"}
+    return {"roots": len(roots), "queried": len(queried), "remaining": len(roots - completed - excluded),
+            "failures": len(failures), "excluded": len(excluded)}
+
+
+def print_discovery_progress(discovery: dict) -> None:
+    counts = discovery_progress(discovery)
+    print(f"Racines: {counts['queried']}/{counts['roots']} interrogées; "
+          f"{counts['remaining']} à reprendre; {counts['failures']} en échec; "
+          f"{counts['excluded']} exclues.", flush=True)
+
+
 def run_discovery(args, roots: list[tuple[str, str]], rules: dict,
-                  output: Path, manifest: dict) -> tuple[list[tuple], list[dict], bool]:
+                  output: Path, manifest: dict, ledger: EventLedger | None = None
+                  ) -> tuple[list[tuple], list[dict], bool]:
     """Keep a query ledger even when the source fails before returning names."""
     discovery = manifest["discovery"]
     started = time.monotonic()
     effective_limit = min(args.discovery_max_names, MAX_TARGETS - len(manifest["targets"]))
     discovery["limits"]["effective_max_names"] = effective_limit
     limit_reason = "NAME_LIMIT_REACHED" if effective_limit == args.discovery_max_names else "TARGET_LIMIT_REACHED"
-    names: dict[str, list[str]] = {}
+    names: dict[str, list[str]] = {
+        item["hostname"]: list(item.get("sources", []))
+        for item in discovery.get("candidates", [])
+        if isinstance(item, dict) and isinstance(item.get("hostname"), str)
+    }
+    previous_queries = list(discovery.get("queries", []))
+    completed_roots = {
+        item.get("root") for item in previous_queries
+        if isinstance(item, dict) and item.get("status") == "COMPLETED"
+        and item.get("processing_complete") is True
+    }
+    incomplete_history = [item for item in previous_queries
+                          if isinstance(item, dict) and item.get("root") not in completed_roots]
+    if incomplete_history:
+        discovery.setdefault("query_history", []).extend(incomplete_history)
+    discovery["queries"] = [item for item in previous_queries
+                            if isinstance(item, dict) and item.get("root") in completed_roots]
     interrupted, stop_reason, query = False, None, None
     try:
         for root, _ in roots:
+            if root in completed_roots:
+                continue
             if any(root == zone or root.endswith("." + zone) for zone in rules["excluded_subdomains"]):
                 discovery["skipped_roots"].append({"root": root, "reason": "SUBDOMAINS_EXCLUDED_BY_OPERATOR"})
                 continue
@@ -432,11 +493,11 @@ def run_discovery(args, roots: list[tuple[str, str]], rules: dict,
                 stop_reason = limit_reason
             if stop_reason is not None:
                 query.update(status="SKIPPED", reason_code=stop_reason, finished_at=utcnow())
-                persist_discovery(output, manifest)
+                if ledger:
+                    ledger.append("discovery", root, {"query": dict(query), "candidates": []})
                 query = None
                 continue
             query["started_at"] = utcnow()
-            persist_discovery(output, manifest)
             print(f"Decouverte crt.sh: {root}...", flush=True)
             fresh_cache = None if args.refresh_discovery else load_discovery_cache(
                 output, root, args.discovery_cache_ttl_minutes * 60)
@@ -519,7 +580,10 @@ def run_discovery(args, roots: list[tuple[str, str]], rules: dict,
             discovery["candidates"] = [{"hostname": name, "sources": sources}
                                        for name, sources in sorted(names.items())]
             print(f"  {query['status']}: {query.get('candidate_count', 0)} noms; {query.get('reason_code', '')}", flush=True)
-            persist_discovery(output, manifest)
+            if ledger:
+                ledger.append("discovery", root, {
+                    "query": dict(query), "candidates": list(result.get("candidates", [])),
+                })
             query = None
         complete = all(item.get("status") == "COMPLETED" and item.get("processing_complete", True)
                        for item in discovery["queries"])
@@ -732,6 +796,67 @@ def resolve_target(name: str, families: list[str], timeout: float,
         return {"dns_status": "DNS_ERROR", "addresses": [], "dns_error": str(exc), "resolved_at": utcnow()}
 
 
+def resolve_targets_bounded(targets: list[dict], families: list[str], timeout: float,
+                            allow_non_global: bool, workers: int, ledger: EventLedger
+                            ) -> bool:
+    """Resolve with at most ``workers`` submitted futures and durable results."""
+    pending_targets = deque(target for target in targets if target.get("dns_status") == "NOT_RESOLVED")
+    futures = {}
+    interrupted = False
+
+    def resolve(target):
+        target.update(dns_status="RUNNING", dns_started_at=utcnow())
+        ledger.append("dns", target["hostname"], {
+            "dns_status": "RUNNING", "dns_started_at": target["dns_started_at"],
+        })
+        result = resolve_target(target["hostname"], families, timeout, allow_non_global)
+        ledger.append("dns", target["hostname"], result)
+        return result
+
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
+        while pending_targets and len(futures) < workers:
+            target = pending_targets.popleft()
+            futures[executor.submit(resolve, target)] = target
+        while futures:
+            completed, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in completed:
+                target = futures.pop(future)
+                try:
+                    target.update(future.result())
+                except Exception as exc:
+                    failure = {"dns_status": "DNS_ERROR", "addresses": [],
+                               "dns_error": f"RUNNER_ERROR: {type(exc).__name__}", "resolved_at": utcnow()}
+                    target.update(failure)
+                    ledger.append("dns", target["hostname"], failure)
+                if pending_targets:
+                    next_target = pending_targets.popleft()
+                    futures[executor.submit(resolve, next_target)] = next_target
+    except KeyboardInterrupt:
+        interrupted = True
+        for future in futures:
+            future.cancel()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        if interrupted:
+            unfinished = []
+            for future, target in futures.items():
+                if future.done() and not future.cancelled():
+                    try:
+                        target.update(future.result())
+                        continue
+                    except Exception:
+                        pass
+                unfinished.append(target)
+            unfinished.extend(pending_targets)
+            for target in unfinished:
+                failure = {"dns_status": "DNS_ERROR", "addresses": [],
+                           "dns_error": "CAMPAIGN_INTERRUPTED", "resolved_at": utcnow()}
+                target.update(failure)
+                ledger.append("dns", target["hostname"], failure)
+    return interrupted
+
+
 def nse_arguments(name: str, paths: list[str], args) -> str:
     # NSE argument files support quoted strings and Lua-style arrays. JSON string
     # escaping is used as data here, never interpolated into a shell command.
@@ -761,6 +886,184 @@ def command_for(nmap: str, endpoint: dict, args_file: Path, prefix: Path, args) 
     # Numeric IP from a DNS snapshot; the original DNS name travels only as Host/SNI.
     command.append(str(ipaddress.ip_address(endpoint["ip"])))
     return command
+
+
+def endpoint_task_id(name: str, endpoint: dict, paths: list[str], http: dict) -> str:
+    identity = {
+        "hostname": name, "ip": str(ipaddress.ip_address(endpoint["ip"])),
+        "family": endpoint["family"], "ports": port_expression(endpoint["ports"]),
+        "paths": paths,
+        "http": {key: http[key] for key in
+                 ("timeout_ms", "budget_ms", "max_requests", "redirects", "samples")},
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def run_endpoint_jobs(jobs: list[tuple[dict, dict]], *, workers: int, workers_per_ip: int,
+                      control: "Processes", output: Path, timeout: float,
+                      ledger: EventLedger, max_attempts: int, progress_label: str = "Progression",
+                      measurements: dict | None = None,
+                      ) -> tuple[bool, int]:
+    """Run a bounded fair queue and durably record actual task transitions."""
+    queues: dict[str, deque] = {}
+    for target, endpoint in jobs:
+        queues.setdefault(endpoint["ip"], deque()).append((target, endpoint))
+    ip_order = deque(queues)
+    active_by_ip = {ip: 0 for ip in queues}
+    futures = {}
+    interrupted, done_count = False, 0
+    started_at = time.monotonic()
+    positive_targets = set()
+    progress_interval = max(100, max(1, len(jobs) // 100))
+    max_submitted = 0
+
+    def current_statuses() -> dict[str, int]:
+        statuses = {}
+        for _, endpoint in jobs:
+            status = endpoint.get("status", "PLANNED")
+            statuses[status] = statuses.get(status, 0) + 1
+        return statuses
+
+    def write_progress() -> None:
+        atomic_json(output / "progress.json", {
+            "schema_version": "1", "provisional": True, "updated_at": utcnow(),
+            "tasks_total": len(jobs), "tasks_completed": done_count,
+            "status_counts": current_statuses(), "positive_targets": sorted(positive_targets),
+            "note": "Résultat provisoire: aucun NON n'est publié avant la consolidation finale.",
+        })
+
+    def print_progress() -> None:
+        statuses = current_statuses()
+        queued = sum(len(queue) for queue in queues.values())
+        elapsed = max(time.monotonic() - started_at, 0.001)
+        summary = ", ".join(f"{status}={count}" for status, count in sorted(statuses.items()))
+        print(f"{progress_label}: {done_count}/{len(jobs)} couples nom/IP terminés; "
+              f"{len(futures)} actifs; {queued} en attente; {done_count / elapsed:.2f}/s; "
+              f"{summary}.", flush=True)
+
+    def execute(target: dict, endpoint: dict) -> dict:
+        attempts = list(endpoint.get("attempts", []))
+        if len(attempts) >= max_attempts:
+            endpoint.update(status="FAILED", error="ATTEMPT_LIMIT_REACHED", finished_at=utcnow())
+            ledger.append("endpoint", endpoint["task_id"], dict(endpoint))
+            return dict(endpoint)
+        attempt = {"number": len(attempts) + 1, "status": "RUNNING",
+                   "started_at": utcnow(), "finished_at": None, "error": None}
+        attempts.append(attempt)
+        endpoint.update(status="RUNNING", started_at=attempt["started_at"], finished_at=None,
+                        error=None, returncode=None, attempts=attempts)
+        ledger.append("endpoint", endpoint["task_id"], dict(endpoint))
+        try:
+            result = control.run(endpoint["command"], endpoint, output, timeout)
+        except Exception as exc:
+            result = {**endpoint, "status": "FAILED", "returncode": None,
+                      "error": f"RUNNER_ERROR: {type(exc).__name__}", "finished_at": utcnow()}
+        attempt.update(status=result.get("status", "FAILED"), finished_at=result.get("finished_at") or utcnow(),
+                       error=result.get("error"), returncode=result.get("returncode"))
+        result["attempts"] = attempts
+        ledger.append("endpoint", endpoint["task_id"], result)
+        return result
+
+    def mark_interrupted(endpoint: dict) -> None:
+        attempts = list(endpoint.get("attempts", []))
+        if attempts and attempts[-1].get("status") == "RUNNING":
+            attempts[-1].update(status="INTERRUPTED", finished_at=utcnow(),
+                                error="CAMPAIGN_INTERRUPTED")
+        endpoint.update(status="INTERRUPTED", error="CAMPAIGN_INTERRUPTED",
+                        finished_at=utcnow(), attempts=attempts)
+        ledger.append("endpoint", endpoint["task_id"], dict(endpoint))
+
+    def submit_available(executor) -> None:
+        nonlocal ip_order, max_submitted
+        while len(futures) < workers and ip_order:
+            submitted = False
+            for _ in range(len(ip_order)):
+                ip = ip_order.popleft()
+                queue = queues[ip]
+                if queue and active_by_ip[ip] < workers_per_ip:
+                    target, endpoint = queue.popleft()
+                    active_by_ip[ip] += 1
+                    future = executor.submit(execute, target, endpoint)
+                    futures[future] = (target, endpoint, ip)
+                    max_submitted = max(max_submitted, len(futures))
+                    submitted = True
+                if queue:
+                    ip_order.append(ip)
+                if len(futures) >= workers:
+                    break
+            if not submitted:
+                break
+
+    executor = ThreadPoolExecutor(max_workers=workers)
+    try:
+        write_progress()
+        submit_available(executor)
+        last_progress = time.monotonic()
+        while futures:
+            completed, _ = wait(tuple(futures), timeout=1, return_when=FIRST_COMPLETED)
+            for future in completed:
+                target, endpoint, ip = futures.pop(future)
+                active_by_ip[ip] -= 1
+                try:
+                    endpoint.update(future.result())
+                except KeyboardInterrupt:
+                    mark_interrupted(endpoint)
+                    raise
+                except Exception as exc:
+                    endpoint.update(status="FAILED", error=f"RUNNER_ERROR: {type(exc).__name__}",
+                                    finished_at=utcnow())
+                    ledger.append("endpoint", endpoint["task_id"], dict(endpoint))
+                done_count += 1
+                if endpoint.get("status") == "COMPLETED" and endpoint.get("returncode") == 0:
+                    try:
+                        rows = parse_report(_campaign_file(output, endpoint.get("xml"), ".xml"))
+                        for row in rows:
+                            row["hostname"] = target["hostname"]
+                        if any(row["vulnerable"] == "OUI" for row in compact_rows(rows)):
+                            positive_targets.add(target["hostname"])
+                    except (InputError, ReportError):
+                        pass
+                if done_count % progress_interval == 0 or done_count == len(jobs):
+                    print_progress()
+                    write_progress()
+            submit_available(executor)
+            if time.monotonic() - last_progress >= 30:
+                print_progress()
+                write_progress()
+                last_progress = time.monotonic()
+    except KeyboardInterrupt:
+        interrupted = True
+        control.stop()
+    finally:
+        if interrupted:
+            for future in futures:
+                future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        if interrupted:
+            for future, (_, endpoint, _) in futures.items():
+                if not future.cancelled() and future.done():
+                    try:
+                        endpoint.update(future.result())
+                        done_count += 1
+                        continue
+                    except BaseException:
+                        pass
+                mark_interrupted(endpoint)
+            for queue in queues.values():
+                for _, endpoint in queue:
+                    mark_interrupted(endpoint)
+            write_progress()
+    if measurements is not None:
+        elapsed = max(time.monotonic() - started_at, 0.0)
+        measurements.update({
+            "tasks_total": len(jobs), "tasks_completed": done_count,
+            "max_submitted_unfinished": max_submitted,
+            "elapsed_seconds": round(elapsed, 3),
+            "throughput_tasks_per_second": round(done_count / elapsed, 3) if elapsed else None,
+            "status_counts": current_statuses(),
+        })
+    return interrupted, done_count
 
 
 class Processes:
@@ -856,7 +1159,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--scope", type=Path, help="Domaines autorises, sous-domaines inclus")
     discovery_flags.add_argument("--discover-subdomains", type=Path, metavar="ROOTS_FILE", help="Compatibilite : utiliser un fichier de racines distinct a la place de DOMAINES --discover")
     result.add_argument("--discovery-timeout", type=bounded_int(1, 120), default=30, help="Delai total par requete crt.sh en secondes")
-    result.add_argument("--discovery-budget", type=bounded_int(1, 3600), default=300, help="Budget total de la phase de decouverte en secondes")
+    result.add_argument("--discovery-budget", type=bounded_int(1, 86400),
+                        help="Budget de cette session de découverte; automatique selon le nombre de racines")
     result.add_argument("--discovery-max-names", type=bounded_int(1, 100000), default=10000, help="Maximum de noms uniques issus de crt.sh par campagne")
     result.add_argument("--discovery-retries", type=bounded_int(0, 5), default=2,
                         help="Nouvelles tentatives pour les erreurs transitoires HTTP 502/503/504")
@@ -876,6 +1180,10 @@ def parser() -> argparse.ArgumentParser:
                         help="Laboratoire uniquement : autoriser les IP privées/réservées résolues")
     result.add_argument("--ports", help="Liste/ranges TCP explicites; remplace les ports du profil")
     result.add_argument("--workers", type=bounded_int(1, 32), default=4, help="Processus Nmap simultanes")
+    result.add_argument("--workers-per-ip", type=bounded_int(1, 32), default=2,
+                        help="Processus Nmap simultanés maximum vers une même adresse IP")
+    result.add_argument("--max-attempts", type=bounded_int(1, 10), default=3,
+                        help="Tentatives cumulées maximum par couple nom/IP lors des reprises")
     result.add_argument("--dns-timeout", type=bounded_int(1, 120), default=15, help="Delai DNS par domaine en secondes")
     result.add_argument("--target-timeout", type=bounded_int(1, 86400), default=900, help="Delai maximal par processus Nmap en secondes")
     result.add_argument("--max-rate", type=bounded_int(1, 100000), help="Plafond Nmap par processus (ne borne pas toutes les requetes HTTP)")
@@ -919,6 +1227,11 @@ def run_campaign(args) -> int:
     if len(paths) > 11:
         raise InputError("11 chemins maximum (chemin initial + 10 supplementaires); budget de requetes partage.")
     roots = read_discovery_roots(discovery_file)
+    discovery_budget_automatic = args.discovery_budget is None
+    if roots and args.discovery_budget is None:
+        args.discovery_budget = automatic_discovery_budget(len(roots))
+    elif args.discovery_budget is None:
+        args.discovery_budget = DISCOVERY_BUDGET_FLOOR
     rules = scope_rules(args.scope or discovery_file, args.exclude)
     for root, _ in roots:
         if not any(is_within(root, allowed) for allowed in rules["domains"]):
@@ -942,14 +1255,20 @@ def run_campaign(args) -> int:
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise InputError("Le dossier de sortie doit etre nouveau ou vide; aucun resultat ne sera ecrase.")
     output.mkdir(parents=True, exist_ok=True)
+    campaign_lock = CampaignLock(output)
+    campaign_lock.acquire()
+    ledger = EventLedger(output)
     (output / "raw").mkdir(exist_ok=True)
+    metrics = {"discovery_seconds": 0.0, "dns_seconds": 0.0, "nmap_seconds": 0.0,
+               "report_seconds": 0.0}
     families = ["ipv4", "ipv6"] if args.families == "both" else [args.families]
     manifest = {"schema_version": "1", "tool_version": VERSION, "campaign_id": campaign_id,
                 "started_at": utcnow(), "finished_at": None, "status": "PLANNED", "profile": args.profile,
                 "ports": default_ports, "address_families": families, "scope": rules,
                 "http": {"paths": [public_path(path) for path in paths], "max_requests": args.max_requests, "budget_ms": args.http_budget,
                          "timeout_ms": args.http_timeout, "redirects": args.redirects, "samples": args.samples},
-                "limits": {"workers": args.workers, "target_timeout_seconds": args.target_timeout,
+                "limits": {"workers": args.workers, "workers_per_ip": args.workers_per_ip,
+                           "max_attempts": args.max_attempts, "target_timeout_seconds": args.target_timeout,
                            "dns_timeout_seconds": args.dns_timeout, "nmap_max_rate": args.max_rate},
                 "targets": targets, "excluded_candidates": excluded, "inputs": []}
     for path in [args.targets, args.scope, args.discover_subdomains, args.exclude, args.paths_file, args.inventory, args.previous, *args.discover_from]:
@@ -966,6 +1285,10 @@ def run_campaign(args) -> int:
     resolution_interrupted = False
     discovery_incomplete = False
     if roots:
+        phase_started = time.monotonic()
+        budget_mode = "automatique" if discovery_budget_automatic else "explicite"
+        print(f"Budget de découverte {budget_mode}: {args.discovery_budget}s pour {len(roots)} racines.",
+              flush=True)
         manifest["discovery"] = {"schema_version": "1", "enabled": True, "mode": "passive", "source": "crt.sh",
             "roots": [name for name, _ in roots], "queries": [], "skipped_roots": [],
             "started_at": utcnow(), "finished_at": None, "status": "RUNNING",
@@ -973,6 +1296,7 @@ def run_campaign(args) -> int:
             "candidates": [], "candidates_count": 0, "retained_count": 0,
             "resolved_count": 0, "unresolved_count": 0,
             "limits": {"timeout_seconds": args.discovery_timeout, "budget_seconds": args.discovery_budget,
+                       "budget_automatic": discovery_budget_automatic,
                        "max_names": args.discovery_max_names, "max_response_bytes": DISCOVERY_RESPONSE_BYTES,
                        "max_roots": MAX_DISCOVERY_ROOTS, "retries": args.discovery_retries,
                        "backoff_seconds": args.discovery_backoff_seconds,
@@ -985,7 +1309,8 @@ def run_campaign(args) -> int:
         try:
             persist_discovery(output, manifest)
             (output / "discovered.txt").write_text("", encoding="utf-8")
-            candidates, source_rejected, resolution_interrupted = run_discovery(args, roots, rules, output, manifest)
+            candidates, source_rejected, resolution_interrupted = run_discovery(
+                args, roots, rules, output, manifest, ledger)
             excluded.extend(source_rejected)
             targets = merge_discovered_targets(targets, excluded, candidates, rules)
             manifest["targets"] = targets
@@ -1009,22 +1334,18 @@ def run_campaign(args) -> int:
             print("Interruption de la decouverte; conservation du bilan partiel.", file=sys.stderr)
         discovery_incomplete = not manifest["discovery"]["processing_complete"]
         print(f"Decouverte: {manifest['discovery']['status']}; {manifest['discovery']['retained_count']} noms retenus; couverture non exhaustive.", flush=True)
+        print_discovery_progress(manifest["discovery"])
         print(f"Noms decouverts: {output / 'discovered.txt'}", flush=True)
+        metrics["discovery_seconds"] = round(time.monotonic() - phase_started, 3)
     (output / "targets.txt").write_text("\n".join(item["hostname"] for item in targets) + ("\n" if targets else ""), encoding="utf-8")
     atomic_json(output / "manifest.json", manifest)
+    phase_started = time.monotonic()
     if not resolution_interrupted:
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            resolutions = {executor.submit(resolve_target, target["hostname"], families, args.dns_timeout,
-                                             args.allow_non_global): target
-                           for target in targets}
-            try:
-                for future in as_completed(resolutions):
-                    resolutions[future].update(future.result())
-            except KeyboardInterrupt:
-                resolution_interrupted = True
-                print("Interruption de la resolution DNS; conservation du bilan partiel.", file=sys.stderr)
-                for future in resolutions:
-                    future.cancel()
+        resolution_interrupted = resolve_targets_bounded(
+            targets, families, args.dns_timeout, args.allow_non_global, args.workers, ledger)
+        if resolution_interrupted:
+            print("Interruption de la resolution DNS; conservation du bilan partiel.", file=sys.stderr)
+    metrics["dns_seconds"] = round(time.monotonic() - phase_started, 3)
     if resolution_interrupted:
         for target in targets:
             if target["dns_status"] == "NOT_RESOLVED":
@@ -1050,7 +1371,10 @@ def run_campaign(args) -> int:
             endpoint = {"ip": address, "family": "ipv4" if ipaddress.ip_address(address).version == 4 else "ipv6",
                         "status": "PLANNED", "ports": selected_ports, "xml": stem + ".xml",
                         "stdout": stem + ".stdout.log", "stderr": stem + ".stderr.log",
-                        "started_at": None, "finished_at": None, "returncode": None}
+                        "started_at": None, "finished_at": None, "returncode": None,
+                        "attempts": []}
+            endpoint["task_id"] = endpoint_task_id(
+                target["hostname"], endpoint, target["requested_paths"], manifest["http"])
             arguments = output / (stem + ".args")
             with os.fdopen(os.open(arguments, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as stream:
                 stream.write(nse_arguments(target["hostname"], target_paths, args))
@@ -1067,56 +1391,33 @@ def run_campaign(args) -> int:
         if discovery_incomplete or resolution_interrupted:
             manifest["status"] = "PARTIAL"
         atomic_json(output / "manifest.json", manifest)
+        campaign_lock.release()
         return 130 if resolution_interrupted else 2 if discovery_incomplete else 0
     manifest["status"] = "RUNNING"
     atomic_json(output / "manifest.json", manifest)
     control, interrupted = Processes(), resolution_interrupted
-    executor = ThreadPoolExecutor(max_workers=args.workers)
-    futures = {}
-    try:
-        for target, endpoint in jobs if not resolution_interrupted else []:
-            endpoint["status"] = "RUNNING"
-            futures[executor.submit(control.run, endpoint["command"], endpoint, output, args.target_timeout)] = endpoint
-        atomic_json(output / "manifest.json", manifest)
-        pending, done_count, last_progress = set(futures), 0, time.monotonic()
-        while pending:
-            ready = [future for future in pending if future.done()]
-            for future in ready:
-                original = futures[future]
-                try:
-                    original.update(future.result())
-                except Exception as exc:
-                    original.update(status="FAILED", error=f"RUNNER_ERROR: {type(exc).__name__}", finished_at=utcnow())
-                pending.remove(future)
-                done_count += 1
-                atomic_json(output / "manifest.json", manifest)
-                print(f"[{done_count}/{len(jobs)}] {original['ip']} {original['status']}", flush=True)
-            if time.monotonic() - last_progress >= 30:
-                print(f"Progression: {done_count}/{len(jobs)} cibles terminees; {len(pending)} en attente/en cours.", flush=True)
-                last_progress = time.monotonic()
-            if pending:
-                time.sleep(0.2)
-    except KeyboardInterrupt:
-        interrupted = True
-        print("Interruption: arret des processus et conservation du bilan partiel.", file=sys.stderr, flush=True)
-        control.stop()
-    finally:
-        executor.shutdown(wait=True, cancel_futures=True)
-        for future, endpoint in futures.items():
-            if future.cancelled():
-                endpoint.update(status="SKIPPED", error="CAMPAIGN_INTERRUPTED", finished_at=utcnow())
-            elif future.done():
-                try:
-                    endpoint.update(future.result())
-                except Exception:
-                    endpoint.update(status="FAILED", error="RUNNER_ERROR", finished_at=utcnow())
-        for arguments in (output / "raw").glob("*.args"):
-            arguments.unlink()
+    phase_started = time.monotonic()
+    scheduler_metrics = {}
+    if not resolution_interrupted:
+        interrupted, _ = run_endpoint_jobs(
+            jobs, workers=args.workers, workers_per_ip=min(args.workers_per_ip, args.workers),
+            control=control, output=output, timeout=args.target_timeout, ledger=ledger,
+            max_attempts=args.max_attempts, measurements=scheduler_metrics)
+        if interrupted:
+            print("Interruption: arrêt des processus et conservation du bilan partiel.",
+                  file=sys.stderr, flush=True)
+    for arguments in (output / "raw").glob("*.args"):
+        arguments.unlink()
+    metrics["nmap_seconds"] = round(time.monotonic() - phase_started, 3)
+    metrics["scheduler"] = scheduler_metrics
     failures = discovery_incomplete or any(item["dns_status"] != "RESOLVED" or item.get("dns_partial") for item in targets) or any(
         endpoint["status"] != "COMPLETED" for _, endpoint in jobs)
     manifest["status"] = "PARTIAL" if failures or interrupted else "COMPLETED"
     manifest["finished_at"] = utcnow()
+    manifest["metrics"] = {**metrics, "state_events": ledger.events_written,
+                           "state_bytes_written": ledger.bytes_written}
     atomic_json(output / "manifest.json", manifest)
+    phase_started = time.monotonic()
     report = build_campaign_report(manifest, output, inventory=args.inventory, previous=args.previous,
                                    max_inventory_age_hours=args.inventory_max_age_hours)
     if not report["summary"].get("processing_complete", True):
@@ -1125,6 +1426,13 @@ def run_campaign(args) -> int:
         report["campaign"]["status"] = "PARTIAL"
         failures = True
     write_campaign_report(report, output)
+    atomic_json(output / "progress.json", {
+        "schema_version": "1", "provisional": False, "updated_at": utcnow(),
+        "campaign_status": manifest["status"], "report": "report.json",
+    })
+    metrics["report_seconds"] = round(time.monotonic() - phase_started, 3)
+    manifest["metrics"].update(metrics)
+    atomic_json(output / "manifest.json", manifest)
     summary = report["summary"]
     print(f"Domaines: {summary.get('targets_total', len(targets))} retenus, "
           f"{summary.get('targets_resolved', 0)} resolus, {summary.get('targets_attempted', 0)} tentes, "
@@ -1137,6 +1445,7 @@ def run_campaign(args) -> int:
     if args.previous:
         print(f"Comparaison: {output / 'changes.csv'}")
     print("OUI/NON selon les versions observees ou les preuves serveur; INDETERMINE si la conclusion reste impossible.")
+    campaign_lock.release()
     return 130 if interrupted else 2 if failures else 0
 
 
@@ -1153,12 +1462,19 @@ def _campaign_file(base: Path, relative: object, suffix: str | None = None) -> P
     return candidate
 
 
-def _completed_endpoint_is_reusable(output: Path, endpoint: dict) -> bool:
+def _completed_endpoint_is_reusable(output: Path, endpoint: dict, expected_hostname: str | None = None) -> bool:
     if endpoint.get("status") != "COMPLETED" or endpoint.get("returncode") != 0:
         return False
     try:
         xml = _campaign_file(output, endpoint.get("xml"), ".xml")
-        parse_report(xml)
+        rows = parse_report(xml)
+        if not rows or any(row.get("ip") != endpoint.get("ip") for row in rows):
+            return False
+        if expected_hostname and any(
+                row.get("row_type") == "ASSESSMENT"
+                and row.get("hostname") not in ("", expected_hostname, endpoint.get("ip"))
+                for row in rows):
+            return False
         return True
     except (InputError, ReportError):
         return False
@@ -1169,15 +1485,16 @@ def resume_campaign(args) -> int:
     if args.targets or args.discover or args.discover_subdomains or args.discover_from or args.output:
         raise InputError("--resume s'utilise seul, avec seulement les options d'execution/inventaire necessaires.")
     output = args.resume.resolve()
+    campaign_lock = CampaignLock(output)
+    campaign_lock.acquire()
+    ledger = EventLedger(output)
     manifest_path = output / "manifest.json"
-    try:
-        manifest = json.loads(read_text(manifest_path, MAX_MANIFEST_BYTES))
-    except (json.JSONDecodeError, RecursionError) as exc:
-        raise InputError("Manifeste de reprise JSON invalide.") from exc
+    manifest = read_manifest(manifest_path)
     if (not isinstance(manifest, dict) or str(manifest.get("schema_version")) != "1"
             or not isinstance(manifest.get("targets"), list)
             or not isinstance(manifest.get("http"), dict)):
         raise InputError("Manifeste de reprise invalide.")
+    manifest = ledger.replay(manifest)
     nmap = shutil.which(args.nmap)
     if not nmap:
         raise InputError("Nmap est introuvable. Installez Nmap ou renseignez --nmap.")
@@ -1190,13 +1507,99 @@ def resume_campaign(args) -> int:
         args.samples = int(http["samples"])
     except (KeyError, TypeError, ValueError) as exc:
         raise InputError("Parametres HTTP absents ou invalides dans le manifeste de reprise.") from exc
-    jobs = []
+    default_raw_paths = http.get("paths") or ["/"]
+    if (not isinstance(default_raw_paths, list) or not default_raw_paths
+            or any("?[redacted]" in str(path) for path in default_raw_paths)):
+        raise InputError("Paramètres HTTP expurgés ou invalides; lancer une nouvelle campagne avec les chemins complets.")
+    for path in default_raw_paths:
+        valid_path(path)
+
+    discovery_interrupted = False
+    discovery = manifest.get("discovery")
+    if isinstance(discovery, dict) and discovery.get("enabled") and not discovery.get("processing_complete"):
+        roots = [(hostname(root), "resume") for root in discovery.get("roots", [])]
+        rules = manifest.get("scope")
+        if not roots or not isinstance(rules, dict):
+            raise InputError("État de découverte incomplet ou invalide dans la campagne.")
+        limits = discovery.get("limits", {})
+        args.discovery_timeout = int(limits.get("timeout_seconds", args.discovery_timeout))
+        args.discovery_max_names = int(limits.get("max_names", args.discovery_max_names))
+        args.discovery_retries = int(limits.get("retries", args.discovery_retries))
+        args.discovery_backoff_seconds = int(limits.get("backoff_seconds", args.discovery_backoff_seconds))
+        args.discovery_cache_ttl_minutes = int(limits.get("cache_ttl_minutes", args.discovery_cache_ttl_minutes))
+        args.discovery_cache_max_age_hours = int(
+            limits.get("cache_max_age_hours", args.discovery_cache_max_age_hours))
+        completed = {query.get("root") for query in discovery.get("queries", [])
+                     if isinstance(query, dict) and query.get("status") == "COMPLETED"
+                     and query.get("processing_complete") is True}
+        remaining_roots = max(1, len(roots) - len(completed))
+        if args.discovery_budget is None:
+            args.discovery_budget = automatic_discovery_budget(remaining_roots)
+        print(f"Reprise de la découverte: {remaining_roots} racines restantes; "
+              f"nouveau budget de session {args.discovery_budget}s.", flush=True)
+        candidates, source_rejected, discovery_interrupted = run_discovery(
+            args, roots, rules, output, manifest, ledger)
+        print_discovery_progress(manifest["discovery"])
+        excluded = manifest.setdefault("excluded_candidates", [])
+        excluded.extend(source_rejected)
+        manifest["targets"] = merge_discovered_targets(
+            manifest["targets"], excluded, candidates, rules)
+        for target in manifest["targets"]:
+            target.setdefault("requested_paths", list(default_raw_paths))
+        record_discovered_targets(output, manifest, manifest["targets"])
+
+    families = manifest.get("address_families")
+    if (not isinstance(families, list) or not families
+            or any(family not in ("ipv4", "ipv6") for family in families)):
+        raise InputError("Familles IP absentes ou invalides dans le manifeste de reprise.")
+    for target in manifest["targets"]:
+        if target.get("dns_status") in ("NOT_RESOLVED", "RUNNING", "DNS_ERROR"):
+            target.update(dns_status="NOT_RESOLVED", addresses=[])
+    if not discovery_interrupted:
+        dns_interrupted = resolve_targets_bounded(
+            manifest["targets"], families, args.dns_timeout, args.allow_non_global,
+            args.workers, ledger)
+    else:
+        dns_interrupted = True
+
+    existing_numbers = []
+    for target in manifest["targets"]:
+        for endpoint in target.get("endpoints", []):
+            match = re.fullmatch(r"raw/(\d+)\.xml", str(endpoint.get("xml", "")))
+            if match:
+                existing_numbers.append(int(match.group(1)))
+    next_number = max(existing_numbers, default=0)
+    for target in manifest["targets"]:
+        paths_for_target = target.get("requested_paths") or default_raw_paths
+        if (not isinstance(paths_for_target, list) or not paths_for_target
+                or any("?[redacted]" in str(path) for path in paths_for_target)):
+            raise InputError(f"{target.get('hostname')}: paramètres HTTP expurgés; lancer une nouvelle campagne.")
+        target["requested_paths"] = [public_path(valid_path(path)) for path in paths_for_target]
+        existing_ips = {endpoint.get("ip") for endpoint in target.get("endpoints", [])
+                        if isinstance(endpoint, dict)}
+        for address_text in target.get("addresses", []):
+            if address_text in existing_ips:
+                continue
+            next_number += 1
+            address = ipaddress.ip_address(address_text)
+            stem = f"raw/{next_number:06d}"
+            endpoint = {
+                "ip": str(address), "family": "ipv4" if address.version == 4 else "ipv6",
+                "status": "PLANNED", "ports": port_expression(str(manifest.get("ports") or "1-65535")),
+                "xml": stem + ".xml", "stdout": stem + ".stdout.log", "stderr": stem + ".stderr.log",
+                "started_at": None, "finished_at": None, "returncode": None, "attempts": [],
+            }
+            endpoint["task_id"] = endpoint_task_id(
+                target["hostname"], endpoint, target["requested_paths"], http)
+            target.setdefault("endpoints", []).append(endpoint)
+    atomic_json(manifest_path, manifest)
+    jobs: list[tuple[dict, dict]] = []
     reusable = 0
     for target in manifest["targets"]:
         if not isinstance(target, dict) or not isinstance(target.get("hostname"), str):
             raise InputError("Cible invalide dans le manifeste de reprise.")
         name = hostname(target["hostname"])
-        raw_paths = target.get("requested_paths") or http.get("paths") or ["/"]
+        raw_paths = target.get("requested_paths") or default_raw_paths
         if not isinstance(raw_paths, list) or not raw_paths:
             raise InputError(f"{name}: chemins de reprise invalides.")
         if any("?[redacted]" in str(path) for path in raw_paths):
@@ -1216,8 +1619,22 @@ def resume_campaign(args) -> int:
                 if str(address) not in excluded:
                     excluded.append(str(address))
                 continue
-            if _completed_endpoint_is_reusable(output, endpoint):
+            endpoint["family"] = "ipv4" if address.version == 4 else "ipv6"
+            endpoint["ports"] = port_expression(str(endpoint.get("ports") or manifest.get("ports") or "1-65535"))
+            expected_task_id = endpoint_task_id(name, endpoint, target.get("requested_paths") or raw_paths, http)
+            if endpoint.get("task_id") not in (None, expected_task_id):
+                raise InputError(f"{name}: identité de tâche incompatible dans le manifeste de reprise.")
+            endpoint["task_id"] = expected_task_id
+            if endpoint.get("status") == "RUNNING":
+                endpoint.update(status="INTERRUPTED", error="PREVIOUS_PROCESS_STOPPED",
+                                finished_at=utcnow())
+                ledger.append("endpoint", endpoint["task_id"], dict(endpoint))
+            if _completed_endpoint_is_reusable(output, endpoint, name):
                 reusable += 1
+                continue
+            if len(endpoint.get("attempts", [])) >= args.max_attempts:
+                endpoint.update(status="FAILED", error="ATTEMPT_LIMIT_REACHED", finished_at=utcnow())
+                ledger.append("endpoint", endpoint["task_id"], dict(endpoint))
                 continue
             xml = _campaign_file(output, endpoint.get("xml"), ".xml")
             stdout = _campaign_file(output, endpoint.get("stdout"))
@@ -1227,13 +1644,11 @@ def resume_campaign(args) -> int:
             with os.fdopen(os.open(arguments, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
                            "w", encoding="utf-8") as stream:
                 stream.write(nse_arguments(name, paths, args))
-            endpoint["family"] = "ipv4" if address.version == 4 else "ipv6"
-            endpoint["ports"] = port_expression(str(endpoint.get("ports") or manifest.get("ports") or "1-65535"))
             endpoint["stdout"] = str(stdout.relative_to(output))
             endpoint["stderr"] = str(stderr.relative_to(output))
             endpoint["command"] = command_for(nmap, endpoint, arguments, xml.with_suffix(""), args)
-            endpoint.update(status="RUNNING", error=None, started_at=None, finished_at=None, returncode=None)
-            jobs.append(endpoint)
+            endpoint.update(status="PLANNED", error=None, started_at=None, finished_at=None, returncode=None)
+            jobs.append((target, endpoint))
     resumed = {"started_at": utcnow(), "finished_at": None,
                "reused_endpoints": reusable, "retried_endpoints": len(jobs)}
     manifest.setdefault("resumes", []).append(resumed)
@@ -1241,59 +1656,30 @@ def resume_campaign(args) -> int:
     atomic_json(manifest_path, manifest)
     print(f"Reprise {manifest.get('campaign_id', output.name)}: {reusable} endpoints valides reutilises; "
           f"{len(jobs)} a relancer.", flush=True)
-    control, interrupted = Processes(), False
-    executor = ThreadPoolExecutor(max_workers=args.workers)
-    futures = {}
-    try:
-        for endpoint in jobs:
-            futures[executor.submit(control.run, endpoint["command"], endpoint,
-                                    output, args.target_timeout)] = endpoint
-        pending, done_count, last_progress = set(futures), 0, time.monotonic()
-        while pending:
-            ready = [future for future in pending if future.done()]
-            for future in ready:
-                endpoint = futures[future]
-                try:
-                    endpoint.update(future.result())
-                except Exception as exc:
-                    endpoint.update(status="FAILED", error=f"RUNNER_ERROR: {type(exc).__name__}",
-                                    finished_at=utcnow())
-                pending.remove(future)
-                done_count += 1
-                atomic_json(manifest_path, manifest)
-                print(f"[{done_count}/{len(jobs)}] {endpoint['ip']} {endpoint['status']}", flush=True)
-            if time.monotonic() - last_progress >= 30:
-                print(f"Progression reprise: {done_count}/{len(jobs)} termines; {len(pending)} en attente/en cours.",
-                      flush=True)
-                last_progress = time.monotonic()
-            if pending:
-                time.sleep(0.2)
-    except KeyboardInterrupt:
-        interrupted = True
+    control, interrupted = Processes(), dns_interrupted
+    scheduler_metrics = {}
+    if jobs and not interrupted:
+        interrupted, _ = run_endpoint_jobs(
+            jobs, workers=args.workers, workers_per_ip=min(args.workers_per_ip, args.workers),
+            control=control, output=output, timeout=args.target_timeout, ledger=ledger,
+            max_attempts=args.max_attempts, progress_label="Progression reprise",
+            measurements=scheduler_metrics)
+    if interrupted:
         print("Interruption de la reprise; conservation du bilan partiel.", file=sys.stderr, flush=True)
-        control.stop()
-    finally:
-        executor.shutdown(wait=True, cancel_futures=True)
-        for future, endpoint in futures.items():
-            if future.cancelled():
-                endpoint.update(status="SKIPPED", error="CAMPAIGN_INTERRUPTED", finished_at=utcnow())
-            elif future.done():
-                try:
-                    endpoint.update(future.result())
-                except Exception:
-                    endpoint.update(status="FAILED", error="RUNNER_ERROR", finished_at=utcnow())
-        for arguments in (output / "raw").glob("*.args"):
-            arguments.unlink()
-    all_endpoints = [endpoint for target in manifest["targets"] for endpoint in target.get("endpoints", [])]
+    for arguments in (output / "raw").glob("*.args"):
+        arguments.unlink()
     discovery_incomplete = bool(manifest.get("discovery", {}).get("enabled")
                                 and not manifest["discovery"].get("processing_complete"))
     failures = (discovery_incomplete
                 or any(target.get("dns_status") != "RESOLVED" or target.get("dns_partial")
                        for target in manifest["targets"])
-                or any(not _completed_endpoint_is_reusable(output, endpoint) for endpoint in all_endpoints))
+                or any(not _completed_endpoint_is_reusable(
+                    output, endpoint, target["hostname"])
+                    for target in manifest["targets"] for endpoint in target.get("endpoints", [])))
     manifest["status"] = "PARTIAL" if failures or interrupted else "COMPLETED"
     manifest["finished_at"] = utcnow()
     resumed["finished_at"] = manifest["finished_at"]
+    resumed["scheduler"] = scheduler_metrics
     atomic_json(manifest_path, manifest)
     report = build_campaign_report(manifest, output, inventory=args.inventory, previous=args.previous,
                                    max_inventory_age_hours=args.inventory_max_age_hours)
@@ -1303,11 +1689,16 @@ def resume_campaign(args) -> int:
         report["campaign"]["status"] = "PARTIAL"
         failures = True
     write_campaign_report(report, output)
+    atomic_json(output / "progress.json", {
+        "schema_version": "1", "provisional": False, "updated_at": utcnow(),
+        "campaign_status": manifest["status"], "report": "report.json",
+    })
     results = compact_rows(report["rows"])
     print(f"Reprise terminee: " + ", ".join(
         f"{verdict}={sum(row['vulnerable'] == verdict for row in results)}"
         for verdict in ("OUI", "NON", "INDETERMINE")))
     print(f"Rapports: {output / 'report.csv'} et {output / 'report.json'}")
+    campaign_lock.release()
     return 130 if interrupted else 2 if failures else 0
 
 
@@ -1315,7 +1706,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         return resume_campaign(args) if args.resume else run_campaign(args)
-    except (InputError, OSError, ValueError) as exc:
+    except (InputError, StateError, OSError, ValueError) as exc:
         print(f"Erreur: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

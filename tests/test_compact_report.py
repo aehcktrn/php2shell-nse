@@ -34,7 +34,7 @@ def coverage(hostname="app.example.com", *, code="SCAN_FAILED", ip="192.0.2.11",
 
 
 def details(rows):
-    return {"schema_version": "1", "tool_version": "0.4.1", "rows": rows,
+    return {"schema_version": "1", "tool_version": "0.5.0", "rows": rows,
             "campaign": {"campaign_id": "fixture"}, "changes": [], "summary": {"processing_complete": True}}
 
 
@@ -112,7 +112,9 @@ class CompactReportTests(unittest.TestCase):
                     redirect,
                     assessment(port="443", scheme="https", state=destination_state, version=version,
                                reason_code=("FIXED_VERSION_ADVERTISED" if expected == "NON"
-                                            else "AFFECTED_VERSION_ADVERTISED")),
+                                            else "AFFECTED_VERSION_ADVERTISED"),
+                               observations=[{"path": "/", "state": destination_state,
+                                              "versions": [version]}]),
                 )
                 self.assertEqual(result["vulnerable"], expected)
                 self.assertTrue(result["explication"].startswith("Ports évalués : 80,443."))
@@ -136,6 +138,73 @@ class CompactReportTests(unittest.TestCase):
         self.assertEqual(result["vulnerable"], "INDETERMINE")
         self.assertIn("HORS PÉRIMÈTRE DU CONTRÔLE", result["explication"])
         self.assertIn("https://other.example.com/", result["explication"])
+
+    def test_redirect_requires_the_exact_destination_path(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://app.example.com/legacy/index.php"}],
+        )
+        destination = assessment(
+            port="443", scheme="https",
+            observations=[{"path": "/", "state": "PATCHED_VERSION_ADVERTISED",
+                           "versions": ["8.3.36"]}],
+        )
+        self.assertEqual(self.compact(redirect, destination)["vulnerable"], "INDETERMINE")
+        destination["observations"].append(
+            {"path": "/legacy/index.php", "state": "PATCHED_VERSION_ADVERTISED",
+             "versions": ["8.3.36"]})
+        self.assertEqual(self.compact(redirect, destination)["vulnerable"], "NON")
+
+    def test_redacted_redirect_parameters_never_prove_path_identity(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://app.example.com/login?[redacted]"}],
+        )
+        destination = assessment(
+            port="443", scheme="https",
+            observations=[{"path": "/login?[redacted]", "state": "PATCHED_VERSION_ADVERTISED",
+                           "versions": ["8.3.36"]}],
+        )
+        self.assertEqual(self.compact(redirect, destination)["vulnerable"], "INDETERMINE")
+
+    def test_every_redirect_destination_must_be_assessed(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[
+                {"reason_code": "REDIRECT_NOT_ASSESSED",
+                 "redirect_to": "https://app.example.com/covered"},
+                {"reason_code": "REDIRECT_NOT_ASSESSED",
+                 "redirect_to": "https://app.example.com/missing"},
+            ],
+        )
+        destination = assessment(
+            port="443", scheme="https",
+            observations=[{"path": "/covered", "state": "PATCHED_VERSION_ADVERTISED",
+                           "versions": ["8.3.36"]}],
+        )
+        self.assertEqual(self.compact(redirect, destination)["vulnerable"], "INDETERMINE")
+
+    def test_covered_redirect_keeps_independent_inventory_evidence(self):
+        destination = assessment(
+            port="443", scheme="https",
+            observations=[{"path": "/", "state": "PATCHED_VERSION_ADVERTISED",
+                           "versions": ["8.3.36"]}],
+        )
+        for proof, expected in (("PATCH_MISSING_CONFIRMED", "OUI"), ("CONFLICT", "INDETERMINE")):
+            with self.subTest(proof=proof):
+                redirect = assessment(
+                    port="80", state="UNKNOWN", version="", service="http", scheme="http",
+                    reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+                    inventory_patch_status=proof,
+                    observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
+                                   "redirect_to": "https://app.example.com/"}],
+                )
+                self.assertEqual(self.compact(redirect, destination)["vulnerable"], expected)
 
     def test_unassessed_redirect_destinations_are_deduplicated_and_bounded(self):
         row = assessment(
@@ -166,12 +235,13 @@ class CompactReportTests(unittest.TestCase):
         self.assertIn("https://outside.example.net/", result["explication"])
 
     def test_old_compact_redirect_explanation_remains_accepted(self):
-        old = details([assessment(
+        old = {**details([assessment(
             state="UNKNOWN", version="", reason_code="REDIRECT_NOT_ASSESSED",
             observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
                            "redirect_to": "https://outside.example.net/"}],
-        )])
-        compact = report.compact_rows(old["rows"], include_redirect_destinations=False)
+        )]), "tool_version": "0.4.5"}
+        compact = report.compact_rows(
+            old["rows"], include_redirect_destinations=False, redirect_coverage="legacy")
         self.save("report.json", compact)
         self.save("raw/report-details.json", old)
         self.assertEqual(report.load_campaign_report(self.base / "report.json"), old)
@@ -470,6 +540,47 @@ class CompactReportTests(unittest.TestCase):
         with self.assertRaisesRegex(report.ReportError, "incohérent"):
             report.load_campaign_report(source)
 
+    def test_v043_compact_previous_accepts_its_port_aware_redirect_rendering(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://app.example.com/legacy"}],
+        )
+        destination = assessment(port="443", scheme="https")
+        old = {**details([redirect, destination]), "tool_version": "0.4.3"}
+        historical = report.compact_rows(
+            old["rows"], include_redirect_destinations=False, redirect_coverage="none")
+        self.assertEqual(historical[0]["vulnerable"], "INDETERMINE")
+        self.assertIn("80,443", historical[0]["explication"])
+        self.save("report.json", historical)
+        self.save("raw/report-details.json", old)
+        self.assertEqual(report.load_campaign_report(self.base / "report.json"), old)
+
+    def test_v044_false_non_redirect_report_remains_readable_but_recomputes_indeterminate(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://app.example.com/legacy/index.php"}],
+        )
+        destination = assessment(
+            port="443", scheme="https",
+            observations=[{"path": "/", "state": "PATCHED_VERSION_ADVERTISED",
+                           "versions": ["8.3.36"]}],
+        )
+        old = {**details([redirect, destination]), "tool_version": "0.4.4"}
+        historical = report.compact_rows(
+            old["rows"], include_redirect_destinations=False, redirect_coverage="legacy")
+        self.assertEqual(historical[0]["vulnerable"], "NON")
+        self.save("report.json", historical)
+        self.save("raw/report-details.json", old)
+        loaded = report.load_campaign_report(self.base / "report.json")
+        self.assertEqual(report.compact_rows(loaded["rows"])[0]["vulnerable"], "INDETERMINE")
+        self.save("report.json", report.compact_rows(old["rows"]))
+        with self.assertRaisesRegex(report.ReportError, "incohérent"):
+            report.load_campaign_report(self.base / "report.json")
+
     def test_current_compact_explanation_cannot_be_ignored_during_companion_validation(self):
         old = details([assessment(port="80"), assessment(port="443")])
         report.write_campaign_report(old, self.base)
@@ -521,15 +632,21 @@ class CompactReportTests(unittest.TestCase):
         discovery = details([coverage("", ip="", protocol="discovery")])
         self.assertEqual(report.load_campaign_report(self.save("discovery.json", discovery)), discovery)
 
-    def test_json_file_size_limits_apply_to_primary_and_companion(self):
-        source = self.save("report.json", report.compact_rows([assessment()]))
-        self.save("raw/report-details.json", {**details([assessment()]), "padding": "x" * 1000})
-        with patch.object(report, "MAX_REPORT_BYTES", 16):
-            with self.assertRaisesRegex(report.ReportError, "volumineux"):
-                report.load_campaign_report(source)
-        with patch.object(report, "MAX_REPORT_BYTES", source.stat().st_size):
-            with self.assertRaisesRegex(report.ReportError, "volumineux"):
-                report.load_campaign_report(source)
+    def test_report_larger_than_the_old_128_mib_limit_is_readable(self):
+        source = self.save("report.json", [])
+        companion = self.base / "raw" / "report-details.json"
+        companion.parent.mkdir(parents=True, exist_ok=True)
+        prefix = json.dumps(details([]), ensure_ascii=False)[:-1] + ', "padding": "'
+        with companion.open("w", encoding="utf-8") as stream:
+            stream.write(prefix)
+            chunk = "x" * (1024 * 1024)
+            for _ in range(129):
+                stream.write(chunk)
+            stream.write('"}')
+        self.assertGreater(companion.stat().st_size, 128 * 1024 * 1024)
+        loaded = report.load_campaign_report(source)
+        self.assertEqual(loaded["rows"], [])
+        self.assertEqual(len(loaded["padding"]), 129 * 1024 * 1024)
 
     def test_io_unicode_and_json_errors_are_report_errors(self):
         paths = [self.base / "missing.json", self.base / "invalid-utf8.json", self.base / "bad-json.json"]

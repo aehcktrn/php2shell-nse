@@ -60,6 +60,11 @@ class CampaignInputTests(unittest.TestCase):
             self.assertEqual(tuple(reader.fieldnames), fields)
             self.assertEqual(list(reader), compact)
 
+    def test_discovery_budget_scales_automatically_and_stays_bounded(self):
+        self.assertEqual(scan.automatic_discovery_budget(1), 300)
+        self.assertEqual(scan.automatic_discovery_budget(465), 3720)
+        self.assertEqual(scan.automatic_discovery_budget(1000), 7200)
+
     def test_single_file_runs_quick_scan_and_creates_results_without_setup(self):
         targets = self.file("domains.txt", "app.example.com\n")
 
@@ -141,6 +146,79 @@ class CampaignInputTests(unittest.TestCase):
         self.assertEqual(manifest["resumes"][-1]["retried_endpoints"], 1)
         compact = json.loads((output / "report.json").read_text())
         self.assertEqual((compact[0]["php"], compact[0]["vulnerable"]), ("8.3.36", "NON"))
+
+    def test_resume_reuses_valid_completion_but_retries_missing_or_wrong_xml(self):
+        targets = self.file("reuse-domains.txt", "app.example.com\n")
+
+        def public_resolution(*_args):
+            return {"dns_status": "RESOLVED", "addresses": ["93.184.216.34"],
+                    "dns_error": "", "dns_partial": False,
+                    "dns_families": {"ipv4": {"status": "RESOLVED",
+                                                 "addresses": ["93.184.216.34"]}}}
+
+        def completed(_command, endpoint, base, _timeout):
+            xml_file(base / endpoint["xml"], name="app.example.com", ip=endpoint["ip"],
+                     state="PATCHED_VERSION_ADVERTISED", version="8.3.36")
+            return {**endpoint, "status": "COMPLETED", "returncode": 0,
+                    "error": None, "finished_at": scan.utcnow()}
+
+        output = self.root / "reuse-campaign"
+        with patch.object(scan, "resolve_target", side_effect=public_resolution), \
+             patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan.Processes, "run", side_effect=completed):
+            self.assertEqual(scan.run_campaign(self.args(
+                targets, "--output", output, "--families", "ipv4", "--ports", "443")), 0)
+
+        with patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan.Processes, "run") as runner, redirect_stdout(io.StringIO()):
+            self.assertEqual(scan.resume_campaign(self.args("--resume", output)), 0)
+        runner.assert_not_called()
+
+        xml = next((output / "raw").glob("*.xml"))
+        xml.unlink()
+        with patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan.Processes, "run", side_effect=completed) as runner, \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(scan.resume_campaign(self.args(
+                "--resume", output, "--max-attempts", "10")), 0)
+        runner.assert_called_once()
+
+        xml.write_text("<nmaprun>", encoding="utf-8")
+        with patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan.Processes, "run", side_effect=completed) as runner, \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(scan.resume_campaign(self.args(
+                "--resume", output, "--max-attempts", "10")), 0)
+        runner.assert_called_once()
+
+        xml_file(xml, name="other.example.com", ip="93.184.216.34",
+                 state="PATCHED_VERSION_ADVERTISED", version="8.3.36")
+        with patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan.Processes, "run", side_effect=completed) as runner, \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(scan.resume_campaign(self.args(
+                "--resume", output, "--max-attempts", "10")), 0)
+        runner.assert_called_once()
+
+    def test_resume_rejects_changed_task_identity_before_network(self):
+        targets = self.file("identity-domains.txt", "app.example.com\n")
+        output = self.root / "identity-campaign"
+        with patch.object(scan, "resolve_target", side_effect=self.resolved), \
+             patch.object(scan.Processes, "run"), redirect_stdout(io.StringIO()):
+            self.assertEqual(scan.run_campaign(self.args(
+                targets, "--output", output, "--dry-run", "--ports", "443",
+                "--allow-non-global")), 0)
+        manifest_path = output / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["targets"][0]["endpoints"][0]["ports"] = "80"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan, "resolve_target") as resolver, \
+             patch.object(scan.Processes, "run") as runner, \
+             self.assertRaisesRegex(scan.InputError, "identité de tâche incompatible"):
+            scan.resume_campaign(self.args("--resume", output, "--allow-non-global"))
+        resolver.assert_not_called()
+        runner.assert_not_called()
 
     def test_explicit_profiles_and_custom_ports_still_control_the_plan(self):
         targets = self.file("domains.txt", "app.example.com\n")
@@ -445,9 +523,8 @@ class CampaignInputTests(unittest.TestCase):
     def test_dns_interruption_preserves_manifest_and_report(self):
         targets = self.file("domains.txt", "app.example.com")
         output = self.root / "interrupted"
-        with patch.object(scan, "resolve_target", side_effect=self.resolved), \
+        with patch.object(scan, "resolve_targets_bounded", return_value=True), \
              patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
-             patch.object(scan, "as_completed", side_effect=KeyboardInterrupt), \
              patch.object(scan.Processes, "run") as runner, redirect_stdout(io.StringIO()):
             code = scan.run_campaign(self.args(targets, "--output", output))
         self.assertEqual(code, 130)
