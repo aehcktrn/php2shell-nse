@@ -32,7 +32,7 @@ from report import (ReportError, build_campaign_report, compact_rows,
 from discovery import discover_root
 
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -798,6 +798,10 @@ def run_campaign(args) -> int:
     (output / "targets.txt").write_text("\n".join(item["hostname"] for item in targets) + "\n", encoding="utf-8")
     atomic_json(output / "manifest.json", manifest)
     print(f"Campagne {campaign_id}: profil {args.profile}; familles {', '.join(families)}.", flush=True)
+    if args.profile == "recheck" and not args.ports:
+        print(f"Ports TCP: selection par cible du rapport precedent; repli {default_ports}.", flush=True)
+    else:
+        print(f"Ports TCP demandes par cible: {default_ports}.", flush=True)
     print(f"Resultats: {output}", flush=True)
     resolution_interrupted = False
     discovery_incomplete = False

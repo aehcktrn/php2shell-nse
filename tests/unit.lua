@@ -36,6 +36,15 @@ local function flatten(value, into)
   return table.concat(into, " ")
 end
 
+local function load_script(modules)
+  local env = setmetatable({SCRIPT_NAME = "http-php2shell"}, {__index = _G})
+  env.require = function(name) return modules[name] or require(name) end
+  local chunk, load_error = loadfile(script_path, "t", env)
+  truthy(chunk, load_error)
+  chunk()
+  return env
+end
+
 local function run(response, args, host, port, clock)
   local calls = {}
   local modules = {
@@ -57,11 +66,7 @@ local function run(response, args, host, port, clock)
       format_output = function(_, value) return value end,
     },
   }
-  local env = setmetatable({SCRIPT_NAME = "http-php2shell"}, {__index = _G})
-  env.require = function(name) return modules[name] or require(name) end
-  local chunk, load_error = loadfile(script_path, "t", env)
-  truthy(chunk, load_error)
-  chunk()
+  local env = load_script(modules)
   local result, human = env.action(host or {ip = "127.0.0.1", targetname = "app.example.test"},
     port or {number = 443, protocol = "tcp", service = "https", state = "open"})
   truthy(type(result) == "table", "action must return a structured result")
@@ -101,6 +106,112 @@ local function test(name, fn)
     io.write("not ok - " .. name .. "\n  " .. tostring(err) .. "\n")
   end
 end
+
+local function port_rule(port, http_match, excluded)
+  local script = load_script({
+    http = {},
+    shortport = {http = function() return http_match or false end},
+    nmap = {port_is_excluded = function(number, protocol)
+      equal(number, port.number)
+      equal(protocol, "tcp")
+      return excluded or false
+    end},
+    stdnse = {},
+  })
+  return script.portrule({ip = "127.0.0.1"}, port)
+end
+
+for _, number in ipairs({80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9443}) do
+  test("open common web port assessed when unidentified: " .. number, function()
+    equal(port_rule({number = number, protocol = "tcp", state = "open",
+      service = "unknown", version = {service_dtype = "probed"}}), true)
+  end)
+end
+
+test("HTTP discovered on an arbitrary port preserves the Nmap rule", function()
+  equal(port_rule({number = 45678, protocol = "tcp", state = "open",
+    service = "http", version = {service_dtype = "probed"}}, true), true)
+end)
+
+test("unknown arbitrary port is not probed as HTTP", function()
+  equal(port_rule({number = 45678, protocol = "tcp", state = "open",
+    service = "unknown"}), false)
+end)
+
+test("probed non-web service on an added common port is not probed as HTTP", function()
+  for _, service in ipairs({"ssh", "cslistener", "smtp", "mysql"}) do
+    equal(port_rule({number = 9000, protocol = "tcp", state = "open",
+      service = service, version = {service_dtype = "probed"}}), false)
+  end
+end)
+
+test("service-table guesses do not suppress a common web port", function()
+  equal(port_rule({number = 9000, protocol = "tcp", state = "open",
+    service = "cslistener", version = {service_dtype = "table"}}), true)
+end)
+
+test("unspecified and incomplete service identification retains the fallback", function()
+  for _, service in ipairs({"", "unknown", "tcpwrapped", "ssl"}) do
+    equal(port_rule({number = 9443, protocol = "tcp", state = "open",
+      service = service, version = {service_dtype = "probed"}}), true)
+  end
+  equal(port_rule({number = 9443, protocol = "tcp", state = "open"}), true)
+end)
+
+test("version-table service name is honored when the outer name is absent", function()
+  equal(port_rule({number = 9000, protocol = "tcp", state = "open",
+    version = {name = "ssh", service_dtype = "probed"}}), false)
+end)
+
+test("common-port fallback respects version-probe exclusions", function()
+  equal(port_rule({number = 9000, protocol = "tcp", state = "open",
+    service = "unknown"}, false, true), false)
+end)
+
+test("closed filtered and non-TCP ports are never selected", function()
+  for _, state in ipairs({"closed", "filtered", "open|filtered"}) do
+    equal(port_rule({number = 80, protocol = "tcp", state = state}, true), false)
+    equal(port_rule({number = 9000, protocol = "tcp", state = state}), false)
+  end
+  equal(port_rule({number = 80, protocol = "udp", state = "open"}, true), false)
+  equal(port_rule({number = 9000, protocol = "udp", state = "open"}), false)
+end)
+
+test("success and exhausted budgets on one port never stop other ports", function()
+  local versions, calls = {[80] = "8.3.36", [443] = "8.3.35", [8443] = "8.4.27"}, {}
+  local script = load_script({
+    http = {get = function(host, port, path, options)
+      calls[#calls + 1] = port.number
+      truthy(options.bypass_cache and options.no_cache, "per-port requests must bypass the cache")
+      if port.number == 8008 then return {status = 200, header = {}} end
+      return response("PHP/" .. versions[port.number], {ssl = port.number ~= 80})
+    end},
+    shortport = {http = function() return true end},
+    nmap = {clock_ms = function() return 1000 end},
+    stdnse = {
+      get_script_args = function(name)
+        if name == "http-php2shell.max_requests" then return 1 end
+      end,
+      output_table = function() return {} end,
+    },
+  })
+  for _, number in ipairs({80, 8008, 443, 8443}) do
+    local result = script.action({ip = "127.0.0.1", targetname = "app.example.test"},
+      {number = number, protocol = "tcp", state = "open", service = "http"})
+    equal(result.port, number)
+    equal(result.requests_made, 1)
+    if number == 8008 then
+      equal(result.budget_exhausted, true)
+      equal(result.reason_code, "REQUEST_BUDGET_EXHAUSTED")
+      equal(result.state, "UNKNOWN")
+    else
+      equal(result.versions[1], versions[number])
+      equal(result.state, number == 443 and "POTENTIALLY_VULNERABLE" or "PATCHED_VERSION_ADVERTISED")
+    end
+    equal(result.script_version, "0.3.1")
+  end
+  equal(#calls, 4)
+end)
 
 local version_cases = {
   {"8.2.34", "POTENTIALLY_VULNERABLE"}, {"8.2.35", "PATCHED_VERSION_ADVERTISED"},
@@ -416,7 +527,7 @@ test("version evidence includes exact transport and request identity", function(
     {ip = "192.0.2.7", targetname = "app.example.test"}, {number = 8443, service = "https"})
   local evidence = result.evidence[1]
   equal(result.schema_version, "1")
-  equal(result.script_version, "0.3.0")
+  equal(result.script_version, "0.3.1")
   equal(result.vhost, "app.example.test")
   equal(evidence.ip, "192.0.2.7")
   equal(evidence.port, 8443)

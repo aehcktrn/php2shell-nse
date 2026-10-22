@@ -33,6 +33,8 @@ FIELDS = (
 )
 COMPACT_FIELDS = ("cible", "php", "vulnerable", "explication")
 COMPACT_VERDICTS = ("OUI", "NON", "INDETERMINE")
+MAX_COMPACT_EXPLANATION = 360
+MAX_SUMMARY_PORTS = 10
 MAX_REPORT_BYTES = 128 * 1024 * 1024
 SCRIPT_ID = "http-php2shell"
 STATES = ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED", "UNKNOWN")
@@ -411,7 +413,7 @@ def _unknown_reason(row: dict[str, Any]) -> str:
     return "Version ou correctifs PHP impossibles à établir"
 
 
-def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str) -> str:
+def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str) -> str:
     if not rows:
         return "Aucun service HTTP évalué ; PHP et ses correctifs restent à vérifier."
     if verdict == "OUI":
@@ -457,13 +459,56 @@ def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdic
     return reason + "."
 
 
-def compact_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _port_summary(rows: list[dict[str, Any]]) -> str:
+    """Describe actual NSE results separately from open, unassessed ports.
+
+    A requested scan port is not evidence of an HTTP assessment. Likewise,
+    repeated addresses on the same port do not create additional port numbers.
+    """
+    assessed, unassessed = set(), set()
+    for row in rows:
+        value = str(row.get("port", ""))
+        if (row.get("protocol") != "tcp" or not value.isascii()
+                or not value.isdecimal() or len(value) > 5 or not 1 <= int(value) <= 65535):
+            continue
+        if row.get("row_type") == "ASSESSMENT":
+            assessed.add(int(value))
+        elif row.get("row_type") == "COVERAGE" and row.get("reason_code") == "SERVICE_NOT_ASSESSED":
+            unassessed.add(int(value))
+
+    def listing(ports):
+        ordered = sorted(ports)
+        text = ",".join(str(port) for port in ordered[:MAX_SUMMARY_PORTS])
+        if len(ordered) > MAX_SUMMARY_PORTS:
+            text += f" (+{len(ordered) - MAX_SUMMARY_PORTS} autres)"
+        return text
+
+    parts = []
+    if assessed:
+        parts.append("Ports évalués : " + listing(assessed) + ".")
+    if unassessed:
+        parts.append("Ports ouverts sans évaluation PHP : " + listing(unassessed) + ".")
+    return " ".join(parts)
+
+
+def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str) -> str:
+    reason = _legacy_compact_explanation(rows, verdicts, verdict)
+    ports = _port_summary(rows)
+    if not ports:
+        return _short(reason, MAX_COMPACT_EXPLANATION)
+    # Keep both coverage lists visible even when a supplied reason is verbose.
+    return ports + " " + _short(reason, MAX_COMPACT_EXPLANATION - len(ports) - 1)
+
+
+def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False) -> list[dict[str, str]]:
     """Aggregate IPs and ports into four fields per hostname (or XML IP).
 
     OUI includes an affected advertised version and says so explicitly. NON
     requires every assessed web service to be corrected or attested, without
     silently discarding DNS, Nmap or HTTP coverage failures. Discovery status
     belongs to campaign details, not to an extra target or a PHP verdict.
+    The legacy rendering is only needed to validate compact reports written
+    before port summaries were added; all four fields are still compared.
     """
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ReportError("Lignes détaillées invalides : une liste d'objets est requise.")
@@ -482,8 +527,9 @@ def compact_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
         verdicts = [_compact_verdict(row) for row in relevant]
         verdict = ("OUI" if "OUI" in verdicts else
                    "NON" if verdicts and all(value == "NON" for value in verdicts) else "INDETERMINE")
+        explain = _legacy_compact_explanation if legacy_explanation else _compact_explanation
         output.append({"cible": target, "php": " | ".join(versions) or "INCONNUE", "vulnerable": verdict,
-                       "explication": _short(_compact_explanation(relevant, verdicts, verdict), 360)})
+                       "explication": _short(explain(relevant, verdicts, verdict), MAX_COMPACT_EXPLANATION)})
     return output
 
 
@@ -570,7 +616,8 @@ def load_campaign_report(path: Path) -> dict[str, Any]:
         details = _validate_detailed(_read_json_report(companion)[0])
     except ReportError as exc:
         raise ReportError(f"Rapport compact : compagnon détaillé requis et valide ({companion}): {exc}") from exc
-    if compact_rows(details["rows"]) != compact:
+    if (compact_rows(details["rows"]) != compact
+            and compact_rows(details["rows"], legacy_explanation=True) != compact):
         raise ReportError("Rapport compact incohérent avec raw/report-details.json ; conserver les fichiers de la même campagne.")
     return details
 

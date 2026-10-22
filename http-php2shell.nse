@@ -18,7 +18,8 @@ exhaustion, or executes code. HTTP and HTTPS use Nmap's HTTP library.
 
 Use -sV -p- to discover HTTP/HTTPS on nonstandard TCP ports automatically.
 Nmap performs port and service discovery; this script assesses the web services
-that Nmap identifies. Normal output shows a short verdict and patch guidance;
+that Nmap identifies and tries common web ports that remain unidentified.
+Normal output shows a short verdict and patch guidance;
 XML output retains all evidence and assessment details for perimeter reports.
 
 References (reviewed 2026-10-22):
@@ -58,7 +59,25 @@ author = "aehcktrn"
 license = "MIT; see https://github.com/aehcktrn/php2shell-scanner/blob/main/LICENSE"
 categories = {"discovery", "safe"}
 
-portrule = shortport.http
+-- Keep Nmap's HTTP service detection, including nonstandard ports. Common
+-- web ports also need a Host/SNI-aware request when version detection only
+-- found an unknown service or a name assigned by the services table.
+local COMMON_WEB_PORTS = {
+  [80] = true, [443] = true, [8000] = true, [8008] = true, [8080] = true,
+  [8081] = true, [8443] = true, [8888] = true, [9000] = true, [9443] = true,
+}
+local UNIDENTIFIED_SERVICES = {unknown = true, tcpwrapped = true, ssl = true}
+
+portrule = function(host, port)
+  if port.protocol ~= "tcp" or port.state ~= "open" then return false end
+  if shortport.http(host, port) then return true end
+  if not COMMON_WEB_PORTS[port.number]
+      or nmap.port_is_excluded(port.number, port.protocol) then return false end
+  local version = port.version or {}
+  local service = port.service or version.name or ""
+  return version.service_dtype ~= "probed" or service == ""
+    or UNIDENTIFIED_SERVICES[service] == true
+end
 
 local PREFIX = "http-php2shell"
 local POTENTIAL = "POTENTIALLY_VULNERABLE"
@@ -76,7 +95,7 @@ local function output()
   result.state = UNKNOWN
   result.detection_method = "HTTP response headers (version-based)"
   result.exploitability = "NOT_TESTED"
-  result.script_version = "0.3.0"
+  result.script_version = "0.3.1"
   result.schema_version = "1"
   result.advisory_date = "2026-10-21"
   result.cves = {"CVE-2026-109618", "CVE-2026-109619"}

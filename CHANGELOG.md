@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.3 — 2026-10-22
+
+### Visibilité et contrôle de plusieurs ports
+
+- Le rapport compact liste les ports ayant une évaluation NSE et distingue les ports ouverts pertinents sans évaluation PHP. Les quatre colonnes et la ligne unique par cible restent inchangées.
+- Correction de l'ambiguïté qui faisait apparaître uniquement le premier port concerné, souvent le 80, dans l'explication alors que d'autres services avaient été évalués.
+- Affichage au lancement de la liste de ports TCP demandés ; le recontrôle indique sa sélection propre à chaque cible.
+- Repli du NSE sur les dix ports du profil rapide lorsqu'un service reste inconnu ou seulement attribué par table. Les services non web positivement identifiés et les ports exclus par Nmap ne déclenchent pas ce nouveau repli.
+- Compatibilité stricte avec les rapports compacts 0.4.1 et 0.4.2 pour la comparaison et le recontrôle, sans accepter de compagnon incohérent.
+- Régressions couvrant plusieurs services HTTP/HTTPS sur une même cible, leurs versions distinctes et les règles de sélection des ports.
+
+Le lanceur passe à **0.4.3** et le NSE à **0.3.1**. Les seuils PHP et les règles de décision des verdicts sont inchangés.
+
 ## 0.4.2 — 2026-10-22
 
 ### Démarrage simplifié

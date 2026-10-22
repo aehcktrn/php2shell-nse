@@ -6,14 +6,17 @@ NMAP and NMAP_DATADIR select the real Nmap executable and its data directory.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import csv
 from datetime import datetime, timezone
+import errno
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import socket
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -23,12 +26,70 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-from integration import LocalServer
+from integration import FixtureHandler, LocalServer
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import scan
+
+
+class PerPortVersionHandler(FixtureHandler):
+    """Keep real HTTP behavior while varying the banner between listeners."""
+
+    def send_header(self, keyword, value):
+        if keyword.lower() == "x-powered-by":
+            value = f"PHP/{self.server.php_version}"
+        super().send_header(keyword, value)
+
+
+class HostRequiredHandler(socketserver.BaseRequestHandler):
+    """Version probes get no HTTP signature; the intended vhost gets PHP."""
+
+    def handle(self):
+        self.request.settimeout(0.25)
+        request = bytearray()
+        try:
+            while len(request) < 8192 and b"\r\n\r\n" not in request:
+                chunk = self.request.recv(8192 - len(request))
+                if not chunk:
+                    break
+                request.extend(chunk)
+        except (socket.timeout, OSError):
+            pass
+        lines = bytes(request).split(b"\r\n")
+        headers = {}
+        for line in lines[1:]:
+            name, separator, value = line.partition(b":")
+            if separator:
+                headers[name.strip().lower()] = value.strip()
+        expected_host = f"localhost:{self.server.server_address[1]}".encode("ascii")
+        is_expected = (lines[0].startswith(b"GET ") and
+                       headers.get(b"host") == expected_host)
+        with self.server.record_lock:
+            self.server.requests.append({"expected_host": is_expected,
+                                         "request_line": lines[0].decode("ascii", errors="replace")})
+        if is_expected:
+            response = (b"HTTP/1.1 200 OK\r\nX-Powered-By: PHP/8.3.35\r\n"
+                        b"Content-Length: 7\r\nConnection: close\r\n\r\nFixture")
+        else:
+            # Close immediately after this unrecognized response so -sV does
+            # not spend one timeout per probe on this synthetic listener.
+            response = b"SYNTHETIC_HOST_REQUIRED\r\n"
+        try:
+            self.request.sendall(response)
+        except OSError:
+            pass
+
+
+class HostRequiredServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, port):
+        super().__init__(("127.0.0.1", port), HostRequiredHandler)
+        self.requests = []
+        self.record_lock = threading.Lock()
 
 
 class ScanCLIIntegration(unittest.TestCase):
@@ -64,8 +125,11 @@ class ScanCLIIntegration(unittest.TestCase):
         cls.temp.cleanup()
 
     @contextmanager
-    def serve(self, *, tls=False):
+    def serve(self, *, tls=False, version=None):
         server = LocalServer()
+        if version is not None:
+            server.php_version = version
+            server.RequestHandlerClass = PerPortVersionHandler
         if tls:
             server.socket = self.tls_context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -209,6 +273,88 @@ class ScanCLIIntegration(unittest.TestCase):
             self.assertFalse((output / "report.json").exists())
             with server.record_lock:
                 self.assertEqual(server.requests, [])
+
+    def test_all_http_and_https_ports_are_assessed_after_first_affected_service(self):
+        if self.tls_context is None:
+            self.skipTest("openssl is required for the local TLS fixture")
+        with ExitStack() as stack:
+            servers = [stack.enter_context(self.serve(tls=tls, version="8.3.36"))
+                       for tls in (False, True, False)]
+            expected = {}
+            # An affected service comes first in Nmap's port order, but the
+            # remaining HTTP and HTTPS services must still be evaluated.
+            for server, version in zip(sorted(servers, key=lambda item: item.server_port),
+                                       ("8.3.35", "8.3.36", "8.4.27")):
+                server.php_version = version
+                expected[server.server_port] = version
+            ports = ",".join(str(port) for port in expected)
+            output, manifest, _ = self.run_campaign(ports)
+            self.assertEqual(manifest["status"], "COMPLETED")
+            self.assertEqual(len(manifest["targets"]), 1)
+            endpoints = manifest["targets"][0]["endpoints"]
+            self.assertEqual(len(endpoints), 1)
+            xml = ET.parse(output / endpoints[0]["xml"]).getroot()
+            assessed_ports = {}
+            for port in xml.findall("host/ports/port"):
+                script = port.find("script[@id='http-php2shell']")
+                self.assertIsNotNone(script, ET.tostring(port, encoding="unicode"))
+                assessed_ports[int(port.get("portid"))] = script.find("elem[@key='state']").text
+            self.assertEqual(set(assessed_ports), set(expected))
+            self.assertEqual(assessed_ports[min(expected)], "POTENTIALLY_VULNERABLE")
+            self.assertEqual(set(assessed_ports.values()),
+                             {"POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED"})
+            details = json.loads((output / "raw" / "report-details.json").read_text())
+            rows = [row for row in details["rows"] if row["row_type"] == "ASSESSMENT"]
+            self.assertEqual(len(rows), 3)
+            self.assertEqual({int(row["port"]): row["versions"] for row in rows}, expected)
+            self.assertTrue(all(row["hostname"] == "localhost" and row["ip"] == "127.0.0.1"
+                                for row in rows))
+            compact = self.assert_compact_report(output, "localhost",
+                                                 " | ".join(expected.values()), "OUI")
+            self.assertIn("Ports évalués :", compact["explication"])
+            for port in expected:
+                self.assertIn(str(port), compact["explication"])
+            for server in servers:
+                with server.record_lock:
+                    requests = [item for item in server.requests if item["path"] == "/old"]
+                self.assertTrue(requests, server.server_port)
+                self.assertTrue(all(item["host"] == f"localhost:{server.server_port}"
+                                    for item in requests))
+                if server is servers[1]:
+                    self.assertTrue(all(item["sni"] == "localhost" for item in requests))
+
+    def test_quick_web_port_is_assessed_when_version_probes_cannot_identify_http(self):
+        # A real nonprivileged quick-profile port that shortport.http does not
+        # select by number. A local port collision may skip only this fixture.
+        try:
+            server = HostRequiredServer(9000)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                self.skipTest(f"Loopback port 9000 already in use: {exc}")
+            raise
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            output, manifest, _ = self.run_campaign(9000)
+            endpoint = manifest["targets"][0]["endpoints"][0]
+            xml = ET.parse(output / endpoint["xml"]).getroot()
+            port = xml.find("host/ports/port[@portid='9000']")
+            self.assertIsNotNone(port)
+            self.assertEqual(port.find("state").get("state"), "open")
+            # The fixture must actually exercise service-detection failure,
+            # rather than accidentally rely on -sV recognizing HTTP.
+            self.assertEqual(port.find("service").get("method"), "table")
+            self.assertIsNotNone(port.find("script[@id='http-php2shell']"))
+            self.assert_report_matches_manifest(output, manifest, 9000)
+            with server.record_lock:
+                requests = list(server.requests)
+            self.assertTrue(any(not item["expected_host"] for item in requests))
+            self.assertTrue(any(item["expected_host"] and item["request_line"].startswith("GET /old ")
+                                for item in requests))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_single_file_discover_scans_root_and_child_with_real_nmap_and_host(self):
         # Discovery and DNS are deterministic; only the loopback Nmap/NSE

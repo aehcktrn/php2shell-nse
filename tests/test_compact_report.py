@@ -78,6 +78,99 @@ class CompactReportTests(unittest.TestCase):
         self.assertIn("192.0.2.11:8080", result["explication"])
         self.assertIn("8.3.36", result["explication"])
         self.assertIn("mettre à jour", result["explication"])
+        self.assertTrue(result["explication"].startswith("Ports évalués : 443,8080,8443."))
+
+    def test_port_80_does_not_hide_other_assessed_ports_in_the_explanation(self):
+        rows = [assessment(port="80", state="POTENTIALLY_VULNERABLE", version="8.3.35"),
+                assessment(port="443", state="POTENTIALLY_VULNERABLE", version="8.3.35"),
+                assessment(port="8443"), assessment(port="443", ip="2001:db8::10")]
+        result = self.compact(*rows)
+        self.assertEqual(result["vulnerable"], "OUI")
+        self.assertEqual(result["php"], "8.3.35 | 8.3.36")
+        self.assertTrue(result["explication"].startswith("Ports évalués : 80,443,8443."))
+        self.assertIn("mettre à jour PHP", result["explication"])
+
+    def test_hidden_versions_still_show_each_assessed_port(self):
+        result = self.compact(assessment(port="80", state="UNKNOWN", version="", reason_code="PHP_VERSION_HIDDEN"),
+                              assessment(port="443", state="UNKNOWN", version="", reason_code="PHP_VERSION_HIDDEN"))
+        self.assertEqual((result["php"], result["vulnerable"]), ("INCONNUE", "INDETERMINE"))
+        self.assertTrue(result["explication"].startswith("Ports évalués : 80,443."))
+        self.assertIn("2 contrôles indéterminés", result["explication"])
+
+    def test_port_summary_preserves_mixed_service_versions_and_verdicts(self):
+        for unknown_https in (False, True):
+            with self.subTest(unknown_https=unknown_https):
+                rows = [assessment(port="80", state="POTENTIALLY_VULNERABLE", version="8.3.35"),
+                        assessment(port="443", state="UNKNOWN" if unknown_https else "PATCHED_VERSION_ADVERTISED",
+                                   version="" if unknown_https else "8.3.36", reason_code="PHP_VERSION_HIDDEN"),
+                        assessment(port="8080")]
+                result = self.compact(*rows)
+                previous = report.compact_rows(rows, legacy_explanation=True)[0]
+                self.assertEqual({key: result[key] for key in ("cible", "php", "vulnerable")},
+                                 {key: previous[key] for key in ("cible", "php", "vulnerable")})
+                self.assertEqual((result["php"], result["vulnerable"]), ("8.3.35 | 8.3.36", "OUI"))
+                self.assertTrue(result["explication"].startswith("Ports évalués : 80,443,8080."))
+                self.assertIn("mettre à jour PHP", result["explication"])
+                if unknown_https:
+                    self.assertIn("Contrôles incomplets : 1", result["explication"])
+
+    def test_all_ten_quick_profile_ports_fit_in_the_summary(self):
+        ports = (80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9443)
+        result = self.compact(*(assessment(port=str(port)) for port in reversed(ports)))
+        self.assertTrue(result["explication"].startswith(
+            "Ports évalués : 80,443,8000,8008,8080,8081,8443,8888,9000,9443."))
+        self.assertNotIn("autres", result["explication"])
+
+    def test_open_ports_without_nse_are_distinct_from_assessed_and_requested_ports(self):
+        result = self.compact(assessment(port="80", scan_ports="22,80,443,8443"),
+                              coverage(port="443", code="SERVICE_NOT_ASSESSED", service="ssl/http"),
+                              coverage(port="22", code="SERVICE_NOT_ASSESSED", service="ssh", service_method="probed"))
+        self.assertEqual(result["vulnerable"], "INDETERMINE")
+        self.assertTrue(result["explication"].startswith(
+            "Ports évalués : 80. Ports ouverts sans évaluation PHP : 443."))
+        self.assertNotIn("22", result["explication"])
+        self.assertNotIn("8443", result["explication"])
+
+    def test_same_port_with_an_unassessed_address_retains_both_coverage_categories(self):
+        result = self.compact(assessment(port="443"),
+                              coverage(port="443", code="SERVICE_NOT_ASSESSED", ip="2001:db8::10"))
+        self.assertEqual(result["vulnerable"], "INDETERMINE")
+        self.assertTrue(result["explication"].startswith(
+            "Ports évalués : 443. Ports ouverts sans évaluation PHP : 443."))
+        self.assertIn("[2001:db8::10]:443", result["explication"])
+
+    def test_large_port_lists_stay_visible_and_bounded_with_an_explicit_remainder(self):
+        rows = [assessment(port=str(port), state="UNKNOWN", version="", reason_code="CUSTOM", reason="failure " * 100)
+                for port in range(10000, 10014)]
+        rows.extend(coverage(port=str(port), code="SERVICE_NOT_ASSESSED", reason="failure " * 100)
+                    for port in range(20000, 20014))
+        result = self.compact(*rows)
+        self.assertEqual(result["vulnerable"], "INDETERMINE")
+        self.assertLessEqual(len(result["explication"]), 360)
+        self.assertTrue(result["explication"].startswith(
+            "Ports évalués : 10000,10001,10002,10003,10004,10005,10006,10007,10008,10009 (+4 autres). "
+            "Ports ouverts sans évaluation PHP : 20000,20001,20002,20003,20004,20005,20006,20007,20008,20009 (+4 autres)."))
+        self.assertIn("Service ouvert sans évaluation PHP exploitable", result["explication"])
+
+    def test_port_summary_is_reserved_when_the_explanation_reaches_its_limit(self):
+        rows = [assessment(port=str(port), state="UNKNOWN", version="8.3.35", reason_code="CUSTOM",
+                           reason="failure " * 100, potentially_vulnerable_evidence=True,
+                           inventory_patch_status="UNVERIFIED", ip="2001:db8:ffff:ffff:ffff:ffff:ffff:ffff")
+                for port in range(10000, 10014)]
+        rows.append(assessment(port="10000", ip="192.0.2.10"))
+        result = self.compact(*rows)
+        self.assertEqual(result["vulnerable"], "INDETERMINE")
+        self.assertEqual(len(result["explication"]), 360)
+        self.assertTrue(result["explication"].startswith(
+            "Ports évalués : 10000,10001,10002,10003,10004,10005,10006,10007,10008,10009 (+4 autres)."))
+        self.assertIn("failure", result["explication"])
+        self.assertTrue(result["explication"].endswith("…"))
+
+    def test_failed_scan_never_turns_requested_ports_into_assessments(self):
+        result = self.compact(coverage(code="SCAN_FAILED", scan_ports="80,443,8443"))
+        self.assertEqual(result["vulnerable"], "INDETERMINE")
+        self.assertNotIn("Ports évalués", result["explication"])
+        self.assertNotIn("Ports ouverts", result["explication"])
 
     def test_virtual_hosts_sharing_an_ip_remain_separate(self):
         result = report.compact_rows([assessment("a.example.com"), assessment("b.example.com")])
@@ -269,7 +362,8 @@ class CompactReportTests(unittest.TestCase):
             self.assertEqual(exported[field], report.safe_cell(compact[0][field]))
         self.assertTrue(exported["cible"].startswith("'="))
         self.assertTrue(exported["php"].startswith("'+"))
-        self.assertTrue(exported["explication"].startswith("'@"))
+        self.assertIn("@formula", exported["explication"])
+        self.assertTrue(exported["explication"].startswith("Ports évalués : 443."))
 
     def test_legacy_previous_report_is_still_accepted(self):
         old = details([assessment()])
@@ -281,6 +375,30 @@ class CompactReportTests(unittest.TestCase):
         report.write_campaign_report(old, self.base)
         self.assertEqual(report.load_campaign_report(self.base / "report.json"), old)
         self.assertEqual(report.load_campaign_report(self.base / "raw/report-details.json"), old)
+
+    def test_v042_compact_previous_accepts_exact_legacy_explanation(self):
+        old = {**details([assessment(port="80", state="POTENTIALLY_VULNERABLE", version="8.3.35"),
+                          assessment(port="443", state="POTENTIALLY_VULNERABLE", version="8.3.35"),
+                          assessment(port="8443")]), "tool_version": "0.4.2"}
+        compact = [{"cible": "app.example.com", "php": "8.3.35 | 8.3.36", "vulnerable": "OUI",
+                    "explication": "Version annoncée concernée (port 80); mettre à jour PHP vers 8.3.36 ou vérifier le correctif fournisseur."}]
+        source = self.save("report.json", compact)
+        self.save("raw/report-details.json", old)
+        self.assertEqual(report.load_campaign_report(source), old)
+        self.assertNotEqual(report.compact_rows(old["rows"]), compact)
+        compact[0]["explication"] += " Texte altéré."
+        self.save("report.json", compact)
+        with self.assertRaisesRegex(report.ReportError, "incohérent"):
+            report.load_campaign_report(source)
+
+    def test_current_compact_explanation_cannot_be_ignored_during_companion_validation(self):
+        old = details([assessment(port="80"), assessment(port="443")])
+        report.write_campaign_report(old, self.base)
+        compact = json.loads((self.base / "report.json").read_text())
+        compact[0]["explication"] = compact[0]["explication"].replace("80,443", "80,8443")
+        source = self.save("report.json", compact)
+        with self.assertRaisesRegex(report.ReportError, "incohérent"):
+            report.load_campaign_report(source)
 
     def test_compact_previous_missing_companion_fails_explicitly(self):
         source = self.save("report.json", report.compact_rows([assessment()]))

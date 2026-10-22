@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.2**, module NSE **0.3.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.3**, module NSE **0.3.1**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -38,6 +38,8 @@ python3 scan.py domaines.txt --discover
 
 Le **profil rapide est activé par défaut** dans les deux cas. Il recherche les services HTTP/HTTPS sur les ports TCP **80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000 et 9443**. Nmap identifie les services ; le lanceur résout IPv4 et IPv6 et transmet le nom testé dans Host HTTP et SNI TLS. Pour couvrir les **65 535 ports TCP**, ajoutez `--profile complet`.
 
+Les ports demandés sont affichés au lancement. **Trouver PHP sur le port 80 n'arrête pas les contrôles des autres ports** : chaque service dispose de son propre budget HTTP. Sur les ports du profil rapide, le NSE essaie aussi le contrôle HTTP lorsque Nmap n'a pas identifié le service ; un protocole non web positivement identifié ne déclenche pas ce repli.
+
 ### Avec `--discover`
 
 Le même `domaines.txt` fournit les racines de découverte et le périmètre autorisé : chaque nom autorise ses descendants. Par exemple, `example.com` inclut `api.example.com` ; `application.example.com` limite la découverte à cette branche. Le lanceur interroge **crt.sh**, normalise et dédoublonne les noms retenus, puis scanne les domaines fournis et les sous-domaines découverts. Aucun compte, clé d'API ou paquet Python supplémentaire n'est nécessaire.
@@ -66,11 +68,13 @@ Les rapports principaux contiennent exactement **quatre champs**, dans cet ordre
 
 | cible | php | vulnerable | explication |
 |---|---|---|---|
-| application.example.com | 8.3.35 | OUI | Version annoncée concernée ; appliquer le correctif PHP 8.3.36 ou un backport attesté. |
-| portail.example.com | 8.3.36 | NON | Version corrigée annoncée sur les services évalués. |
-| api.example.org | INCONNUE | INDETERMINE | Version PHP masquée ; vérifier le runtime actif. |
+| application.example.com | 8.3.35 | OUI | Ports évalués : 80,443. Version annoncée concernée ; appliquer le correctif PHP 8.3.36 ou un backport attesté. |
+| portail.example.com | 8.3.36 | NON | Ports évalués : 443,8443. Version corrigée annoncée sur les services évalués. |
+| api.example.org | INCONNUE | INDETERMINE | Ports évalués : 443. Version PHP masquée ; vérifier le runtime actif. |
 
 Ces lignes illustrent le format. **`php` contient les versions observées**, séparées par ` | ` lorsqu'il y en a plusieurs, ou `INCONNUE` lorsqu'aucune version n'est disponible. Dans une campagne `scan.py`, chaque nom DNS retenu garde sa propre ligne, même s'il partage une IP avec une autre cible. Un export XML autonome reprend le vhost explicite ou l'identité de l'entrée Nmap, avec l'IP en l'absence de nom ; plusieurs alias d'une même entrée restent groupés, car ils ne prouvent pas des tests distincts de chaque vhost.
+
+**L'explication liste les ports ayant une évaluation NSE**, même indéterminée, puis le motif du résultat. Les ports ouverts pertinents sans évaluation PHP sont signalés séparément. Les listes sont triées, dédoublonnées et bornées ; au-delà de dix ports, le nombre restant est indiqué. Les ports fermés ou filtrés ne figurent pas dans cette liste d'évaluations : leurs états restent dans les fichiers Nmap de `raw/`. Un port cité dans le motif de vulnérabilité désigne le service qui justifie le résultat, pas le seul port contrôlé.
 
 - **`OUI`** : au moins un service annonce clairement une version concernée, sans preuve valide de correction, ou un inventaire atteste un runtime encore affecté. L'explication précise le correctif ou la preuve disponible. Une version annoncée ne démontre pas l'exploitabilité.
 - **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une ancienne version avec un backport attesté peut donc apparaître en `NON`, avec la version conservée et l'attestation expliquée.
@@ -137,6 +141,8 @@ python3 scan.py domaines.txt \
 ```
 
 **Conservez le dossier de campagne complet.** Pour un `report.json` compact, `--previous` charge automatiquement `raw/report-details.json` dans le même dossier et vérifie que les deux rapports correspondent. Un compagnon absent ou incohérent est refusé avant les accès réseau. Les anciens rapports JSON détaillés de schéma `1` restent acceptés directement, sans fichier compagnon. Cette règle vaut aussi pour le profil `recontrole`.
+
+Les rapports compacts des versions 0.4.1 et 0.4.2 restent acceptés avec leur compagnon, même si leur explication ne listait pas encore tous les ports évalués.
 
 Les changements sont classés en `NEW`, `CHANGED`, `UNCHANGED` et `NO_LONGER_OBSERVED`, en conservant nom, IP, port et protocole. Un changement DNS peut apparaître comme un nouveau service et un ancien non observé. **La disparition d'un service ne prouve pas sa correction.** Les changements de périmètre, de ports ou de visibilité doivent être pris en compte.
 
