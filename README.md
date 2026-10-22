@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.4**, module NSE **0.3.2**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.4.5**, module NSE **0.3.2**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -100,7 +100,7 @@ Tous les fichiers ci-dessous sont des sorties du scanner. Ils n'ont pas à être
 | `raw/report-details.json` | Bilan technique complet : évaluations par service, observations, preuves, couverture et métadonnées de campagne. Nécessaire au recontrôle et à la comparaison des nouveaux rapports. |
 | Autres fichiers de `raw/` | Résultats Nmap `.xml`, `.nmap`, `.gnmap` et journaux par couple nom/IP. |
 
-Le bilan technique distingue **domaines retenus après validation et dédoublonnage, résolus, tentés et évalués**. Les candidats écartés restent dans `excluded_candidates` du manifeste et de `raw/report-details.json`. Les échecs DNS, délais expirés, interruptions, XML invalides et cibles absentes d'un XML restent visibles dans la ligne de leur cible. Les erreurs d'une source de découverte sont consignées dans `discovery.json` et dans le bilan technique ; elles ne créent pas de cible fictive ni de résultat PHP supplémentaire.
+Le bilan technique distingue **domaines retenus après validation et dédoublonnage, résolus, tentés et évalués**. Les candidats écartés restent dans `excluded_candidates` du manifeste et de `raw/report-details.json`. Les échecs DNS, délais expirés, interruptions, XML invalides et cibles absentes d'un XML restent visibles dans la ligne de leur cible. Par défaut, les adresses DNS non globales (privées, loopback, link-local, CGNAT, multicast ou réservées) sont consignées avec `NO_PUBLIC_ADDRESS` et ne sont jamais transmises à Nmap. `--allow-non-global` lève explicitement cette protection pour un laboratoire maîtrisé ; ne l'utilisez pas pour une campagne Internet. Les erreurs d'une source de découverte sont consignées dans `discovery.json` et dans le bilan technique ; elles ne créent pas de cible fictive ni de résultat PHP supplémentaire.
 
 ### Évaluation réseau détaillée
 
@@ -190,11 +190,15 @@ Avec cette option, **`--dry-run` effectue les requêtes HTTPS vers crt.sh et la 
 | Délai total d'une requête, résolution de la source et lecture incluses | 30 s | `--discovery-timeout`, de 1 à 120 |
 | Budget de toute la phase de découverte | 300 s | `--discovery-budget`, de 1 à 3 600 |
 | Noms CT uniques par campagne, avant filtrage du périmètre et des exclusions | 10 000 | `--discovery-max-names`, de 1 à 100 000 |
+| Nouvelles tentatives sur HTTP 502/503/504 | 2 | `--discovery-retries`, de 0 à 5 |
+| Backoff initial entre tentatives | 5 s | `--discovery-backoff-seconds`, de 1 à 60 |
+| Cooldown du cache réussi | 30 min | `--discovery-cache-ttl-minutes`, de 1 à 1 440 |
+| Cache de secours maximal si crt.sh échoue | 24 h | `--discovery-cache-max-age-hours`, de 1 à 168 |
 | Réponse par racine | 8 Mio | Limite fixe |
 
 Le plafond effectif de noms CT est également limité aux places restantes parmi les **100 000 cibles maximum** de la campagne, racines, cibles exactes et imports compris. Sa valeur est enregistrée dans `limits.effective_max_names` de `discovery.json`.
 
-Une seule requête est effectuée par racine, séquentiellement, sans nouvelle tentative ni redirection. Les noms découverts ne déclenchent pas de nouvelles recherches de certificats. Les erreurs de source, limitations de débit, délais et plafonds atteints sont conservés dans `discovery.json` ; une campagne partielle sort avec le code `2`. Une interruption conserve le bilan disponible et sort avec `130`.
+Les racines sont traitées séquentiellement, sans redirection. Un résultat réussi récent est réutilisé pendant le cooldown pour ne pas solliciter inutilement crt.sh. Les erreurs transitoires HTTP 502/503/504 sont retentées avec un backoff exponentiel et légèrement aléatoire, dans le budget global. Si elles persistent, un cache réussi assez récent peut servir de secours ; `cache_mode`, `cache_age_seconds` et chaque tentative restent visibles dans `discovery.json`. `--refresh-discovery` force une nouvelle interrogation et désactive le repli sur cache. Les noms découverts ne déclenchent pas de nouvelles recherches de certificats. Les autres erreurs, limitations de débit, délais et plafonds atteints sont conservés dans `discovery.json` ; une campagne partielle sort avec le code `2`. Une interruption conserve le bilan disponible et sort avec `130`.
 
 ### Lire les limites de l'inventaire
 
@@ -203,6 +207,16 @@ La découverte reste **non exhaustive**, y compris après une réponse réussie 
 Les certificats historiques peuvent fournir des noms qui ne répondent plus au DNS : ils restent dans `discovered.txt` avant résolution, et `NO_DNS_ADDRESS` reste visible dans le bilan de couverture partielle. Une réponse vide ne démontre pas l'absence de sous-domaines. crt.sh applique aussi ses propres limites ; le lanceur signale les plafonds détectables et l'incertitude de troncature lorsqu'il manque les compteurs nécessaires. Voir l'[interface JSON décrite par le mainteneur](https://groups.google.com/g/crtsh/c/bybDhKDszkg) et l'[implémentation de crt.sh](https://github.com/crtsh/certwatch_db/blob/master/fnc/web_apis.fnc).
 
 </details>
+
+## Reprendre une campagne interrompue
+
+Le manifeste est mis à jour après chaque endpoint. Pour reprendre une campagne :
+
+```bash
+python3 scan.py --resume results/20261022T223344Z-9bb9cdcf
+```
+
+La reprise valide les XML des endpoints `COMPLETED`, les réutilise sans nouveau trafic et ne relance que les endpoints incomplets, en échec ou expirés. Les commandes enregistrées dans le manifeste ne sont jamais exécutées directement : Nmap et ses arguments sont reconstruits depuis les champs validés. Les adresses non globales restent exclues, sauf dérogation explicite de laboratoire avec `--allow-non-global`. Si un chemin avec paramètres a été expurgé, une nouvelle campagne avec le chemin complet est requise. Une campagne peut rester `PARTIAL` après reprise lorsque des noms ne résolvent pas ou qu'une lacune de couverture indépendante de Nmap subsiste.
 
 <details>
 <summary>Importer des noms ou appliquer des exclusions</summary>

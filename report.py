@@ -319,6 +319,7 @@ COMPACT_REASONS = {
     "DNS_ERROR": "Résolution DNS impossible",
     "DNS_FAMILY_ERROR": "Résolution DNS incomplète pour une famille IP",
     "NO_DNS_ADDRESS": "Aucune adresse IP résolue",
+    "NO_PUBLIC_ADDRESS": "Aucune adresse IP publique globale ; adresses non globales exclues",
     "TARGET_NOT_ATTEMPTED": "Cible non testée",
     "ADDRESS_NOT_ATTEMPTED": "Une adresse IP résolue n'a pas été testée",
     "SCAN_TIMEOUT": "Délai du scan Nmap dépassé",
@@ -905,7 +906,9 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
         endpoints = target.get("endpoints", [])
         if not endpoints:
             code = "DNS_ERROR" if target.get("dns_status") == "DNS_ERROR" else (
-                "NO_DNS_ADDRESS" if target.get("dns_status") == "NO_ADDRESS" else "TARGET_NOT_ATTEMPTED")
+                "NO_DNS_ADDRESS" if target.get("dns_status") == "NO_ADDRESS" else (
+                "NO_PUBLIC_ADDRESS" if target.get("dns_status") == "NO_PUBLIC_ADDRESS" else
+                "TARGET_NOT_ATTEMPTED"))
             reason = target.get("dns_error") or "Aucune adresse du domaine n'a ete evaluee."
             rows.append(_campaign_coverage(name, None, str(reason), code, campaign_id, observed_at))
             processing_complete = False

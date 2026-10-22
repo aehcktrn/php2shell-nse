@@ -154,6 +154,7 @@ class ScanCLIIntegration(unittest.TestCase):
             sys.executable, str(ROOT / "scan.py"), str(targets),
             "--ports", str(port),
             "--families", "ipv4", "--workers", "1", "--target-timeout", "60",
+            "--allow-non-global",
             "--paths-file", str(paths), "--output", str(output),
             "--nmap", self.nmap, *extra_args,
         ]
@@ -375,7 +376,8 @@ class ScanCLIIntegration(unittest.TestCase):
         }
         fixture_dns = {name: "127.0.0.1" for name in source_result["candidates"]}
 
-        def resolve_fixture(name, families, timeout):
+        def resolve_fixture(name, families, timeout, allow_non_global=False):
+            self.assertTrue(allow_non_global)
             address = fixture_dns[name]
             return {"dns_status": "RESOLVED", "addresses": [address],
                     "dns_families": {"ipv4": {"status": "RESOLVED", "addresses": [address]}},
@@ -387,7 +389,7 @@ class ScanCLIIntegration(unittest.TestCase):
             arguments = [
                 str(domains), "--discover", "--ports", str(port), "--families", "ipv4",
                 "--workers", "1", "--target-timeout", "60", "--path", "/old",
-                "--output", str(output), "--nmap", self.nmap,
+                "--allow-non-global", "--output", str(output), "--nmap", self.nmap,
             ]
             with patch.object(scan, "discover_root", return_value=source_result) as discover, \
                     patch.object(scan, "resolve_target", side_effect=resolve_fixture) as resolve, \
@@ -399,7 +401,8 @@ class ScanCLIIntegration(unittest.TestCase):
             self.assertEqual(resolve.call_count, 2)
             self.assertEqual({call.args[0] for call in resolve.call_args_list},
                              {"example.test", "app.example.test"})
-            self.assertTrue(all(call.args[1:] == (["ipv4"], 15) for call in resolve.call_args_list))
+            self.assertTrue(all(call.args[1:] == (["ipv4"], 15, True)
+                                for call in resolve.call_args_list))
             with server.record_lock:
                 requests = [item for item in server.requests if item["path"] == "/old"]
             self.assertTrue(requests, (output / "raw" / "000001.xml").read_text())

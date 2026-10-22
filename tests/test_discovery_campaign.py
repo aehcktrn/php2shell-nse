@@ -76,7 +76,7 @@ class DiscoveryCampaignTests(unittest.TestCase):
         return {**endpoint, "status": "COMPLETED", "returncode": 0, "finished_at": scan.utcnow()}
 
     def execute(self, *options, roots="example.com\n", source=None, resolver=None, dry_run=True,
-                ports="443"):
+                ports="443", refresh=True):
         self.counter += 1
         output = self.base / f"campaign-{self.counter}"
         argv = [str(option) for option in options]
@@ -84,6 +84,8 @@ class DiscoveryCampaignTests(unittest.TestCase):
             root_file = self.file(f"roots-{self.counter}.txt", roots)
             argv += ["--discover-subdomains", str(root_file)]
         argv += ["--output", str(output), "--families", "ipv4"]
+        if refresh:
+            argv += ["--refresh-discovery"]
         if ports is not None:
             argv += ["--ports", ports]
         if dry_run:
@@ -99,6 +101,36 @@ class DiscoveryCampaignTests(unittest.TestCase):
             code = scan.run_campaign(scan.parser().parse_args(argv))
         data = json.loads((output / "manifest.json").read_text())
         return code, output, data, provider, dns, runner
+
+    def test_recent_successful_discovery_is_reused_during_cooldown(self):
+        first = self.execute(source=source_result("app.example.com"), refresh=False)
+        self.assertEqual(first[0], 0)
+        first[3].assert_called_once()
+        second = self.execute(source=AssertionError("provider must not run"), refresh=False)
+        self.assertEqual(second[0], 0)
+        second[3].assert_not_called()
+        query = second[2]["discovery"]["queries"][0]
+        self.assertEqual((query["status"], query["reason_code"], query["cache_mode"]),
+                         ("COMPLETED", "CACHE_FRESH", "FRESH"))
+
+    def test_http_502_retries_then_uses_older_successful_cache(self):
+        first = self.execute(source=source_result("app.example.com"), refresh=False)
+        cache = scan.discovery_cache_path(first[1], "example.com")
+        payload = json.loads(cache.read_text())
+        payload["saved_at"] = "2026-10-22T00:00:00Z"
+        cache.write_text(json.dumps(payload), encoding="utf-8")
+        failure = source_result(status="FAILED", reason="HTTP_ERROR")
+        failure["http_status"] = 502
+        with patch.object(scan.time, "sleep"):
+            second = self.execute("--discovery-cache-ttl-minutes", "1",
+                                  "--discovery-cache-max-age-hours", "168",
+                                  source=failure, refresh=False)
+        self.assertEqual(second[0], 0)
+        self.assertEqual(second[3].call_count, 3)
+        query = second[2]["discovery"]["queries"][0]
+        self.assertEqual((query["status"], query["reason_code"], query["cache_mode"]),
+                         ("COMPLETED", "CACHE_FALLBACK", "FALLBACK"))
+        self.assertEqual(len(query["attempts"]), 3)
 
     def test_single_file_discover_supplies_scope_scans_and_saves_distinct_names(self):
         original = "EXAMPLE.COM.\nexample.com # duplicate\n"

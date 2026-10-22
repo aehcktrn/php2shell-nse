@@ -16,6 +16,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shutil
 import signal
@@ -28,17 +29,19 @@ from urllib.parse import quote
 import uuid
 
 from report import (ReportError, build_campaign_report, compact_rows,
-                    load_campaign_report, write_campaign_report)
+                    load_campaign_report, parse_report, write_campaign_report)
 from discovery import discover_root
 
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
+MAX_MANIFEST_BYTES = 128 * 1024 * 1024
 MAX_TARGETS = 100000
 MAX_DISCOVERY_ROOTS = 1000
 DISCOVERY_RESPONSE_BYTES = 8 * 1024 * 1024
+DISCOVERY_CACHE_SCHEMA = "1"
 PROFILES = {"rapide": "quick", "quick": "quick", "complet": "complete",
             "complete": "complete", "recontrole": "recheck", "recheck": "recheck"}
 HOST_FIELDS = ("hostname", "fqdn", "name", "domain", "host")
@@ -338,6 +341,47 @@ def persist_discovery(output: Path, manifest: dict) -> None:
     atomic_json(output / "manifest.json", manifest)
 
 
+def discovery_cache_path(output: Path, root: str) -> Path:
+    digest = hashlib.sha256(root.encode("ascii")).hexdigest()
+    return output.parent / ".discovery-cache" / (digest + ".json")
+
+
+def load_discovery_cache(output: Path, root: str, max_age_seconds: float) -> tuple[dict, float] | None:
+    path = discovery_cache_path(output, root)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(read_text(path, DISCOVERY_RESPONSE_BYTES))
+        saved_at = datetime.fromisoformat(str(payload["saved_at"]).replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - saved_at).total_seconds()
+        result = payload["result"]
+        candidates = result["candidates"]
+        if (payload.get("schema_version") != DISCOVERY_CACHE_SCHEMA or payload.get("root") != root
+                or saved_at.tzinfo is None or age < -300 or age > max_age_seconds
+                or not isinstance(result, dict) or result.get("status") != "COMPLETED"
+                or not result.get("processing_complete") or not isinstance(candidates, list)
+                or len(candidates) > MAX_TARGETS
+                or any(hostname(name) != name or not is_within(name, root) for name in candidates)
+                or len(candidates) != len(set(candidates))):
+            return None
+        return result, max(0.0, age)
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, RecursionError):
+        return None
+
+
+def save_discovery_cache(output: Path, root: str, result: dict) -> None:
+    if result.get("status") != "COMPLETED" or not result.get("processing_complete"):
+        return
+    cached = {key: value for key, value in result.items()
+              if key not in ("started_at", "finished_at", "cache_age_seconds", "cache_mode", "attempts")}
+    atomic_json(discovery_cache_path(output, root), {
+        "schema_version": DISCOVERY_CACHE_SCHEMA,
+        "root": root,
+        "saved_at": utcnow(),
+        "result": cached,
+    })
+
+
 def interrupt_discovery(discovery: dict, roots: list[tuple[str, str]], rules: dict) -> None:
     """Finish the local ledger without issuing any further source requests."""
     finished = utcnow()
@@ -394,14 +438,67 @@ def run_discovery(args, roots: list[tuple[str, str]], rules: dict,
             query["started_at"] = utcnow()
             persist_discovery(output, manifest)
             print(f"Decouverte crt.sh: {root}...", flush=True)
-            try:
-                result = discover_root(root, timeout=min(args.discovery_timeout, remaining),
-                                       max_names=effective_limit,
-                                       max_bytes=DISCOVERY_RESPONSE_BYTES)
-            except Exception as exc:
-                result = {"status": "FAILED", "reason_code": "PROVIDER_ERROR", "candidates": [],
-                          "processing_complete": False, "finished_at": utcnow(),
-                          "error_type": type(exc).__name__}
+            fresh_cache = None if args.refresh_discovery else load_discovery_cache(
+                output, root, args.discovery_cache_ttl_minutes * 60)
+            if fresh_cache is not None:
+                result, cache_age = fresh_cache
+                result = dict(result)
+                result.update(status="COMPLETED", reason_code="CACHE_FRESH",
+                              processing_complete=True, started_at=query["started_at"],
+                              finished_at=utcnow(), cache_mode="FRESH",
+                              cache_age_seconds=round(cache_age, 3), attempts=[])
+            else:
+                attempts = []
+                result = None
+                for attempt in range(args.discovery_retries + 1):
+                    remaining = args.discovery_budget - (time.monotonic() - started)
+                    if remaining <= 0:
+                        result = {"status": "FAILED", "reason_code": "DISCOVERY_BUDGET_EXHAUSTED",
+                                  "candidates": [], "processing_complete": False,
+                                  "finished_at": utcnow()}
+                        break
+                    try:
+                        result = discover_root(root, timeout=min(args.discovery_timeout, remaining),
+                                               max_names=effective_limit,
+                                               max_bytes=DISCOVERY_RESPONSE_BYTES)
+                    except Exception as exc:
+                        result = {"status": "FAILED", "reason_code": "PROVIDER_ERROR", "candidates": [],
+                                  "processing_complete": False, "finished_at": utcnow(),
+                                  "error_type": type(exc).__name__}
+                    attempts.append({key: result.get(key) for key in
+                                     ("status", "reason_code", "http_status", "started_at", "finished_at")
+                                     if result.get(key) is not None})
+                    retryable = (result.get("status") == "FAILED"
+                                 and result.get("reason_code") == "HTTP_ERROR"
+                                 and result.get("http_status") in (502, 503, 504)
+                                 and attempt < args.discovery_retries)
+                    if not retryable:
+                        break
+                    base_delay = args.discovery_backoff_seconds * (2 ** attempt)
+                    delay = min(60.0, base_delay + random.uniform(0, min(1.0, base_delay * 0.25)))
+                    remaining = args.discovery_budget - (time.monotonic() - started)
+                    if remaining <= delay:
+                        break
+                    print(f"  HTTP {result.get('http_status')}; nouvelle tentative dans {delay:.1f}s.",
+                          flush=True)
+                    time.sleep(delay)
+                result["attempts"] = attempts
+                if result.get("status") == "COMPLETED" and result.get("processing_complete"):
+                    save_discovery_cache(output, root, result)
+                elif not args.refresh_discovery:
+                    fallback = load_discovery_cache(
+                        output, root, args.discovery_cache_max_age_hours * 3600)
+                    if fallback is not None:
+                        cached, cache_age = fallback
+                        failed_attempts = result["attempts"]
+                        result = dict(cached)
+                        result.update(status="COMPLETED", reason_code="CACHE_FALLBACK",
+                                      processing_complete=True, started_at=query["started_at"],
+                                      finished_at=utcnow(), cache_mode="FALLBACK",
+                                      cache_age_seconds=round(cache_age, 3),
+                                      attempts=failed_attempts,
+                                      warnings=list(dict.fromkeys(
+                                          [*cached.get("warnings", []), "PROVIDER_FAILED_CACHE_USED"])))
             query.update({key: value for key, value in result.items() if key != "candidates"})
             query.update(root=root, source="crt.sh", exhaustive=False)
             source = "crt.sh:" + root
@@ -464,7 +561,7 @@ def record_discovered_targets(output: Path, manifest: dict, targets: list[dict])
     discovery["retained_count"] = len(retained)
     discovery["resolved_count"] = sum(item.get("retained") and item.get("dns_status") == "RESOLVED"
                                       for item in discovery["candidates"])
-    discovery["unresolved_count"] = sum(item.get("retained") and item.get("dns_status") in ("NO_ADDRESS", "DNS_ERROR")
+    discovery["unresolved_count"] = sum(item.get("retained") and item.get("dns_status") in ("NO_ADDRESS", "NO_PUBLIC_ADDRESS", "DNS_ERROR")
                                         for item in discovery["candidates"])
     (output / "discovered.txt").write_text("\n".join(retained) + ("\n" if retained else ""), encoding="utf-8")
     persist_discovery(output, manifest)
@@ -533,20 +630,24 @@ def port_expression(value: str) -> str:
 
 _RESOLVER_CODE = """
 import ipaddress,json,socket,sys
-name=sys.argv[1]; result={'addresses': [], 'families': {}}
+name=sys.argv[1]; allow_non_global=sys.argv[3]=='1'; result={'addresses': [], 'families': {}}
 for label in sys.argv[2].split(','):
     family=socket.AF_INET if label=='ipv4' else socket.AF_INET6
     try:
-        values=set()
+        values=set(); excluded=set()
         for item in socket.getaddrinfo(name,None,family,socket.SOCK_STREAM,socket.IPPROTO_TCP):
             if '%' in item[4][0]: continue
             address=ipaddress.ip_address(item[4][0])
             if address.version != (4 if label=='ipv4' else 6): continue
             if address.version == 6 and address.ipv4_mapped is not None: continue
+            if not allow_non_global and not address.is_global:
+                excluded.add(str(address)); continue
             values.add(str(address))
         values=sorted(values)
         result['addresses'].extend(values)
-        result['families'][label]={'status':'RESOLVED' if values else 'NO_ADDRESS','addresses':values}
+        excluded=sorted(excluded)
+        result['families'][label]={'status':'RESOLVED' if values else 'NO_PUBLIC_ADDRESS' if excluded else 'NO_ADDRESS','addresses':values}
+        if excluded: result['families'][label]['excluded_addresses']=excluded
     except socket.gaierror as exc:
         absent=exc.errno in (socket.EAI_NONAME,getattr(socket,'EAI_NODATA',socket.EAI_NONAME))
         result['families'][label]={'status':'NO_ADDRESS' if absent else 'ERROR','addresses':[]}
@@ -557,22 +658,36 @@ for label in sys.argv[2].split(','):
 """
 
 
-def resolve_target(name: str, families: list[str], timeout: float) -> dict:
+def resolve_target(name: str, families: list[str], timeout: float,
+                   allow_non_global: bool = False) -> dict:
     def finish(value: dict) -> dict:
         cleaned_families = {}
+        all_excluded = []
         for family, item in value["families"].items():
             expected_version = 4 if family == "ipv4" else 6
-            cleaned = []
+            cleaned, excluded = [], []
             for raw_address in item.get("addresses", []):
                 address = ipaddress.ip_address(raw_address)
                 if address.version != expected_version or (
                         address.version == 6 and address.ipv4_mapped is not None):
                     continue
-                cleaned.append(str(address))
+                if not allow_non_global and not address.is_global:
+                    excluded.append(str(address))
+                else:
+                    cleaned.append(str(address))
+            for raw_address in item.get("excluded_addresses", []):
+                address = ipaddress.ip_address(raw_address)
+                if (address.version == expected_version and not allow_non_global
+                        and not address.is_global):
+                    excluded.append(str(address))
             normalized = dict(item)
             normalized["addresses"] = sorted(dict.fromkeys(cleaned))
+            excluded = sorted(dict.fromkeys(excluded))
+            if excluded:
+                normalized["excluded_addresses"] = excluded
+                all_excluded.extend(excluded)
             if normalized.get("status") == "RESOLVED" and not normalized["addresses"]:
-                normalized["status"] = "NO_ADDRESS"
+                normalized["status"] = "NO_PUBLIC_ADDRESS" if excluded else "NO_ADDRESS"
             cleaned_families[family] = normalized
         value["families"] = cleaned_families
         addresses = list(dict.fromkeys(
@@ -580,13 +695,20 @@ def resolve_target(name: str, families: list[str], timeout: float) -> dict:
         errors = "; ".join(f"{family}: {item.get('error', item['status'])}"
                            for family, item in cleaned_families.items()
                            if item["status"] in ("ERROR", "TIMEOUT"))
-        return {"dns_status": "RESOLVED" if addresses else "DNS_ERROR" if errors else "NO_ADDRESS",
+        excluded_addresses = sorted(dict.fromkeys(all_excluded))
+        status = ("RESOLVED" if addresses else "DNS_ERROR" if errors else
+                  "NO_PUBLIC_ADDRESS" if excluded_addresses else "NO_ADDRESS")
+        excluded_error = ("Adresses DNS non globales exclues: " + ", ".join(excluded_addresses)
+                          if excluded_addresses else "")
+        return {"dns_status": status,
                 "addresses": addresses, "dns_families": cleaned_families,
                 "dns_partial": bool(addresses and errors),
-                "dns_error": errors, "resolved_at": utcnow()}
+                "dns_error": errors or excluded_error,
+                "excluded_addresses": excluded_addresses, "resolved_at": utcnow()}
 
     try:
-        child = subprocess.run([sys.executable, "-c", _RESOLVER_CODE, name, ",".join(families)],
+        child = subprocess.run([sys.executable, "-c", _RESOLVER_CODE, name, ",".join(families),
+                                "1" if allow_non_global else "0"],
                                capture_output=True, text=True, timeout=timeout, check=False)
         if child.returncode:
             raise ValueError("Echec du processus de resolution DNS.")
@@ -736,10 +858,22 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--discovery-timeout", type=bounded_int(1, 120), default=30, help="Delai total par requete crt.sh en secondes")
     result.add_argument("--discovery-budget", type=bounded_int(1, 3600), default=300, help="Budget total de la phase de decouverte en secondes")
     result.add_argument("--discovery-max-names", type=bounded_int(1, 100000), default=10000, help="Maximum de noms uniques issus de crt.sh par campagne")
+    result.add_argument("--discovery-retries", type=bounded_int(0, 5), default=2,
+                        help="Nouvelles tentatives pour les erreurs transitoires HTTP 502/503/504")
+    result.add_argument("--discovery-backoff-seconds", type=bounded_int(1, 60), default=5,
+                        help="Attente initiale avant nouvelle tentative crt.sh (backoff exponentiel)")
+    result.add_argument("--discovery-cache-ttl-minutes", type=bounded_int(1, 1440), default=30,
+                        help="Cooldown : reutiliser directement un resultat crt.sh recent")
+    result.add_argument("--discovery-cache-max-age-hours", type=bounded_int(1, 168), default=24,
+                        help="Age maximal du cache de secours si crt.sh reste indisponible")
+    result.add_argument("--refresh-discovery", action="store_true",
+                        help="Ignorer le cache et interroger crt.sh immediatement")
     result.add_argument("--discover-from", action="append", type=Path, default=[], help="Import local TXT/CSV/TSV/JSON, repetable; exige --scope ou une decouverte activee")
     result.add_argument("--exclude", type=Path, help="Noms exacts ou *.domaine exclus")
     result.add_argument("--output", type=Path, help="Dossier de campagne facultatif ; sinon creation automatique sous results/")
     result.add_argument("--families", choices=("ipv4", "ipv6", "both"), default="both")
+    result.add_argument("--allow-non-global", action="store_true",
+                        help="Laboratoire uniquement : autoriser les IP privées/réservées résolues")
     result.add_argument("--ports", help="Liste/ranges TCP explicites; remplace les ports du profil")
     result.add_argument("--workers", type=bounded_int(1, 32), default=4, help="Processus Nmap simultanes")
     result.add_argument("--dns-timeout", type=bounded_int(1, 120), default=15, help="Delai DNS par domaine en secondes")
@@ -755,6 +889,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--inventory", type=Path, help="Preuves de runtimes authentifies au format JSON")
     result.add_argument("--inventory-max-age-hours", type=bounded_int(1, 8760), default=24)
     result.add_argument("--previous", type=Path, help="report.json precedent pour comparaison/recontrole")
+    result.add_argument("--resume", type=Path, metavar="CAMPAIGN_DIR",
+                        help="Reprendre les endpoints incomplets d'une campagne existante")
     result.add_argument("--dry-run", action="store_true", help="Decouverte crt.sh si activee, resolution DNS et plan sans lancer Nmap")
     result.add_argument("--nmap", default=os.environ.get("NMAP", "nmap"), help="Executable Nmap")
     result.add_argument("--nmap-datadir", default=os.environ.get("NMAP_DATADIR"), help="Repertoire des donnees Nmap")
@@ -838,7 +974,10 @@ def run_campaign(args) -> int:
             "resolved_count": 0, "unresolved_count": 0,
             "limits": {"timeout_seconds": args.discovery_timeout, "budget_seconds": args.discovery_budget,
                        "max_names": args.discovery_max_names, "max_response_bytes": DISCOVERY_RESPONSE_BYTES,
-                       "max_roots": MAX_DISCOVERY_ROOTS},
+                       "max_roots": MAX_DISCOVERY_ROOTS, "retries": args.discovery_retries,
+                       "backoff_seconds": args.discovery_backoff_seconds,
+                       "cache_ttl_minutes": args.discovery_cache_ttl_minutes,
+                       "cache_max_age_hours": args.discovery_cache_max_age_hours},
             "limitations": ["Source publique de certificats; inventaire non exhaustif.",
                 "Un certificat generique ne revele pas les noms concrets qu'il peut couvrir.",
                 "Un nom historique peut ne plus resoudre; une adresse partagee ou un DNS generique ne prouve pas une application distincte."]}
@@ -875,7 +1014,8 @@ def run_campaign(args) -> int:
     atomic_json(output / "manifest.json", manifest)
     if not resolution_interrupted:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            resolutions = {executor.submit(resolve_target, target["hostname"], families, args.dns_timeout): target
+            resolutions = {executor.submit(resolve_target, target["hostname"], families, args.dns_timeout,
+                                             args.allow_non_global): target
                            for target in targets}
             try:
                 for future in as_completed(resolutions):
@@ -1000,10 +1140,181 @@ def run_campaign(args) -> int:
     return 130 if interrupted else 2 if failures else 0
 
 
+def _campaign_file(base: Path, relative: object, suffix: str | None = None) -> Path:
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise InputError("Chemin de campagne invalide dans le manifeste.")
+    candidate = (base / relative).resolve()
+    try:
+        candidate.relative_to(base.resolve())
+    except ValueError as exc:
+        raise InputError("Chemin de campagne hors du dossier de reprise.") from exc
+    if suffix is not None and candidate.suffix != suffix:
+        raise InputError("Extension de fichier de campagne invalide.")
+    return candidate
+
+
+def _completed_endpoint_is_reusable(output: Path, endpoint: dict) -> bool:
+    if endpoint.get("status") != "COMPLETED" or endpoint.get("returncode") != 0:
+        return False
+    try:
+        xml = _campaign_file(output, endpoint.get("xml"), ".xml")
+        parse_report(xml)
+        return True
+    except (InputError, ReportError):
+        return False
+
+
+def resume_campaign(args) -> int:
+    """Resume only unfinished endpoints from a persisted, validated snapshot."""
+    if args.targets or args.discover or args.discover_subdomains or args.discover_from or args.output:
+        raise InputError("--resume s'utilise seul, avec seulement les options d'execution/inventaire necessaires.")
+    output = args.resume.resolve()
+    manifest_path = output / "manifest.json"
+    try:
+        manifest = json.loads(read_text(manifest_path, MAX_MANIFEST_BYTES))
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise InputError("Manifeste de reprise JSON invalide.") from exc
+    if (not isinstance(manifest, dict) or str(manifest.get("schema_version")) != "1"
+            or not isinstance(manifest.get("targets"), list)
+            or not isinstance(manifest.get("http"), dict)):
+        raise InputError("Manifeste de reprise invalide.")
+    nmap = shutil.which(args.nmap)
+    if not nmap:
+        raise InputError("Nmap est introuvable. Installez Nmap ou renseignez --nmap.")
+    http = manifest["http"]
+    try:
+        args.http_timeout = int(http["timeout_ms"])
+        args.http_budget = int(http["budget_ms"])
+        args.max_requests = int(http["max_requests"])
+        args.redirects = int(http["redirects"])
+        args.samples = int(http["samples"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InputError("Parametres HTTP absents ou invalides dans le manifeste de reprise.") from exc
+    jobs = []
+    reusable = 0
+    for target in manifest["targets"]:
+        if not isinstance(target, dict) or not isinstance(target.get("hostname"), str):
+            raise InputError("Cible invalide dans le manifeste de reprise.")
+        name = hostname(target["hostname"])
+        raw_paths = target.get("requested_paths") or http.get("paths") or ["/"]
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise InputError(f"{name}: chemins de reprise invalides.")
+        if any("?[redacted]" in str(path) for path in raw_paths):
+            raise InputError(f"{name}: parametres HTTP expurges; fournir une nouvelle campagne avec les chemins complets.")
+        paths = [valid_path(path) for path in raw_paths]
+        endpoints = target.get("endpoints", [])
+        if not isinstance(endpoints, list):
+            raise InputError("Endpoints invalides dans le manifeste de reprise.")
+        for endpoint in endpoints:
+            if not isinstance(endpoint, dict) or not isinstance(endpoint.get("ip"), str):
+                raise InputError("Endpoint invalide dans le manifeste de reprise.")
+            address = ipaddress.ip_address(endpoint["ip"])
+            if not address.is_global and not args.allow_non_global:
+                endpoint.update(status="SKIPPED", error="NON_GLOBAL_ADDRESS",
+                                finished_at=utcnow(), returncode=None)
+                excluded = target.setdefault("excluded_addresses", [])
+                if str(address) not in excluded:
+                    excluded.append(str(address))
+                continue
+            if _completed_endpoint_is_reusable(output, endpoint):
+                reusable += 1
+                continue
+            xml = _campaign_file(output, endpoint.get("xml"), ".xml")
+            stdout = _campaign_file(output, endpoint.get("stdout"))
+            stderr = _campaign_file(output, endpoint.get("stderr"))
+            arguments = xml.with_suffix(".args")
+            arguments.unlink(missing_ok=True)
+            with os.fdopen(os.open(arguments, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                           "w", encoding="utf-8") as stream:
+                stream.write(nse_arguments(name, paths, args))
+            endpoint["family"] = "ipv4" if address.version == 4 else "ipv6"
+            endpoint["ports"] = port_expression(str(endpoint.get("ports") or manifest.get("ports") or "1-65535"))
+            endpoint["stdout"] = str(stdout.relative_to(output))
+            endpoint["stderr"] = str(stderr.relative_to(output))
+            endpoint["command"] = command_for(nmap, endpoint, arguments, xml.with_suffix(""), args)
+            endpoint.update(status="RUNNING", error=None, started_at=None, finished_at=None, returncode=None)
+            jobs.append(endpoint)
+    resumed = {"started_at": utcnow(), "finished_at": None,
+               "reused_endpoints": reusable, "retried_endpoints": len(jobs)}
+    manifest.setdefault("resumes", []).append(resumed)
+    manifest["status"] = "RUNNING"
+    atomic_json(manifest_path, manifest)
+    print(f"Reprise {manifest.get('campaign_id', output.name)}: {reusable} endpoints valides reutilises; "
+          f"{len(jobs)} a relancer.", flush=True)
+    control, interrupted = Processes(), False
+    executor = ThreadPoolExecutor(max_workers=args.workers)
+    futures = {}
+    try:
+        for endpoint in jobs:
+            futures[executor.submit(control.run, endpoint["command"], endpoint,
+                                    output, args.target_timeout)] = endpoint
+        pending, done_count, last_progress = set(futures), 0, time.monotonic()
+        while pending:
+            ready = [future for future in pending if future.done()]
+            for future in ready:
+                endpoint = futures[future]
+                try:
+                    endpoint.update(future.result())
+                except Exception as exc:
+                    endpoint.update(status="FAILED", error=f"RUNNER_ERROR: {type(exc).__name__}",
+                                    finished_at=utcnow())
+                pending.remove(future)
+                done_count += 1
+                atomic_json(manifest_path, manifest)
+                print(f"[{done_count}/{len(jobs)}] {endpoint['ip']} {endpoint['status']}", flush=True)
+            if time.monotonic() - last_progress >= 30:
+                print(f"Progression reprise: {done_count}/{len(jobs)} termines; {len(pending)} en attente/en cours.",
+                      flush=True)
+                last_progress = time.monotonic()
+            if pending:
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("Interruption de la reprise; conservation du bilan partiel.", file=sys.stderr, flush=True)
+        control.stop()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        for future, endpoint in futures.items():
+            if future.cancelled():
+                endpoint.update(status="SKIPPED", error="CAMPAIGN_INTERRUPTED", finished_at=utcnow())
+            elif future.done():
+                try:
+                    endpoint.update(future.result())
+                except Exception:
+                    endpoint.update(status="FAILED", error="RUNNER_ERROR", finished_at=utcnow())
+        for arguments in (output / "raw").glob("*.args"):
+            arguments.unlink()
+    all_endpoints = [endpoint for target in manifest["targets"] for endpoint in target.get("endpoints", [])]
+    discovery_incomplete = bool(manifest.get("discovery", {}).get("enabled")
+                                and not manifest["discovery"].get("processing_complete"))
+    failures = (discovery_incomplete
+                or any(target.get("dns_status") != "RESOLVED" or target.get("dns_partial")
+                       for target in manifest["targets"])
+                or any(not _completed_endpoint_is_reusable(output, endpoint) for endpoint in all_endpoints))
+    manifest["status"] = "PARTIAL" if failures or interrupted else "COMPLETED"
+    manifest["finished_at"] = utcnow()
+    resumed["finished_at"] = manifest["finished_at"]
+    atomic_json(manifest_path, manifest)
+    report = build_campaign_report(manifest, output, inventory=args.inventory, previous=args.previous,
+                                   max_inventory_age_hours=args.inventory_max_age_hours)
+    if not report["summary"].get("processing_complete", True):
+        manifest["status"] = "PARTIAL"
+        atomic_json(manifest_path, manifest)
+        report["campaign"]["status"] = "PARTIAL"
+        failures = True
+    write_campaign_report(report, output)
+    results = compact_rows(report["rows"])
+    print(f"Reprise terminee: " + ", ".join(
+        f"{verdict}={sum(row['vulnerable'] == verdict for row in results)}"
+        for verdict in ("OUI", "NON", "INDETERMINE")))
+    print(f"Rapports: {output / 'report.csv'} et {output / 'report.json'}")
+    return 130 if interrupted else 2 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        return run_campaign(args)
+        return resume_campaign(args) if args.resume else run_campaign(args)
     except (InputError, OSError, ValueError) as exc:
         print(f"Erreur: {exc}", file=sys.stderr)
         return 2

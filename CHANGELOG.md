@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.5 — 2026-10-23
+
+- Exclusion systématique avant Nmap des adresses DNS non globales, avec conservation explicite des adresses rejetées et du motif `NO_PUBLIC_ADDRESS` dans les rapports de couverture.
+- Cache de découverte crt.sh avec cooldown de 30 minutes, repli borné à 24 heures et traçabilité de l'âge et du mode d'utilisation.
+- Deux nouvelles tentatives avec backoff exponentiel et jitter sur les erreurs transitoires HTTP 502/503/504 de crt.sh.
+- Reprise de campagne avec `--resume` : validation et réutilisation des XML terminés, reconstruction sûre des commandes et relance des seuls endpoints incomplets.
+
+Le lanceur passe à **0.4.5** ; le NSE reste en **0.3.2**. Les seuils PHP et les règles de décision des verdicts sont inchangés.
+
 ## 0.4.4 — 2026-10-23
 
 ### Compatibilité WAF et résolution DNS

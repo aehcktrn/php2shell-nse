@@ -104,6 +104,44 @@ class CampaignInputTests(unittest.TestCase):
         self.assertEqual({item.name for item in self.root.iterdir()}, {"domains.txt", "results"})
         self.assertEqual(targets.read_text(), "app.example.com\n")
 
+    def test_resume_retries_only_failed_endpoint_and_rebuilds_report(self):
+        targets = self.file("resume-domains.txt", "app.example.com\n")
+        output = self.root / "resume-campaign"
+
+        def public_resolution(*_args):
+            address = "93.184.216.34"
+            return {"dns_status": "RESOLVED", "addresses": [address], "dns_error": "",
+                    "dns_partial": False,
+                    "dns_families": {"ipv4": {"status": "RESOLVED", "addresses": [address]}}}
+
+        def failed(_command, endpoint, _output, _timeout):
+            return {**endpoint, "status": "FAILED", "returncode": 1,
+                    "error": "fixture failure", "finished_at": scan.utcnow()}
+
+        initial = self.args(targets, "--output", output, "--families", "ipv4", "--ports", "443")
+        with patch.object(scan, "resolve_target", side_effect=public_resolution), \
+             patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan.Processes, "run", side_effect=failed):
+            self.assertEqual(scan.run_campaign(initial), 2)
+
+        def completed(_command, endpoint, base, _timeout):
+            xml_file(base / endpoint["xml"], name="app.example.com", ip=endpoint["ip"],
+                     state="PATCHED_VERSION_ADVERTISED", version="8.3.36")
+            return {**endpoint, "status": "COMPLETED", "returncode": 0,
+                    "error": None, "finished_at": scan.utcnow()}
+
+        resume = self.args("--resume", output, "--workers", "1")
+        with patch.object(scan.shutil, "which", return_value="/fixture/nmap"), \
+             patch.object(scan.Processes, "run", side_effect=completed) as runner, \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(scan.resume_campaign(resume), 0)
+        runner.assert_called_once()
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["status"], "COMPLETED")
+        self.assertEqual(manifest["resumes"][-1]["retried_endpoints"], 1)
+        compact = json.loads((output / "report.json").read_text())
+        self.assertEqual((compact[0]["php"], compact[0]["vulnerable"]), ("8.3.36", "NON"))
+
     def test_explicit_profiles_and_custom_ports_still_control_the_plan(self):
         targets = self.file("domains.txt", "app.example.com\n")
         cases = (
@@ -247,8 +285,8 @@ class CampaignInputTests(unittest.TestCase):
         self.assertEqual(command[command.index("--script-timeout") + 1], "22s")
 
     def test_dns_normal_absence_of_aaaa_is_not_partial_failure(self):
-        payload = {"addresses": ["192.0.2.10"], "families": {
-            "ipv4": {"status": "RESOLVED", "addresses": ["192.0.2.10"]},
+        payload = {"addresses": ["93.184.216.34"], "families": {
+            "ipv4": {"status": "RESOLVED", "addresses": ["93.184.216.34"]},
             "ipv6": {"status": "NO_ADDRESS", "addresses": []}}}
         completed = subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
         with patch.object(scan.subprocess, "run", return_value=completed):
@@ -257,26 +295,49 @@ class CampaignInputTests(unittest.TestCase):
         self.assertFalse(result["dns_partial"])
 
     def test_dns_ipv4_mapped_ipv6_is_not_scanned_twice(self):
-        payload = {"addresses": ["192.0.2.10", "::ffff:192.0.2.10"], "families": {
-            "ipv4": {"status": "RESOLVED", "addresses": ["192.0.2.10"]},
-            "ipv6": {"status": "RESOLVED", "addresses": ["::ffff:192.0.2.10"]}}}
+        payload = {"addresses": ["93.184.216.34", "::ffff:93.184.216.34"], "families": {
+            "ipv4": {"status": "RESOLVED", "addresses": ["93.184.216.34"]},
+            "ipv6": {"status": "RESOLVED", "addresses": ["::ffff:93.184.216.34"]}}}
         completed = subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
         with patch.object(scan.subprocess, "run", return_value=completed):
             result = scan.resolve_target("app.example.com", ["ipv4", "ipv6"], 1)
-        self.assertEqual(result["addresses"], ["192.0.2.10"])
+        self.assertEqual(result["addresses"], ["93.184.216.34"])
         self.assertEqual(result["dns_families"]["ipv6"],
                          {"status": "NO_ADDRESS", "addresses": []})
         self.assertFalse(result["dns_partial"])
 
     def test_dns_timeout_preserves_successful_family(self):
-        partial = {"addresses": ["192.0.2.10"], "families": {
-            "ipv4": {"status": "RESOLVED", "addresses": ["192.0.2.10"]}}}
+        partial = {"addresses": ["93.184.216.34"], "families": {
+            "ipv4": {"status": "RESOLVED", "addresses": ["93.184.216.34"]}}}
         error = subprocess.TimeoutExpired([], 1, output=(json.dumps(partial) + "\n").encode())
         with patch.object(scan.subprocess, "run", side_effect=error):
             result = scan.resolve_target("app.example.com", ["ipv4", "ipv6"], 1)
-        self.assertEqual(result["addresses"], ["192.0.2.10"])
+        self.assertEqual(result["addresses"], ["93.184.216.34"])
         self.assertTrue(result["dns_partial"])
         self.assertEqual(result["dns_families"]["ipv6"]["status"], "TIMEOUT")
+
+    def test_dns_non_global_addresses_are_recorded_but_never_scanned(self):
+        payload = {"addresses": ["172.18.120.22", "127.0.0.1", "93.184.216.34"], "families": {
+            "ipv4": {"status": "RESOLVED", "addresses": [
+                "172.18.120.22", "127.0.0.1", "93.184.216.34"]}}}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
+        with patch.object(scan.subprocess, "run", return_value=completed):
+            result = scan.resolve_target("app.example.com", ["ipv4"], 1)
+        self.assertEqual(result["dns_status"], "RESOLVED")
+        self.assertEqual(result["addresses"], ["93.184.216.34"])
+        self.assertEqual(result["excluded_addresses"], ["127.0.0.1", "172.18.120.22"])
+        self.assertEqual(result["dns_families"]["ipv4"]["excluded_addresses"],
+                         ["127.0.0.1", "172.18.120.22"])
+
+    def test_dns_only_non_global_addresses_is_an_explicit_coverage_gap(self):
+        payload = {"addresses": ["172.18.120.22"], "families": {
+            "ipv4": {"status": "RESOLVED", "addresses": ["172.18.120.22"]}}}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
+        with patch.object(scan.subprocess, "run", return_value=completed):
+            result = scan.resolve_target("internal.example.com", ["ipv4"], 1)
+        self.assertEqual(result["dns_status"], "NO_PUBLIC_ADDRESS")
+        self.assertEqual(result["addresses"], [])
+        self.assertIn("172.18.120.22", result["dns_error"])
 
     def test_dns_total_timeout_retains_both_family_failures(self):
         with patch.object(scan.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 1)):
