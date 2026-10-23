@@ -800,9 +800,12 @@ class CompactReportTests(unittest.TestCase):
 
     def test_compact_previous_loads_only_matching_companion(self):
         old = details([assessment()])
+        original = deepcopy(old)
         report.write_campaign_report(old, self.base)
-        self.assertEqual(report.load_campaign_report(self.base / "report.json"), old)
-        self.assertEqual(report.load_campaign_report(self.base / "raw/report-details.json"), old)
+        expected = {**old, "tool_version": report.RENDERER_VERSION}
+        self.assertEqual(report.load_campaign_report(self.base / "report.json"), expected)
+        self.assertEqual(report.load_campaign_report(self.base / "raw/report-details.json"), expected)
+        self.assertEqual(old, original)
 
     def test_v042_compact_previous_accepts_exact_legacy_explanation(self):
         old = {**details([assessment(port="80", state="POTENTIALLY_VULNERABLE", version="8.3.35"),

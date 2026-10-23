@@ -37,7 +37,7 @@ from campaign_state import CampaignLock, EventLedger, StateError
 from http_campaign import discovery_command, run_collection, _private_write
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024

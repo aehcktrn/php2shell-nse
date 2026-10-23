@@ -39,6 +39,7 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_service_budget.py'
           python3 -m unittest discover -s tests -p 'test_http_campaign.py'
           python3 -m unittest discover -s tests -p 'test_collection_report.py'
+          python3 -m unittest discover -s tests -p 'test_redirect_coverage.py'
 
       - name: Run HTTP and HTTPS integration tests on loopback
         run: python3 tests/integration.py

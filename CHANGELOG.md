@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1 — 2026-10-23
+
+- Distinction entre destination hors périmètre, destination non visitée et destination effectivement contrôlée mais non conclusive sur PHP. Les réponses HTTP `403`/`404` et l'absence de version ne deviennent plus des exclusions de périmètre.
+- Conservation séparée des preuves de visite exacte et de la conclusion PHP, sans transformer une réponse HTTP seule en verdict non vulnérable. Corrélation toujours stricte sur les IP, protocoles, ports, chemins et paramètres.
+- Confirmation du périmètre DNS à profondeur quelconque et préservation de la lecture des rapports historiques.
+
+Le lanceur passe à **0.6.1** ; le NSE reste en **0.4.0**. Aucun nouveau scan n'est nécessaire pour régénérer les rapports d'une campagne conservée.
+
 ## 0.6.0 — 2026-10-23
 
 - Planification par le lanceur des destinations exactes des redirections autorisées, en conservant Host/SNI, les adresses épinglées, les exclusions et les ports de campagne. L'identité d'URL distingue les queries expurgées ; les boucles et la limite de chaîne sont communes aux phases.

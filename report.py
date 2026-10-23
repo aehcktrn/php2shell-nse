@@ -40,6 +40,7 @@ COMPACT_VERDICTS = ("OUI", "NON", "INDETERMINE")
 MAX_COMPACT_EXPLANATION = 360
 MAX_SUMMARY_PORTS = 10
 SCRIPT_ID = "http-php2shell"
+RENDERER_VERSION = "0.6.1"
 STATES = ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED", "UNKNOWN")
 PRIORITIES = {
     "POTENTIALLY_VULNERABLE": "PATCH_OR_VERIFY_BACKPORT",
@@ -332,6 +333,10 @@ def _redirect_observation_destination(observation: dict[str, Any]) -> str:
     return _single_line(observation.get("redirect_to"))
 
 
+def _modern_redirect_row(row: dict[str, Any]) -> bool:
+    return bool(row.get("collection_service_key")) and not row.get("_historical_redirect_semantics")
+
+
 def _observation_matches_path(candidate: dict[str, Any], request_target: str) -> bool:
     observations = candidate.get("observations")
     return isinstance(observations, list) and any(
@@ -401,9 +406,10 @@ def _redirect_destinations_by_coverage(
             destination = _redirect_observation_destination(observation)
             if not destination:
                 continue
-            bucket = (assessed if assessment_index is not None
-                      and _redirect_destination_was_assessed(row, destination, assessment_index, observation)
-                      else unassessed)
+            covered = ((_modern_redirect_row(row) and _true(observation.get("redirect_evaluated")))
+                       or (assessment_index is not None and _redirect_destination_was_assessed(
+                           row, destination, assessment_index, observation)))
+            bucket = assessed if covered else unassessed
             bucket.append(destination)
     return _unique(unassessed), _unique(assessed)
 
@@ -675,7 +681,8 @@ def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]],
             except ValueError:
                 return False
         return (not row.get("collection_gaps") and bool(observations)
-                and all(isinstance(item, dict) and _true(item.get("redirect_evaluated"))
+                and all(isinstance(item, dict) and _true(item.get(
+                    "redirect_conclusive" if _modern_redirect_row(row) else "redirect_evaluated"))
                         and same_name(item) for item in observations))
     if (row.get("row_type") != "ASSESSMENT"
             or row.get("reason_code") != "REDIRECT_NOT_ASSESSED"
@@ -738,7 +745,20 @@ def _unknown_reason(row: dict[str, Any],
     if row.get("inventory_patch_status") == "CONFLICT":
         return "Preuves serveur contradictoires ; vérifier le runtime"
     code = row.get("traversal_reason_code") or row.get("reason_code")
+    if _modern_redirect_row(row) and not _version_values(row.get("versions")):
+        observations = [item for item in row.get("observations", []) if isinstance(item, dict)]
+        statuses = {_single_line(item.get("http_status")) for item in observations
+                    if _single_line(item.get("http_status")).isdigit()
+                    and not 300 <= int(_single_line(item.get("http_status"))) < 400}
+        gap_statuses = {_single_line(item.get("http_status")) for item in row.get("collection_gaps", [])
+                        if isinstance(item, dict) and _single_line(item.get("http_status")).isdigit()}
+        if statuses == {"404"}:
+            return "HTTP 404 : pages demandées introuvables ; version PHP non identifiée"
+        if gap_statuses == {"404"}:
+            return "HTTP 404 à la destination ; version PHP non identifiée"
     if code == "REDIRECT_NOT_ASSESSED" and _redirect_row_was_assessed_separately(row, assessment_index):
+        if _modern_redirect_row(row):
+            return "Destination de redirection visitée ; conclusion PHP indéterminée"
         return "Destination de redirection évaluée séparément dans la campagne"
     if code in COMPACT_REASONS:
         return COMPACT_REASONS[code]
@@ -871,12 +891,13 @@ def _cross_host_first(destinations: list[str], rows: list[dict[str, Any]]) -> li
 def _redirect_summary(rows: list[dict[str, Any]],
                       assessment_index: dict[tuple[str, int, str, str], set[int]]
                       | None = None) -> str:
-    unassessed, assessed = _redirect_destinations_by_coverage(rows, assessment_index)
+    parts = _redirect_coverage_summaries(rows, bounded=True)
+    legacy_rows = [row for row in rows if not _modern_redirect_row(row)]
+    unassessed, assessed = _redirect_destinations_by_coverage(legacy_rows, assessment_index)
     # v0.5.0 companion validation preserves its original encounter order.
     if assessment_index is not None:
         unassessed = _cross_host_first(unassessed, rows)
         assessed = _cross_host_first(assessed, rows)
-    parts = []
     if unassessed:
         label = "destination non évaluée" if len(unassessed) == 1 else "destinations non évaluées"
         parts.append(f"HORS PÉRIMÈTRE DU CONTRÔLE — {label} : {_destination_listing(unassessed)}.")
@@ -884,6 +905,75 @@ def _redirect_summary(rows: list[dict[str, Any]],
         label = "destination évaluée séparément" if len(assessed) == 1 else "destinations évaluées séparément"
         parts.append(f"Dans la campagne — {label} : {_destination_listing(assessed)}.")
     return _short(" ".join(parts), 245)
+
+
+OUTSIDE_REDIRECT_SCOPES = frozenset({
+    "OUTSIDE_AUTHORIZED_DOMAINS", "UNAUTHORIZED_PORT", "EXCLUDED_BY_OPERATOR", "NO_PUBLIC_ADDRESS",
+})
+
+
+def _redirect_coverage_summaries(rows: list[dict[str, Any]], *, bounded: bool = False) -> list[str]:
+    """Report authorization, physical visits and PHP conclusions separately."""
+    groups: dict[tuple[str, bool, bool, str, tuple[str, ...]], list[str]] = {}
+    for row in rows:
+        if not _modern_redirect_row(row):
+            continue
+        for observation in row.get("observations", []):
+            if not isinstance(observation, dict):
+                continue
+            destination = _redirect_observation_destination(observation)
+            if not destination:
+                continue
+            scope = _single_line(observation.get("redirect_scope") or "UNKNOWN")
+            visited = _true(observation.get("redirect_evaluated"))
+            conclusive = _true(observation.get("redirect_conclusive"))
+            reason = _single_line(observation.get("redirect_coverage_reason"))
+            raw_statuses = observation.get("redirect_destination_http_statuses", [])
+            if not isinstance(raw_statuses, list):
+                raw_statuses = [raw_statuses]
+            causal_status = _single_line(observation.get("redirect_coverage_http_status"))
+            statuses = tuple(sorted({_single_line(value) for value in raw_statuses + [causal_status]
+                                     if _single_line(value).isdigit() and 100 <= int(_single_line(value)) <= 599}))
+            key = scope, visited, conclusive, reason, statuses
+            destinations = groups.setdefault(key, [])
+            if destination not in destinations:
+                destinations.append(destination)
+    labels = {
+        "PHP_NOT_IDENTIFIED": "PHP non identifié",
+        "PHP_VERSION_HIDDEN": "version PHP non publiée",
+        "AUTHENTICATION_REQUIRED": "authentification requise",
+        "HTTP_ACCESS_DENIED": "accès refusé",
+        "RATE_LIMITED": "requêtes limitées",
+    }
+    result = []
+    ordered = sorted(groups.items(), key=lambda item: (
+        0 if item[0][0] in OUTSIDE_REDIRECT_SCOPES else 1 if not item[0][1] else 2,
+        item[0][2],
+    ))
+    for (scope, visited, conclusive, reason, statuses), destinations in ordered:
+        outside = scope in OUTSIDE_REDIRECT_SCOPES
+        prefix = "HORS PÉRIMÈTRE AUTORISÉ — " if outside else "DANS LE PÉRIMÈTRE — " if scope == "IN_SCOPE" else ""
+        plural = len(destinations) != 1
+        label = ("destinations " if plural else "destination ")
+        label += ("VISITÉES" if plural else "VISITÉE") if visited else ("NON VISITÉES" if plural else "NON VISITÉE")
+        details = []
+        if statuses:
+            details.append("HTTP " + "/".join(statuses))
+        if conclusive:
+            details.append("conclusion PHP établie")
+        else:
+            cause = labels.get(reason) or COMPACT_REASONS.get(reason)
+            if visited and not outside and reason in OUTSIDE_REDIRECT_SCOPES:
+                cause = "suite de la chaîne vers une destination hors périmètre"
+            if cause:
+                details.append(cause)
+            elif visited:
+                details.append("conclusion PHP indéterminée")
+        listing = (_destination_listing(_cross_host_first(destinations, rows)) if bounded else
+                   ", ".join(_cross_host_first(destinations, rows)))
+        result.append(prefix + label + ((" ; " + " ; ".join(details)) if details else "")
+                      + " : " + listing + ("." if bounded else ""))
+    return result
 
 
 def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str,
@@ -1166,8 +1256,9 @@ def _report_indeterminate_causes(report: dict[str, Any]) -> dict[str, list[str]]
         relevant = [row for row in group if not _non_web_coverage(row)]
         conclusive = [row for row in relevant
                       if not _covered_redirect_is_navigation_only(row, relevant)]
-        causes = []
-        unassessed, assessed = _redirect_destinations_by_coverage(conclusive, assessment_index)
+        causes = _redirect_coverage_summaries(conclusive)
+        legacy_rows = [row for row in conclusive if not _modern_redirect_row(row)]
+        unassessed, assessed = _redirect_destinations_by_coverage(legacy_rows, assessment_index)
         for destinations, prefix, singular, plural in (
             (unassessed, "HORS PÉRIMÈTRE DU CONTRÔLE", "destination non évaluée", "destinations non évaluées"),
             (assessed, "Dans la campagne", "destination évaluée séparément", "destinations évaluées séparément"),
@@ -1344,6 +1435,12 @@ def _historical_compact_rows(details: dict[str, Any]) -> list[dict[str, str]] | 
         return None
     minor, patch = int(match.group(1)), int(match.group(2))
     rows = details["rows"]
+    if minor == 6 and patch == 0:
+        # In 0.6.0 redirect_evaluated combined a physical visit and a PHP
+        # conclusion. This marker exists only in the compatibility renderer;
+        # current verdicts require redirect_conclusive explicitly.
+        return compact_rows([{**row, "_historical_redirect_semantics": True}
+                             if row.get("collection_service_key") else row for row in rows])
     if minor == 5 and patch <= 3:
         coverage = "current" if patch == 0 else "campaign"
         return compact_rows(rows, redirect_coverage=coverage, historical_semantics=True)
@@ -1708,6 +1805,21 @@ def _reconcile_collection_gaps(rows: list[dict[str, Any]]) -> None:
             destinations.setdefault(key, []).append(row)
     edge_cache: dict[int, bool] = {}
 
+    def received(observation):
+        status = str(observation.get("http_status", ""))
+        return status.isdecimal() and 100 <= int(status) <= 599
+
+    def append_gap(row, reason, path, identity, *, status="", evaluated=False):
+        gap = {"reason_code": reason, "path": path, "path_identity": identity,
+               "coverage_status": "VISITED_INDETERMINATE" if evaluated else "NOT_VISITED",
+               "coverage_scope": "DESTINATION"}
+        if status:
+            gap["http_status"] = status
+        marker = reason, identity, status
+        if not any((item.get("reason_code"), item.get("path_identity"), item.get("http_status", "")) == marker
+                   for item in row["collection_gaps"]):
+            row["collection_gaps"].append(gap)
+
     def redirect_context(row, observation):
         identity = str(observation.get("redirect_identity", ""))
         matching = destinations.get((row["collection_service_key"], identity), [])
@@ -1719,28 +1831,65 @@ def _reconcile_collection_gaps(rows: list[dict[str, Any]]) -> None:
             or _unique([item["ip"] for item in matching]) or [row["ip"]]
         return identity, matching, recorded, addresses
 
-    def request_conclusive(row, observation, visiting):
+    def request_result(row, observation, visiting):
         status = str(observation.get("http_status", ""))
         if status.isdigit() and 300 <= int(status) < 400 and status != "304":
-            return edge_conclusive(row, observation, visiting)
-        return _collection_observation_conclusive(row, observation)
+            conclusive = edge_conclusive(row, observation, visiting)
+            return (conclusive, "" if conclusive else observation.get("redirect_coverage_reason")
+                    or "REDIRECT_NOT_ASSESSED", observation.get("redirect_coverage_http_status", ""))
+        if _collection_observation_conclusive(row, observation):
+            return True, "", status
+        reason = {"401": "AUTHENTICATION_REQUIRED", "403": "HTTP_ACCESS_DENIED", "429": "RATE_LIMITED"}.get(status)
+        if not reason:
+            reason = (observation.get("reason_code") or row.get("collection_original_reason_code")
+                      or "PHP_NOT_IDENTIFIED") if received(observation) else "NO_HTTP_RESPONSE"
+        return False, str(reason), status if received(observation) else ""
+
+    def destination_result(candidates, visiting, fallback_rows=()):
+        results = [request_result(candidate, observation, visiting) for candidate, observation in candidates]
+        if any(result[0] for result in results):
+            return True, "", ""
+        if not results:
+            gap = next((gap for candidate in fallback_rows for gap in candidate.get("collection_gaps", [])
+                        if gap.get("reason_code")), None)
+            if gap is not None:
+                return False, str(gap["reason_code"]), str(gap.get("http_status", ""))
+        # Keep an actionable refusal rather than a generic missing-version
+        # cause when repeated observations have different outcomes.
+        return next((result for result in results if result[1] in (
+            "AUTHENTICATION_REQUIRED", "HTTP_ACCESS_DENIED", "RATE_LIMITED")),
+            results[0] if results else (False, "REDIRECT_NOT_ASSESSED", ""))
 
     def edge_conclusive(row, observation, visiting=frozenset()):
         marker = id(observation)
         if marker in edge_cache:
             return edge_cache[marker]
         if marker in visiting or len(visiting) >= 32:
+            observation["redirect_coverage_reason"] = "REDIRECT_LOOP" if marker in visiting else "CHAIN_LIMIT"
             return False
         identity, matching, recorded, addresses = redirect_context(row, observation)
         observation["redirect_destination_ips"] = addresses
-        blocked = any(item.get("status") == "UNASSESSED" and item.get("reason_code") for item in recorded)
+        blocked = next((str(item["reason_code"]) for item in recorded
+                        if item.get("status") == "UNASSESSED" and item.get("reason_code")), "")
+        candidates = {address: index.get((identity, address), []) for address in addresses}
+        physical = bool(identity) and all(any(received(item) for _, item in candidates[address])
+                                          for address in addresses)
+        observation["redirect_evaluated"] = "true" if physical else "false"
+        observation["redirect_destination_http_statuses"] = sorted({str(item["http_status"])
+            for entries in candidates.values() for _, item in entries if received(item)}, key=int)
+        outside = {"OUTSIDE_AUTHORIZED_DOMAINS", "EXCLUDED_BY_OPERATOR", "UNAUTHORIZED_PORT", "NO_PUBLIC_ADDRESS"}
+        observation["redirect_scope"] = (blocked if blocked in outside else
+            "IN_SCOPE" if recorded or matching else "UNKNOWN")
+        outcomes = [destination_result(candidates[address], visiting | {marker},
+                                       [candidate for candidate in matching if candidate["ip"] == address])
+                    for address in addresses]
         covered = bool(identity) and not blocked \
-            and bool(matching or any(index.get((identity, address)) for address in addresses)) \
-            and all(any(request_conclusive(candidate, requested, visiting | {marker})
-                        for candidate, requested in index.get((identity, address), []))
-                    for address in addresses)
+            and bool(matching or any(candidates.values())) and all(result[0] for result in outcomes)
         edge_cache[marker] = covered
-        observation["redirect_evaluated"] = "true" if covered else "false"
+        observation["redirect_conclusive"] = "true" if covered else "false"
+        failure = next((result for result in outcomes if not result[0]), (False, "REDIRECT_NOT_ASSESSED", ""))
+        observation["redirect_coverage_reason"] = "" if covered else blocked or failure[1]
+        observation["redirect_coverage_http_status"] = "" if covered else failure[2]
         return covered
 
     # Resolve complete navigation chains before deciding whether a 302 that
@@ -1755,9 +1904,10 @@ def _reconcile_collection_gaps(rows: list[dict[str, Any]]) -> None:
                 continue
             identity = str(destination.get("path_identity", ""))
             exact = index.get((identity, row["ip"]), [])
-            if not any(request_conclusive(candidate, observation, frozenset()) for candidate, observation in exact):
-                row["collection_gaps"].append({"reason_code": str(destination.get("reason_code")
-                    or "REDIRECT_NOT_ASSESSED"), "path": destination.get("path", ""), "path_identity": identity})
+            conclusive, reason, status = destination_result(exact, frozenset(), [row])
+            if not conclusive:
+                append_gap(row, str(destination.get("reason_code") or reason), destination.get("path", ""),
+                           identity, status=status, evaluated=any(received(item) for _, item in exact))
     for row in managed:
         for observation in row.get("observations", []):
             identity = str(observation.get("redirect_identity", ""))
@@ -1771,10 +1921,10 @@ def _reconcile_collection_gaps(rows: list[dict[str, Any]]) -> None:
             _, _, recorded, _ = redirect_context(row, observation)
             covered = edge_conclusive(row, observation)
             if not covered:
-                code = next((str(item["reason_code"]) for item in recorded if item.get("reason_code")),
-                            "REDIRECT_NOT_ASSESSED")
-                row["collection_gaps"].append({"reason_code": code,
-                    "path": observation.get("redirect_to", ""), "path_identity": identity})
+                code = observation.get("redirect_coverage_reason") or "REDIRECT_NOT_ASSESSED"
+                append_gap(row, code, observation.get("redirect_to", ""), identity,
+                           status=observation.get("redirect_coverage_http_status", ""),
+                           evaluated=_true(observation.get("redirect_evaluated")))
         gaps = row["collection_gaps"]
         if gaps:
             uncertain = any(gap.get("reason_code") == "HTTP_BUDGET_UNCERTAIN" for gap in gaps)
@@ -1784,11 +1934,16 @@ def _reconcile_collection_gaps(rows: list[dict[str, Any]]) -> None:
                 row["notes"].append("Quota réservé conservativement après interruption ; consommation exacte inconnue.")
             row["traversal_complete"], row["traversal_reason_code"] = "false", code
             row["budget_exhausted"] = "true" if any(gap.get("reason_code") in (
-                "REQUEST_BUDGET_EXHAUSTED", "HTTP_BUDGET_UNCERTAIN") for gap in gaps) else "false"
+                "REQUEST_BUDGET_EXHAUSTED", "HTTP_BUDGET_UNCERTAIN")
+                and gap.get("coverage_scope") != "DESTINATION" for gap in gaps) else "false"
             row["reason_code"] = code
             row["reason"] = COMPACT_REASONS.get(code, "Contrôle HTTP planifié non terminé.")
         row["redirect_destinations"] = " | ".join(_unassessed_redirect_destinations([row]))
-        row["redirect_evaluation_scope"] = "HORS_PERIMETRE_DU_CONTROLE" if row["redirect_destinations"] else ""
+        scopes = {item.get("redirect_scope", "UNKNOWN") for item in row.get("observations", [])
+                  if item.get("redirect_to") and not _true(item.get("redirect_evaluated"))}
+        row["redirect_evaluation_scope"] = ("HORS_PERIMETRE_DU_CONTROLE" if scopes & {
+            "OUTSIDE_AUTHORIZED_DOMAINS", "EXCLUDED_BY_OPERATOR", "UNAUTHORIZED_PORT", "NO_PUBLIC_ADDRESS"}
+            else "IN_SCOPE" if "IN_SCOPE" in scopes else "UNKNOWN" if scopes else "")
 
 
 def merge_collection_rows(rows: list[dict[str, Any]], collection: dict[str, Any], base_dir: Path,
@@ -1881,6 +2036,7 @@ def collection_metrics(rows: list[dict[str, Any]], collection: dict[str, Any],
     for row in managed:
         if _true(row.get("budget_exhausted")) or any(
                 gap.get("reason_code") in ("REQUEST_BUDGET_EXHAUSTED", "HTTP_BUDGET_UNCERTAIN")
+                and gap.get("coverage_scope") != "DESTINATION"
                 for gap in row.get("collection_gaps", [])):
             counts["services_budget_exhausted"] += 1
         for part in row.get("collection_parts", []):
@@ -2161,7 +2317,7 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
     }
     if collection is not None:
         summary["collection_metrics"] = collection_metrics(rows, collection, manifest.get("http_services"))
-    result = {"schema_version": "1", "tool_version": str(manifest.get("tool_version") or "0.3.0"),
+    result = {"schema_version": "1", "tool_version": RENDERER_VERSION,
               "campaign": {key: manifest.get(key) for key in ("campaign_id", "started_at", "finished_at", "status", "profile", "ports", "address_families", "http", "limits", "scope")},
               "generated_at": now.isoformat(), "summary": summary, "rows": rows, "changes": [],
               "excluded_candidates": manifest.get("excluded_candidates", []),
@@ -2170,6 +2326,7 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
                   "Une absence d'evaluation ou de signal reseau ne confirme pas l'application du correctif.",
                   "Les preuves serveur importees restent des attestations dont l'authenticite et l'exhaustivite sont a valider par l'operateur.",
               ]}
+    result["campaign"]["scan_tool_version"] = str(manifest.get("tool_version") or "0.3.0")
     if collection is not None:
         result["campaign"]["http_collection"] = {
             "schema_version": collection["schema_version"], "status": collection.get("status", "PARTIAL"),
@@ -2201,6 +2358,9 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
 def write_campaign_report(report: dict, output_dir: Path) -> None:
     """Write each artifact atomically; publish JSON last as completion marker."""
     output_dir = Path(output_dir)
+    # Companion validation must identify the renderer that actually wrote the
+    # compact artifact, even when re-exporting evidence from an older scan.
+    report = {**report, "tool_version": RENDERER_VERSION}
     # Validate both forms before touching any existing artifact. Keep evidence
     # and service-level comparison data out of the operator's main reports.
     compact = compact_rows(_validate_detailed(report)["rows"])

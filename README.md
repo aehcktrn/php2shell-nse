@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.6.0**, module NSE **0.4.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.6.1**, module NSE **0.4.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions explicitement publiées dans les en-têtes HTTP et les diagnostics `phpinfo()` déjà accessibles. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi des destinations exactes des redirections, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -163,7 +163,7 @@ python3 scan.py domaines.txt \
 
 **Conservez le dossier de campagne complet.** Pour un `report.json` compact, `--previous` charge automatiquement `raw/report-details.json` dans le même dossier et vérifie que les deux rapports correspondent. Un compagnon absent ou incohérent est refusé avant les accès réseau. Les anciens rapports JSON détaillés de schéma `1` restent acceptés directement, sans fichier compagnon. Cette règle vaut aussi pour le profil `recontrole`.
 
-Les rapports compacts des versions 0.4.1 à 0.5.5 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouvelles campagnes appliquent les règles de collecte 0.6.0 ; la comparaison des versions et les seuils PHP restent inchangés.
+Les rapports compacts des versions 0.4.1 à 0.6.0 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouveaux rapports identifient séparément leur version de restitution et la version du scan d'origine ; la comparaison des versions et les seuils PHP restent inchangés.
 
 Les changements sont classés en `NEW`, `CHANGED`, `UNCHANGED` et `NO_LONGER_OBSERVED`, en conservant nom, IP, port et protocole. Un changement DNS peut apparaître comme un nouveau service et un ancien non observé. **La disparition d'un service ne prouve pas sa correction.** Les changements de périmètre, de ports ou de visibilité doivent être pris en compte.
 
@@ -272,11 +272,13 @@ Le fichier positionnel est facultatif si `--discover-from` ou l'ancienne option 
 
 | Entrée | Effet |
 |---|---|
-| `example.com` dans `domaines.txt` avec `--discover`, ou dans le fichier `--scope` | Autorise ce nom et ses sous-domaines. |
+| `example.com` dans `domaines.txt` avec `--discover`, ou dans le fichier `--scope` | Autorise ce nom et tous ses descendants DNS, sans limite de profondeur (`a.example.com`, `a.b.example.com`, etc.). |
 | `archive.example.com` dans `exclusions.txt` | Exclut ce nom exact. |
 | `*.sandbox.example.com` dans `exclusions.txt` | Exclut les sous-domaines de cette zone, **pas** `sandbox.example.com` lui-même. |
 
 Pour exclure une zone entière, ajoutez son nom exact et `*.zone`. Les noms hors périmètre, invalides, ambigus ou exclus restent dans le manifeste avec leur provenance et leur motif de rejet. La propriété des domaines est déclarée par l'opérateur ; le programme ne la vérifie pas.
+
+Le rapport distingue une destination réellement hors périmètre, une destination autorisée mais non visitée et une destination visitée dont le statut PHP reste indéterminé. Une réponse `404` ou une version PHP non identifiable n'exclut jamais un sous-domaine du périmètre. Le masquage `?[redacted]` ne concerne que les paramètres affichés, pas l'URL exacte utilisée pour une requête autorisée.
 
 ### Formats d'import
 
@@ -495,6 +497,7 @@ python3 -m unittest discover -s tests -p 'test_campaign_state.py'
 python3 -m unittest discover -s tests -p 'test_service_budget.py'
 python3 -m unittest discover -s tests -p 'test_http_campaign.py'
 python3 -m unittest discover -s tests -p 'test_collection_report.py'
+python3 -m unittest discover -s tests -p 'test_redirect_coverage.py'
 python3 tests/integration.py
 python3 tests/test_scan_integration.py
 python3 tests/test_collection_resume_integration.py

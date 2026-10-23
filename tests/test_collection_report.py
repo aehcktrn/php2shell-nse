@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -187,7 +188,7 @@ class CollectionReportTests(unittest.TestCase):
                          ("INCONNUE", "INDETERMINE"))
         self.assertEqual((compact[destination["hostname"]]["php"], compact[destination["hostname"]]["vulnerable"]),
                          ("8.3.35", "OUI"))
-        self.assertIn("évaluée séparément", compact[source["hostname"]]["explication"])
+        self.assertIn("destination VISITÉE", compact[source["hostname"]]["explication"])
 
     def test_missing_necessary_destination_blocks_negative_but_preserves_positive(self):
         for state, version, expected in (("PATCHED_VERSION_ADVERTISED", "8.3.36", "INDETERMINE"),
@@ -322,6 +323,37 @@ class CollectionReportTests(unittest.TestCase):
         rows = self.merged()
         self.assertTrue(all(row["vulnerable"] == "NON" for row in report.compact_rows(rows)))
         self.assertTrue(all(not row["collection_gaps"] for row in rows))
+
+    def test_v060_companion_keeps_its_historical_navigation_verdict(self):
+        source = self.service("http", port=80, scheme="http")
+        destination = self.service("https")
+        self.phase(source, observations=[self.redirect(source, destination, "/")])
+        self.phase(destination, version="8.3.36")
+        rows = self.merged()
+        for row in rows:
+            for observation in row.get("observations", []):
+                if observation.get("redirect_to"):
+                    observation.pop("redirect_conclusive", None)
+                    observation.pop("redirect_coverage_reason", None)
+                    observation.pop("redirect_destination_http_statuses", None)
+                    observation["redirect_scope"] = "HORS_PERIMETRE_DU_CONTROLE"
+        historical = [{"cible": "app.example.com", "php": "8.3.36", "vulnerable": "NON",
+                       "explication": "Ports évalués : 80,443. Versions annoncées corrigées sur les services évalués ; runtime à confirmer côté serveur. Source publiée : en-têtes HTTP."}]
+        details = {"schema_version": "1", "tool_version": "0.6.0", "rows": rows}
+        (self.base / "raw").mkdir(exist_ok=True)
+        (self.base / "raw/report-details.json").write_text(json.dumps(details), encoding="utf-8")
+        (self.base / "report.json").write_text(json.dumps(historical), encoding="utf-8")
+        loaded = report.load_campaign_report(self.base / "report.json")
+        self.assertEqual(loaded["tool_version"], "0.6.0")
+        self.assertEqual(report.compact_rows(rows)[0]["vulnerable"], "INDETERMINE")
+        original = deepcopy(loaded)
+        fresh = self.base / "reexport"
+        report.write_campaign_report(loaded, fresh)
+        reloaded = report.load_campaign_report(fresh / "report.json")
+        self.assertEqual(reloaded["tool_version"], "0.6.1")
+        self.assertEqual(reloaded["rows"], original["rows"])
+        self.assertEqual(loaded, original)
+        self.assertEqual(json.loads((self.base / "report.json").read_text())[0]["vulnerable"], "NON")
 
 
 if __name__ == "__main__":
