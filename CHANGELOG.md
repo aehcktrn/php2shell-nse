@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.4 — 2026-10-23
+
+- Libellés explicites `VULNERABLE` et `NON-VULNERABLE` dans l'arborescence à la place de `OUI` et `NON`.
+- Échantillonnage borné des pages reliées par le HTML au sein de la même origine, avec priorité aux chemins PHP, sans dictionnaire de chemins, soumission de formulaire, lien externe ni paramètres de requête.
+- Agrégation de la version PHP au niveau du service web : une version observée sur une page qualifie les autres pages demandées et atteintes sur la même origine, sans masquer un refus HTTP, un délai ou un parcours incomplet.
+- Priorité au signal positif : une version affectée observée sur une page, un port ou un backend classe le domaine `VULNERABLE`, même si d'autres contrôles restent incomplets.
+- Conservation de `INDETERMINE` lorsqu'une version ou une partie du parcours n'est pas observable depuis Internet, afin de ne pas transformer une absence de preuve en faux résultat non vulnérable.
+- Rapport arborescent directement présentable en quatre vues : inventaire crt.sh retenu, hôtes PHP confirmés, éléments vulnérables avec endpoint/version de preuve, et résultats non conclusifs avec leur cause.
+- Application des filtres de liens à chaque redirection du parcours découvert ; un refus ou une absence de réponse sur une page liée conserve son motif de couverture incomplète.
+
+Le lanceur passe à **0.5.4** et le NSE à **0.3.4**. Les valeurs historiques `OUI` et `NON` des exports CSV/JSON restent inchangées pour préserver leur compatibilité machine.
+
 ## 0.5.3 — 2026-10-23
 
 - Contrôle explicite de `/` et `/index.php` dans l'usage simple, même lorsqu'une version PHP est déjà annoncée sur la racine ; les redirections HTTP vers ces deux destinations peuvent ainsi être corrélées exactement avec leur évaluation HTTPS.

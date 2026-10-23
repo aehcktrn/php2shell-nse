@@ -204,6 +204,10 @@ def _assessment(script: ET.Element) -> dict[str, Any]:
         "budget_exhausted": _scalar(script, "budget_exhausted"),
         "traversal_complete": _scalar(script, "traversal_complete"),
         "traversal_reason_code": _scalar(script, "traversal_reason_code"),
+        "discovered_paths": _array(script, "discovered_paths"),
+        "crawl_truncated": _scalar(script, "crawl_truncated"),
+        "crawl_gap_reason_code": _scalar(script, "crawl_gap_reason_code"),
+        "crawl_gap_path": _scalar(script, "crawl_gap_path"),
         "script_version": _scalar(script, "script_version"),
         "evidence": _details(script, "evidence"),
         "observations": observations,
@@ -485,6 +489,28 @@ def _compact_verdict(row: dict[str, Any]) -> str:
     proof = row.get("inventory_patch_status")
     if proof == "PATCH_MISSING_CONFIRMED":
         return "OUI"
+    if row.get("row_type") != "ASSESSMENT":
+        return "INDETERMINE"
+    if proof == "PATCH_CONFIRMED":
+        return "INDETERMINE" if _http_gap(row) else "NON"
+    # One affected runtime exposed by any page is enough to classify the
+    # service as vulnerable. Other hidden or blocked pages cannot turn that
+    # positive evidence back into an indeterminate result.
+    if _suspect(row) and _version_values(row.get("versions")):
+        return "OUI"
+    if proof == "CONFLICT" or _http_gap(row):
+        return "INDETERMINE"
+    if _version_values(row.get("versions")):
+        if row.get("state") == "PATCHED_VERSION_ADVERTISED" and not _suspect(row):
+            return "NON"
+    return "INDETERMINE"
+
+
+def _pre_v054_compact_verdict(row: dict[str, Any]) -> str:
+    """Reproduce stored verdicts before affected evidence took precedence."""
+    proof = row.get("inventory_patch_status")
+    if proof == "PATCH_MISSING_CONFIRMED":
+        return "OUI"
     if row.get("row_type") != "ASSESSMENT" or proof == "CONFLICT" or _http_gap(row):
         return "INDETERMINE"
     if proof == "PATCH_CONFIRMED":
@@ -519,16 +545,46 @@ def _redirect_destination(value: object) -> tuple[str, int, str, str] | None:
 
 
 def _observation_covers_path(candidate: dict[str, Any], request_target: str) -> bool:
+    """Confirm that a path was reached on a conclusively versioned service.
+
+    PHP version headers qualify the web service/runtime, not only the URL that
+    happened to expose them. Still require the exact destination to have been
+    requested, and never let evidence from another page erase a service-level
+    HTTP gap such as a denial, timeout or incomplete traversal.
+    """
     if _compact_verdict(candidate) == "INDETERMINE":
         return False
     if not _observation_matches_path(candidate, request_target):
         return False
     observations = candidate.get("observations")
     proof = candidate.get("inventory_patch_status")
+    reached = False
     for observation in observations:
         if not isinstance(observation, dict) or _single_line(observation.get("path")) != request_target:
             continue
+        reached = True
+        if (observation.get("reason_code") in HTTP_GAP_CODES
+                or str(observation.get("http_status", "")) in ("401", "403", "429")):
+            return False
         if proof in ("PATCH_CONFIRMED", "PATCH_MISSING_CONFIRMED"):
+            return True
+        if (observation.get("state") in ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED")
+                and _version_values(observation.get("versions"))):
+            return True
+    return (reached
+            and candidate.get("state") in ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED")
+            and bool(_version_values(candidate.get("versions"))))
+
+
+def _pre_v054_observation_covers_path(candidate: dict[str, Any], request_target: str) -> bool:
+    """Preserve the exact-page version rule used in stored v0.5.0-v0.5.3 reports."""
+    if (_pre_v054_compact_verdict(candidate) == "INDETERMINE"
+            or not _observation_matches_path(candidate, request_target)):
+        return False
+    for observation in candidate["observations"]:
+        if not isinstance(observation, dict) or _single_line(observation.get("path")) != request_target:
+            continue
+        if candidate.get("inventory_patch_status") in ("PATCH_CONFIRMED", "PATCH_MISSING_CONFIRMED"):
             return True
         if (observation.get("state") in ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED")
                 and _version_values(observation.get("versions"))):
@@ -567,19 +623,21 @@ def _legacy_redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]])
                    and _single_line(candidate.get("hostname") or candidate.get("ip")).lower().rstrip(".") == target
                    and _single_line(candidate.get("scheme")).lower() == scheme
                    and _single_line(candidate.get("port")) == str(port)
-                   and _compact_verdict(candidate) != "INDETERMINE"
+                   and _pre_v054_compact_verdict(candidate) != "INDETERMINE"
                    for candidate in rows):
             return False
     return True
 
 
-def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]],
+                         *, historical_semantics: bool = False) -> bool:
     """Return true when every external-origin redirect was assessed separately.
 
     The NSE deliberately does not cross an origin boundary. A campaign can
     nevertheless cover a routine HTTP-to-HTTPS redirect through its separate
     scan of the destination service. Require the same target name, IP and exact
-    request target so a redirect never hides an untested path or backend.
+    request target. Once that path has answered without a service-level gap,
+    PHP evidence from another requested page qualifies the same web service.
     """
     if (row.get("row_type") != "ASSESSMENT"
             or row.get("reason_code") != "REDIRECT_NOT_ASSESSED"
@@ -591,6 +649,8 @@ def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]]) -> boo
         return False
     target = _single_line(row.get("hostname") or row.get("ip")).lower().rstrip(".")
     source_ip = _single_line(row.get("ip"))
+    covers_path = (_pre_v054_observation_covers_path if historical_semantics
+                   else _observation_covers_path)
     for observation in observations:
         if not isinstance(observation, dict) or observation.get("reason_code") != "REDIRECT_NOT_ASSESSED":
             return False
@@ -606,15 +666,16 @@ def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]]) -> boo
                    and _single_line(candidate.get("hostname") or candidate.get("ip")).lower().rstrip(".") == target
                    and _single_line(candidate.get("scheme")).lower() == scheme
                    and _single_line(candidate.get("port")) == str(port)
-                   and _observation_covers_path(candidate, request_target)
+                   and covers_path(candidate, request_target)
                    for candidate in rows):
             return False
     return True
 
 
-def _covered_redirect_is_navigation_only(row: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+def _covered_redirect_is_navigation_only(row: dict[str, Any], rows: list[dict[str, Any]],
+                                          *, historical_semantics: bool = False) -> bool:
     """Suppress only the resolved navigation gap, never independent evidence."""
-    if not _redirect_is_covered(row, rows):
+    if not _redirect_is_covered(row, rows, historical_semantics=historical_semantics):
         return False
     proof = row.get("inventory_patch_status")
     return proof in (None, "", "NOT_PROVIDED") and not _suspect(row)
@@ -652,7 +713,7 @@ def _unknown_reason(row: dict[str, Any],
 
 def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str,
                                 assessment_index: dict[tuple[str, int, str, str], set[int]]
-                                | None = None) -> str:
+                                | None = None, *, historical_semantics: bool = False) -> str:
     if not rows:
         return "Aucun service HTTP évalué ; PHP et ses correctifs restent à vérifier."
     if verdict == "OUI":
@@ -667,6 +728,8 @@ def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str],
             action = ("mettre à jour PHP vers " + _short(" / ".join(fixed), 60)
                       if fixed else "mettre à jour PHP")
             reason += "; " + action + " ou vérifier le correctif fournisseur."
+        if not historical_semantics and any(item.get("inventory_patch_status") == "CONFLICT" for item in rows):
+            reason += " Preuves serveur contradictoires ; le signal vulnérable reste prioritaire."
         gaps = sum(value == "INDETERMINE" or _http_gap(item)
                    or item.get("row_type") != "ASSESSMENT" for item, value in zip(rows, verdicts))
         if gaps:
@@ -776,8 +839,9 @@ def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdic
                          *, port_rows: list[dict[str, Any]] | None = None,
                          include_redirect_destinations: bool = True,
                          assessment_index: dict[tuple[str, int, str, str], set[int]]
-                         | None = None) -> str:
-    reason = _legacy_compact_explanation(rows, verdicts, verdict, assessment_index)
+                         | None = None, historical_semantics: bool = False) -> str:
+    reason = _legacy_compact_explanation(
+        rows, verdicts, verdict, assessment_index, historical_semantics=historical_semantics)
     ports = _port_summary(port_rows if port_rows is not None else rows)
     redirect = _redirect_summary(rows, assessment_index) if include_redirect_destinations else ""
     prefix = " ".join(part for part in (ports, redirect) if part)
@@ -791,7 +855,8 @@ def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdic
 
 def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False,
                  include_redirect_destinations: bool = True,
-                 redirect_coverage: str = "campaign") -> list[dict[str, str]]:
+                 redirect_coverage: str = "campaign",
+                 historical_semantics: bool = False) -> list[dict[str, str]]:
     """Aggregate IPs and ports into four fields per hostname (or XML IP).
 
     OUI includes an affected advertised version and says so explicitly. NON
@@ -823,17 +888,21 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
         elif redirect_coverage == "legacy":
             conclusive = [row for row in relevant if not _legacy_redirect_is_covered(row, relevant)]
         else:
-            conclusive = [row for row in relevant if not _covered_redirect_is_navigation_only(row, relevant)]
-        verdicts = [_compact_verdict(row) for row in conclusive]
+            conclusive = [row for row in relevant if not _covered_redirect_is_navigation_only(
+                row, relevant, historical_semantics=historical_semantics)]
+        determine = _pre_v054_compact_verdict if historical_semantics else _compact_verdict
+        verdicts = [determine(row) for row in conclusive]
         verdict = ("OUI" if "OUI" in verdicts else
                    "NON" if verdicts and all(value == "NON" for value in verdicts) else "INDETERMINE")
         if legacy_explanation:
-            explanation = _legacy_compact_explanation(conclusive, verdicts, verdict)
+            explanation = _legacy_compact_explanation(
+                conclusive, verdicts, verdict, historical_semantics=historical_semantics)
         else:
             explanation = _compact_explanation(
                 conclusive, verdicts, verdict, port_rows=relevant,
                 include_redirect_destinations=include_redirect_destinations,
                 assessment_index=assessment_index,
+                historical_semantics=historical_semantics,
             )
         output.append({"cible": target, "php": " | ".join(versions) or "INCONNUE", "vulnerable": verdict,
                        "explication": _short(explanation, MAX_COMPACT_EXPLANATION)})
@@ -856,26 +925,43 @@ def _report_tree_roots(report: dict[str, Any]) -> list[str]:
     ])
 
 
-def _tree_result_label(label: str, row: dict[str, str] | None, count: int,
+def _tree_result_label(label: str, row: dict[str, Any] | None, count: int,
                        *, root: bool = False) -> str:
     if row is None:
         result = f"{label} [regroupement]"
     else:
-        fields = [f"PHP {row['php']}", row["vulnerable"]]
+        verdict = {"OUI": "VULNERABLE", "NON": "NON-VULNERABLE"}.get(
+            row["vulnerable"], row["vulnerable"])
+        fields = [f"PHP {row['php']}", verdict]
         cause = _tree_result_cause(row)
         if cause:
             fields.append(cause)
+        proofs = row.get("_tree_proofs")
+        if isinstance(proofs, list) and proofs:
+            fields.append("PREUVE " + _single_line(proofs[0]))
         result = f"{label} [{' | '.join(fields)}]"
     if root:
         result += f" — {count} cible" + ("s" if count != 1 else "")
     return result
 
 
-def _tree_result_cause(row: dict[str, str]) -> str:
+def _tree_result_cause(row: dict[str, Any]) -> str:
     """Return a short operational cause without duplicating the full report."""
     if row.get("vulnerable") != "INDETERMINE":
         return ""
+    causes = row.get("_tree_causes")
+    if isinstance(causes, list) and causes:
+        return " ; ".join(causes)
     explanation = row.get("explication", "")
+    outside = "HORS PÉRIMÈTRE DU CONTRÔLE —"
+    if outside in explanation:
+        segment = explanation[explanation.index(outside):]
+        for marker in (". Dans la campagne", ". Ports évalués", ". Ports ouverts",
+                       ". Version", ". PHP", ". Aucune", ". Service", ". Résolution",
+                       ". Échec", ". Délai", ". Scan", ". Budget", ". Parcours"):
+            if marker in segment:
+                segment = segment.split(marker, 1)[0]
+        return _short(segment.rstrip("."), 170)
     causes = (
         ("HTTP 403", "HTTP 403"),
         ("HTTP 401", "HTTP 401"),
@@ -886,6 +972,11 @@ def _tree_result_cause(row: dict[str, str]) -> str:
         ("Budget HTTP épuisé", "BUDGET HTTP ÉPUISÉ"),
         ("Délai du scan Nmap dépassé", "SCAN EXPIRÉ"),
         ("Échec du scan Nmap", "ÉCHEC NMAP"),
+        ("Scan Nmap interrompu", "SCAN INTERROMPU"),
+        ("Scan Nmap incomplet", "SCAN INCOMPLET"),
+        ("Scan Nmap non exécuté", "SCAN NON EXÉCUTÉ"),
+        ("Cible absente du résultat Nmap", "CIBLE ABSENTE DU RÉSULTAT NMAP"),
+        ("Résultat Nmap incomplet ou invalide", "RÉSULTAT NMAP INVALIDE"),
         ("Destination de redirection non évaluée", "REDIRECTION NON COUVERTE"),
         ("Parcours des redirections incomplet", "REDIRECTION INCOMPLÈTE"),
         ("PHP détecté, mais sa version n'est pas annoncée", "VERSION PHP MASQUÉE"),
@@ -913,16 +1004,24 @@ def _render_tree_children(node: dict[str, Any], prefix: str, lines: list[str]) -
         last = index == len(children) - 1
         lines.append(prefix + ("└── " if last else "├── ")
                      + _tree_result_label(label, child.get("row"), _tree_result_count(child)))
-        _render_tree_children(child, prefix + ("    " if last else "│   "), lines)
+        child_prefix = prefix + ("    " if last else "│   ")
+        _render_tree_extra_proofs(child.get("row"), child_prefix, lines)
+        _render_tree_children(child, child_prefix, lines)
 
 
-def _report_tree_text(report: dict[str, Any], compact: list[dict[str, str]]) -> str:
-    """Render compact results as a DNS hierarchy beneath explicit scope roots."""
-    roots = _report_tree_roots(report)
+def _render_tree_extra_proofs(row: dict[str, Any] | None, prefix: str, lines: list[str]) -> None:
+    """Keep each additional affected service/page visible below its DNS node."""
+    proofs = row.get("_tree_proofs") if row is not None else None
+    if isinstance(proofs, list):
+        lines.extend(prefix + "PREUVE " + _single_line(proof) for proof in proofs[1:])
+
+
+def _report_tree_forest(roots: list[str], rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Build a DNS hierarchy beneath explicit scope roots."""
     forest: dict[str, dict[str, Any]] = {
         root: {"row": None, "children": {}} for root in roots
     }
-    for row in compact:
+    for row in rows:
         target = row["cible"].lower().rstrip(".")
         matching = [root for root in roots if target == root or target.endswith("." + root)]
         root = max(matching, key=len) if matching else target
@@ -934,21 +1033,206 @@ def _report_tree_text(report: dict[str, Any], compact: list[dict[str, str]]) -> 
         for label in reversed(relative.split(".")):
             node = node["children"].setdefault(label, {"row": None, "children": {}})
         node["row"] = row
+    return forest
 
-    campaign = report.get("campaign")
-    campaign_id = _single_line(campaign.get("campaign_id")) if isinstance(campaign, dict) else ""
-    title = "Arborescence des résultats"
-    if campaign_id:
-        title += " — campagne " + campaign_id
-    lines = [title, "Légende : [PHP version | verdict | cause éventuelle] ; [regroupement] = branche DNS non évaluée.", ""]
-    ordered_roots = [root for root in roots if root in forest]
-    ordered_roots.extend(sorted(root for root in forest if root not in roots))
+
+def _render_tree_view(roots: list[str], rows: list[dict[str, Any]], empty: str) -> list[str]:
+    """Render one filtered managerial view while preserving DNS grouping."""
+    if not rows:
+        return [empty]
+    forest = _report_tree_forest(roots, rows)
+    lines = []
+    ordered_roots = [root for root in roots if root in forest and _tree_result_count(forest[root])]
+    ordered_roots.extend(sorted(
+        root for root in forest if root not in roots and _tree_result_count(forest[root])))
     for index, root in enumerate(ordered_roots):
         node = forest[root]
         lines.append(_tree_result_label(root, node.get("row"), _tree_result_count(node), root=True))
+        _render_tree_extra_proofs(node.get("row"), "│   " if node["children"] else "    ", lines)
         _render_tree_children(node, "", lines)
         if index != len(ordered_roots) - 1:
             lines.append("")
+    return lines
+
+
+def _report_php_targets(report: dict[str, Any]) -> set[str]:
+    """Return targets for which PHP was observed or attested, versioned or not."""
+    targets = set()
+    rows = report.get("rows")
+    if not isinstance(rows, list):
+        return targets
+    for row in rows:
+        if not isinstance(row, dict) or row.get("protocol") == "discovery":
+            continue
+        target = _single_line(row.get("hostname") or row.get("ip")).lower().rstrip(".")
+        proof = _single_line(row.get("inventory_patch_status"))
+        if (target and (row.get("php_detected") == "YES"
+                        or bool(_version_values(row.get("versions")))
+                        or proof in ("PATCH_CONFIRMED", "PATCH_MISSING_CONFIRMED"))):
+            targets.add(target)
+    return targets
+
+
+def _report_indeterminate_causes(report: dict[str, Any]) -> dict[str, list[str]]:
+    """Retain concrete per-service causes independently of the compact text limit."""
+    rows = report.get("rows")
+    if not isinstance(rows, list):
+        return {}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("protocol") == "discovery":
+            continue
+        target = _single_line(row.get("hostname") or row.get("ip")).lower().rstrip(".")
+        if target:
+            groups.setdefault(target, []).append(row)
+    assessment_index = _redirect_assessment_index(rows)
+    output = {}
+    for target, group in groups.items():
+        relevant = [row for row in group if not _non_web_coverage(row)]
+        conclusive = [row for row in relevant
+                      if not _covered_redirect_is_navigation_only(row, relevant)]
+        causes = []
+        redirects = _redirect_summary(conclusive, assessment_index)
+        if redirects:
+            causes.append(redirects)
+        for row in conclusive:
+            if _compact_verdict(row) != "INDETERMINE":
+                continue
+            cause = _unknown_reason(row, assessment_index)
+            gap_path = _single_line(row.get("crawl_gap_path"))
+            if gap_path:
+                cause += " sur " + gap_path
+            cause += _endpoint_hint(row, relevant)
+            if cause not in causes:
+                causes.append(cause)
+        if not conclusive:
+            causes.append("Aucun service HTTP évalué ; PHP et ses correctifs restent à vérifier")
+        output[target] = causes
+    return output
+
+
+def _tree_endpoint(target: str, scheme: object, port: object, path: object) -> str:
+    """Format a concise public endpoint without inventing missing fields."""
+    scheme_text = _single_line(scheme).lower()
+    port_text = _single_line(port)
+    path_text = _single_line(path) or "/"
+    host = ("[" + target + "]" if ":" in target and not (target.startswith("[") and target.endswith("]"))
+            else target)
+    if scheme_text not in ("http", "https"):
+        endpoint = host
+        if port_text:
+            endpoint += ":" + port_text
+        return endpoint + path_text
+    default = (scheme_text == "http" and port_text == "80") or (scheme_text == "https" and port_text == "443")
+    authority = host if default or not port_text else host + ":" + port_text
+    return scheme_text + "://" + authority + path_text
+
+
+def _report_vulnerability_proofs(report: dict[str, Any]) -> dict[str, list[str]]:
+    """Keep the page/service evidence that made each target vulnerable."""
+    proofs: dict[str, list[str]] = {}
+    rows = report.get("rows")
+    if not isinstance(rows, list):
+        return proofs
+    for row in rows:
+        if not isinstance(row, dict) or _compact_verdict(row) != "OUI":
+            continue
+        target = _single_line(row.get("hostname") or row.get("ip")).lower().rstrip(".")
+        if not target:
+            continue
+        target_proofs = proofs.setdefault(target, [])
+        row_proofs = []
+        evidence = row.get("evidence")
+        if isinstance(evidence, list):
+            for item in evidence:
+                if not isinstance(item, dict) or item.get("state") != "POTENTIALLY_VULNERABLE":
+                    continue
+                endpoint = _tree_endpoint(
+                    target, item.get("scheme") or row.get("scheme"),
+                    item.get("port") or row.get("port"), item.get("path") or row.get("path"),
+                )
+                version = _single_line(item.get("version"))
+                proof = endpoint + ((" — PHP " + version) if version else "")
+                if proof not in row_proofs:
+                    row_proofs.append(proof)
+        if row.get("inventory_patch_status") == "PATCH_MISSING_CONFIRMED":
+            endpoint = _tree_endpoint(target, row.get("scheme"), row.get("port"), row.get("path"))
+            proof = endpoint + " — correctif manquant attesté"
+            if proof not in row_proofs:
+                row_proofs.append(proof)
+        elif not row_proofs:
+            endpoint = _tree_endpoint(target, row.get("scheme"), row.get("port"), row.get("path"))
+            versions = _version_values(row.get("versions"))
+            proof = endpoint + ((" — PHP " + " / ".join(versions)) if versions else "")
+            row_proofs.append(proof)
+        target_proofs.extend(proof for proof in row_proofs if proof not in target_proofs)
+    return {target: values for target, values in proofs.items() if values}
+
+
+def _report_tree_text(report: dict[str, Any], compact: list[dict[str, str]]) -> str:
+    """Render inventory, PHP hosts, positives and explained gaps as DNS views."""
+    roots = _report_tree_roots(report)
+    causes = _report_indeterminate_causes(report)
+    compact = [dict(row, _tree_causes=causes.get(row["cible"].lower().rstrip("."), []))
+               for row in compact]
+
+    campaign = report.get("campaign")
+    campaign_id = _single_line(campaign.get("campaign_id")) if isinstance(campaign, dict) else ""
+    title = "Synthèse arborescente des résultats"
+    if campaign_id:
+        title += " — campagne " + campaign_id
+    discovery = report.get("discovery")
+    discovery_enabled = isinstance(discovery, dict) and _true(discovery.get("enabled"))
+    scope_note = (
+        "Périmètre : noms Internet publiés par crt.sh et retenus sous les domaines fournis ; "
+        "cet inventaire passif n'est pas exhaustif."
+        if discovery_enabled else
+        "Périmètre : cibles Internet fournies à l'outil ; cette vue ne prétend pas inventorier "
+        "les sous-domaines non transmis."
+    )
+    inventory_title = ("INVENTAIRE INTERNET DÉCOUVERT" if discovery_enabled
+                       else "INVENTAIRE DES CIBLES FOURNIES")
+    lines = [
+        title,
+        scope_note,
+        "Légende : [PHP version | VULNERABLE/NON-VULNERABLE/INDETERMINE | cause ou preuve éventuelle] ; [regroupement] = branche DNS non évaluée.",
+        "Verdicts PHP2Shell selon les versions observées ; parcours représentatif des pages et backends.",
+        "",
+        f"1. {inventory_title} — {len(compact)} cible" + ("s" if len(compact) != 1 else ""),
+    ]
+    lines.extend(_render_tree_view(roots, list(compact), "Aucune cible retenue."))
+
+    php_targets = _report_php_targets(report)
+    php_rows = [row for row in compact if row["cible"].lower().rstrip(".") in php_targets]
+    lines.extend(["", f"2. DOMAINES ET SOUS-DOMAINES HÉBERGEANT DU PHP — {len(php_rows)} hôte"
+                  + ("s" if len(php_rows) != 1 else "")])
+    lines.extend(_render_tree_view(
+        roots, php_rows,
+        "Aucun hôte PHP n'a pu être confirmé depuis les réponses Internet ou les preuves serveur fournies.",
+    ))
+
+    vulnerability_proofs = _report_vulnerability_proofs(report)
+    vulnerable_rows = []
+    for row in compact:
+        if row["vulnerable"] != "OUI":
+            continue
+        rendered = dict(row)
+        rendered["_tree_proofs"] = vulnerability_proofs.get(row["cible"].lower().rstrip("."), [])
+        vulnerable_rows.append(rendered)
+    lines.extend(["", f"3. ÉLÉMENTS VULNÉRABLES — {len(vulnerable_rows)} hôte"
+                  + ("s" if len(vulnerable_rows) != 1 else "")])
+    lines.extend(_render_tree_view(
+        roots, vulnerable_rows,
+        "Aucun élément vulnérable n'a été établi par les preuves observées dans cette campagne.",
+    ))
+
+    inconclusive_rows = [row for row in compact if row["vulnerable"] == "INDETERMINE"]
+    lines.extend(["", f"4. ÉLÉMENTS NON CONCLUSIFS — {len(inconclusive_rows)} hôte"
+                  + ("s" if len(inconclusive_rows) != 1 else "")])
+    lines.extend(_render_tree_view(
+        roots, inconclusive_rows,
+        "Aucun élément non conclusif : toutes les cibles disposent d'un verdict établi.",
+    ))
     return "\n".join(lines) + "\n"
 
 
@@ -958,19 +1242,20 @@ def _historical_compact_rows(details: dict[str, Any]) -> list[dict[str, str]] | 
     if not match:
         return None
     minor, patch = int(match.group(1)), int(match.group(2))
-    if minor == 5 and patch == 0:
-        return compact_rows(details["rows"], redirect_coverage="current")
+    rows = details["rows"]
+    if minor == 5 and patch <= 3:
+        coverage = "current" if patch == 0 else "campaign"
+        return compact_rows(rows, redirect_coverage=coverage, historical_semantics=True)
     if minor != 4:
         return None
-    rows = details["rows"]
     if patch <= 2:
-        return compact_rows(rows, legacy_explanation=True, redirect_coverage="none")
+        return compact_rows(rows, legacy_explanation=True, redirect_coverage="none", historical_semantics=True)
     if patch == 3:
-        return compact_rows(rows, include_redirect_destinations=False, redirect_coverage="none")
+        return compact_rows(rows, include_redirect_destinations=False, redirect_coverage="none", historical_semantics=True)
     if patch in (4, 5):
-        return compact_rows(rows, include_redirect_destinations=False, redirect_coverage="legacy")
+        return compact_rows(rows, include_redirect_destinations=False, redirect_coverage="legacy", historical_semantics=True)
     if patch == 6:
-        return compact_rows(rows, redirect_coverage="legacy")
+        return compact_rows(rows, redirect_coverage="legacy", historical_semantics=True)
     return None
 
 

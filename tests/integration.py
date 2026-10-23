@@ -30,7 +30,8 @@ SECRET_BODY = "SYNTHETIC_BODY_MUST_NOT_APPEAR"
 
 class FixtureHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    # Keep the real BaseHTTP/Python signature so -sV can identify this fixture.
+    # Keep a stable Nmap-recognizable fixture banner across Python versions.
+    server_version = "BaseHTTP/0.6"
 
     def log_message(self, *_args):
         pass
@@ -40,7 +41,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
                  "sni": getattr(self.connection, "_test_sni", None)}
         with self.server.record_lock:
             self.server.requests.append(entry)
-        status, headers, body = 200, {}, b"Synthetic fixture."
+        status, headers, body, content_type = 200, {}, b"Synthetic fixture.", "text/plain"
         supplied_host = self.headers.get("Host", "").split(":", 1)[0]
         if self.path == "/":
             body = b"Static landing page."
@@ -50,6 +51,32 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             headers["X-Powered-By"] = "PHP/8.3.35"
         elif self.path == "/fixed":
             headers["X-Powered-By"] = "PHP/8.3.36"
+        elif self.path == "/linked":
+            content_type = "text/html"
+            body = (b'<a href="https://outside.example/foreign.php">outside</a>'
+                    b'<a href="/assets/site.css">asset</a>'
+                    b'<a href="/logout">logout</a>'
+                    b'<a href="/%64elete-record">encoded action</a>'
+                    b'<!-- <a href="/comment.php">comment</a> -->'
+                    b'<script>const text = \'href="/script.php"\';</script>'
+                    b'<a data-href="/data.php" title="href=\'/quoted.php\'">noise</a>'
+                    b'<a href="/linked-component.php?id=42">component</a>')
+        elif self.path == "/linked-component.php":
+            headers["X-Powered-By"] = "PHP/8.3.35"
+        elif self.path in ("/linked-fixed-blocked", "/linked-fixed-unsafe-redirect"):
+            content_type = "text/html"
+            headers["X-Powered-By"] = "PHP/8.3.36"
+            destination = "/blocked" if self.path.endswith("blocked") else "/linked-redirect-unsafe"
+            body = f'<a href="{destination}">component</a>'.encode()
+        elif self.path == "/linked-safe-redirect":
+            content_type = "text/html"
+            body = b'<a href="/linked-redirect-safe">component</a>'
+        elif self.path == "/linked-redirect-safe":
+            status = 302
+            headers["Location"] = "/linked-component.php?token=synthetic-secret"
+        elif self.path == "/linked-redirect-unsafe":
+            status = 302
+            headers["Location"] = "/delete-record?confirm=1"
         elif self.path == "/silent":
             body = b"Documentation example: PHP/8.3.36"
         elif self.path == "/redirect":
@@ -108,7 +135,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
         for name, value in headers.items():
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", content_type)
         self.send_header("Connection", "close")
         self.end_headers()
         try:
@@ -327,6 +354,45 @@ class NSEIntegration(unittest.TestCase):
             self.assertEqual(self.field(item, "port"), str(self.httpd.server_port))
             self.assertEqual(self.field(item, "vhost"), FALLBACK_VHOST)
             self.assertEqual(self.field(item, "http_host"), f"{FALLBACK_VHOST}:{self.httpd.server_port}")
+
+    def test_html_links_sample_exposed_php_pages_without_bruteforce(self):
+        with self.httpd.record_lock:
+            before = len(self.httpd.requests)
+        state, script, _ = self.scan("/linked")
+        self.assertEqual(state, "POTENTIALLY_VULNERABLE")
+        with self.httpd.record_lock:
+            paths = [entry["path"] for entry in self.httpd.requests[before:]]
+        self.assertEqual(paths, ["/linked", "/index.php", "/linked-component.php"])
+        self.assertNotIn("/logout", paths)
+        self.assertNotIn("/assets/site.css", paths)
+        self.assertEqual(self.field(script, "requests_made"), "3")
+
+    def test_sampled_redirect_strips_query_values_before_request(self):
+        with self.httpd.record_lock:
+            before = len(self.httpd.requests)
+        state, script, _ = self.scan("/linked-safe-redirect")
+        self.assertEqual(state, "POTENTIALLY_VULNERABLE")
+        with self.httpd.record_lock:
+            paths = [entry["path"] for entry in self.httpd.requests[before:]]
+        self.assertEqual(paths, ["/linked-safe-redirect", "/index.php",
+                                 "/linked-redirect-safe", "/linked-component.php"])
+        self.assertEqual(self.field(self.observations(script)[-1], "optional_crawl"), "true")
+
+    def test_sampled_failure_keeps_fixed_banner_inconclusive(self):
+        for path, expected_code in (("/linked-fixed-blocked", "HTTP_ACCESS_DENIED"),
+                                    ("/linked-fixed-unsafe-redirect", "REDIRECT_NOT_ASSESSED")):
+            with self.subTest(path=path):
+                with self.httpd.record_lock:
+                    before = len(self.httpd.requests)
+                state, script, _ = self.scan(path)
+                self.assertEqual(state, "UNKNOWN")
+                self.assertEqual(self.field(script, "traversal_complete"), "false")
+                self.assertEqual(self.field(script, "crawl_gap_reason_code"), expected_code)
+                self.assertEqual(self.field(script, "traversal_reason_code"), expected_code)
+                with self.httpd.record_lock:
+                    paths = [entry["path"] for entry in self.httpd.requests[before:]]
+                self.assertEqual(len(paths), 2)
+                self.assertTrue(all("delete-record" not in item for item in paths))
 
     def test_request_budget_stops_redirect_chain(self):
         with self.httpd.record_lock:

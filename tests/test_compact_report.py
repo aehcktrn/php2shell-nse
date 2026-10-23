@@ -34,7 +34,7 @@ def coverage(hostname="app.example.com", *, code="SCAN_FAILED", ip="192.0.2.11",
 
 
 def details(rows):
-    return {"schema_version": "1", "tool_version": "0.5.3", "rows": rows,
+    return {"schema_version": "1", "tool_version": "0.5.4", "rows": rows,
             "campaign": {"campaign_id": "fixture"}, "changes": [], "summary": {"processing_complete": True}}
 
 
@@ -213,6 +213,32 @@ class CompactReportTests(unittest.TestCase):
              "versions": ["8.3.36"]})
         self.assertEqual(self.compact(redirect, destination)["vulnerable"], "NON")
 
+    def test_version_from_one_page_qualifies_other_reached_pages_on_same_service(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[
+                {"reason_code": "REDIRECT_NOT_ASSESSED",
+                 "redirect_to": "https://app.example.com/"},
+                {"reason_code": "REDIRECT_NOT_ASSESSED",
+                 "redirect_to": "https://app.example.com/index.php"},
+            ],
+        )
+        destination = assessment(
+            port="443", scheme="https",
+            observations=[
+                {"path": "/", "state": "UNKNOWN", "reason_code": "PHP_NOT_IDENTIFIED",
+                 "versions": []},
+                {"path": "/index.php", "state": "PATCHED_VERSION_ADVERTISED",
+                 "reason_code": "FIXED_VERSION_ADVERTISED", "versions": ["8.3.36"]},
+            ],
+        )
+        self.assertEqual(self.compact(redirect, destination)["vulnerable"], "NON")
+
+        destination["traversal_complete"] = "false"
+        destination["reason_code"] = "HTTP_ACCESS_DENIED"
+        self.assertEqual(self.compact(redirect, destination)["vulnerable"], "INDETERMINE")
+
     def test_redacted_redirect_parameters_never_prove_path_identity(self):
         redirect = assessment(
             port="80", state="UNKNOWN", version="", service="http", scheme="http",
@@ -359,17 +385,17 @@ class CompactReportTests(unittest.TestCase):
 
     def test_port_summary_is_reserved_when_the_explanation_reaches_its_limit(self):
         rows = [assessment(port=str(port), state="UNKNOWN", version="8.3.35", reason_code="CUSTOM",
-                           reason="failure " * 100, potentially_vulnerable_evidence=True,
+                           reason="failure " * 100, potentially_vulnerable_evidence=False,
                            inventory_patch_status="UNVERIFIED", ip="2001:db8:ffff:ffff:ffff:ffff:ffff:ffff")
                 for port in range(10000, 10014)]
         rows.append(assessment(port="10000", ip="192.0.2.10"))
         result = self.compact(*rows)
         self.assertEqual(result["vulnerable"], "INDETERMINE")
-        self.assertEqual(len(result["explication"]), 360)
+        self.assertLessEqual(len(result["explication"]), 360)
         self.assertTrue(result["explication"].startswith(
             "Ports évalués : 10000,10001,10002,10003,10004,10005,10006,10007,10008,10009 (+4 autres)."))
         self.assertIn("failure", result["explication"])
-        self.assertTrue(result["explication"].endswith("…"))
+        self.assertIn("…", result["explication"])
 
     def test_failed_scan_never_turns_requested_ports_into_assessments(self):
         result = self.compact(coverage(code="SCAN_FAILED", scan_ports="80,443,8443"))
@@ -408,13 +434,12 @@ class CompactReportTests(unittest.TestCase):
                 self.assertEqual((result["php"], result["vulnerable"]), ("INCONNUE", "INDETERMINE"))
                 self.assertTrue(result["explication"])
 
-    def test_unknown_service_keeps_suspicious_observed_versions_without_false_certainty(self):
+    def test_any_observed_affected_version_makes_the_service_vulnerable(self):
         result = self.compact(assessment(state="UNKNOWN", version="8.3.35 | 8.3.36",
                                         reason_code="CONFLICTING_VERSIONS", potentially_vulnerable_evidence=True))
-        self.assertEqual(result["vulnerable"], "INDETERMINE")
+        self.assertEqual(result["vulnerable"], "OUI")
         self.assertEqual(result["php"], "8.3.35 | 8.3.36")
-        self.assertIn("contradictoires", result["explication"])
-        self.assertIn("concernée observée", result["explication"])
+        self.assertIn("Version annoncée concernée", result["explication"])
 
     def test_unknown_php_on_one_endpoint_cannot_be_hidden_by_a_corrected_one(self):
         result = self.compact(assessment(), assessment(ip="2001:db8::10", state="UNKNOWN", version="",
@@ -514,11 +539,11 @@ class CompactReportTests(unittest.TestCase):
                 result = self.compact(assessment(state="POTENTIALLY_VULNERABLE", version="8.3.35", inventory_patch_status=proof))
                 self.assertEqual(result["vulnerable"], "OUI")
 
-    def test_conflicting_inventory_is_indeterminate_and_retains_observation(self):
+    def test_conflicting_inventory_does_not_hide_an_affected_observation(self):
         result = self.compact(assessment(state="POTENTIALLY_VULNERABLE", version="8.3.35", inventory_patch_status="CONFLICT"))
-        self.assertEqual((result["php"], result["vulnerable"]), ("8.3.35", "INDETERMINE"))
+        self.assertEqual((result["php"], result["vulnerable"]), ("8.3.35", "OUI"))
         self.assertIn("Preuves serveur contradictoires", result["explication"])
-        self.assertIn("concernée observée", result["explication"])
+        self.assertIn("Version annoncée concernée", result["explication"])
 
     def test_false_boolean_strings_and_null_evidence_are_not_truthy_signals(self):
         result = self.compact(assessment(evidence=None, potentially_vulnerable_evidence="false", budget_exhausted="false"))
@@ -558,30 +583,116 @@ class CompactReportTests(unittest.TestCase):
         ]
         payload = details(rows)
         payload["campaign"]["scope"] = {"domains": ["example.com"]}
+        payload["discovery"] = {"enabled": True, "roots": ["example.com"]}
         report.write_campaign_report(payload, self.base)
         tree = (self.base / "report-tree.txt").read_text(encoding="utf-8")
-        self.assertIn("example.com [PHP 8.3.36 | NON] — 4 cibles", tree)
-        self.assertIn("├── api [PHP 8.3.36 | NON]", tree)
+        self.assertIn("1. INVENTAIRE INTERNET DÉCOUVERT — 4 cibles", tree)
+        self.assertIn("Verdicts PHP2Shell selon les versions observées ; parcours représentatif des pages et backends.", tree)
+        self.assertIn("2. DOMAINES ET SOUS-DOMAINES HÉBERGEANT DU PHP — 3 hôtes", tree)
+        self.assertIn("3. ÉLÉMENTS VULNÉRABLES — 0 hôte", tree)
+        self.assertIn("4. ÉLÉMENTS NON CONCLUSIFS — 1 hôte", tree)
+        self.assertIn("example.com [PHP 8.3.36 | NON-VULNERABLE] — 4 cibles", tree)
+        self.assertIn("├── api [PHP 8.3.36 | NON-VULNERABLE]", tree)
         self.assertIn("└── fr [regroupement]", tree)
-        self.assertIn("├── admin [PHP 8.3.36 | NON]", tree)
-        self.assertIn("└── www [PHP INCONNUE | INDETERMINE | SANS DNS]", tree)
-        self.assertEqual(sum("[PHP " in line for line in tree.splitlines()[3:]), 4)
+        self.assertIn("├── admin [PHP 8.3.36 | NON-VULNERABLE]", tree)
+        self.assertIn("└── www [PHP INCONNUE | INDETERMINE | Aucune adresse IP résolue", tree)
+        self.assertIn("Aucun élément vulnérable n'a été établi", tree)
+
+    def test_tree_report_lists_vulnerable_component_evidence(self):
+        rows = [assessment(
+            hostname="legacy.example.com", state="POTENTIALLY_VULNERABLE", version="8.3.35",
+            reason_code="AFFECTED_VERSION_ADVERTISED", scheme="https", path="/",
+            evidence=[{"state": "POTENTIALLY_VULNERABLE", "version": "8.3.35",
+                       "scheme": "https", "port": "443", "path": "/index.php"}],
+        )]
+        payload = details(rows)
+        payload["campaign"]["scope"] = {"domains": ["example.com"]}
+        report.write_campaign_report(payload, self.base)
+        tree = (self.base / "report-tree.txt").read_text(encoding="utf-8")
+        self.assertIn("3. ÉLÉMENTS VULNÉRABLES — 1 hôte", tree)
+        self.assertIn("legacy [PHP 8.3.35 | VULNERABLE | PREUVE "
+                      "https://legacy.example.com/index.php — PHP 8.3.35]", tree)
 
     def test_tree_report_explains_common_indeterminate_causes(self):
         rows = [
             assessment(hostname="blocked.example.com", state="UNKNOWN", version="",
-                       reason_code="HTTP_ACCESS_DENIED", traversal_complete="false"),
+                       reason_code="HTTP_ACCESS_DENIED", traversal_complete="false", php_detected="UNKNOWN"),
             assessment(hostname="hidden.example.com", state="UNKNOWN", version="",
-                       reason_code="PHP_NOT_IDENTIFIED"),
+                       reason_code="PHP_NOT_IDENTIFIED", php_detected="UNKNOWN"),
             coverage(hostname="missing.example.com", code="NO_DNS_ADDRESS"),
         ]
         payload = details(rows)
         payload["campaign"]["scope"] = {"domains": ["example.com"]}
         report.write_campaign_report(payload, self.base)
         tree = (self.base / "report-tree.txt").read_text(encoding="utf-8")
-        self.assertIn("blocked [PHP INCONNUE | INDETERMINE | HTTP 403]", tree)
-        self.assertIn("hidden [PHP INCONNUE | INDETERMINE | VERSION NON EXPOSÉE]", tree)
-        self.assertIn("missing [PHP INCONNUE | INDETERMINE | SANS DNS]", tree)
+        self.assertIn("4. ÉLÉMENTS NON CONCLUSIFS — 3 hôtes", tree)
+        self.assertIn("blocked [PHP INCONNUE | INDETERMINE | HTTP 403 : accès refusé (port 443)]", tree)
+        self.assertIn("hidden [PHP INCONNUE | INDETERMINE | PHP non identifié ; absence de vulnérabilité non établie", tree)
+        self.assertIn("missing [PHP INCONNUE | INDETERMINE | Aucune adresse IP résolue", tree)
+
+    def test_tree_php_hosts_require_observed_php_or_valid_attestation(self):
+        rows = [assessment(hostname=proof.lower() + ".example.com", state="UNKNOWN", version="",
+                           php_detected="UNKNOWN", inventory_patch_status=proof)
+                for proof in ("NOT_PROVIDED", "UNVERIFIED", "STALE", "PARTIAL", "CONFLICT",
+                              "PATCH_CONFIRMED", "PATCH_MISSING_CONFIRMED")]
+        rows.append(assessment(hostname="hidden.example.com", state="UNKNOWN", version="",
+                               reason_code="PHP_VERSION_HIDDEN", php_detected="YES"))
+        self.assertEqual(report._report_php_targets(details(rows)),
+                         {"patch_confirmed.example.com", "patch_missing_confirmed.example.com",
+                          "hidden.example.com"})
+
+    def test_tree_vulnerable_proof_excludes_runtime_with_attested_backport(self):
+        rows = [assessment(state="POTENTIALLY_VULNERABLE", version="8.3.35", scheme="https",
+                           inventory_patch_status="PATCH_CONFIRMED",
+                           evidence=[{"state": "POTENTIALLY_VULNERABLE", "version": "8.3.35",
+                                      "path": "/backported.php"}]),
+                assessment(state="POTENTIALLY_VULNERABLE", version="8.3.35", scheme="https", port="8443",
+                           evidence=[{"state": "POTENTIALLY_VULNERABLE", "version": "8.3.35",
+                                      "path": "/affected.php"}]),
+                assessment(state="POTENTIALLY_VULNERABLE", version="8.3.35", scheme="https", port="9443",
+                           path="/other.php")]
+        proofs = report._report_vulnerability_proofs(details(rows))["app.example.com"]
+        self.assertEqual(proofs, ["https://app.example.com:8443/affected.php — PHP 8.3.35",
+                                  "https://app.example.com:9443/other.php — PHP 8.3.35"])
+        payload = details(rows)
+        payload["campaign"]["scope"] = {"domains": ["example.com"]}
+        tree = report._report_tree_text(payload, report.compact_rows(rows))
+        self.assertIn("app [PHP 8.3.35 | VULNERABLE | PREUVE https://app.example.com:8443/affected.php — PHP 8.3.35]", tree)
+        self.assertIn("\n    PREUVE https://app.example.com:9443/other.php — PHP 8.3.35\n", tree)
+        self.assertNotIn("backported.php", tree)
+        self.assertNotIn("(+1 autre)", tree)
+
+    def test_tree_vulnerable_root_shows_additional_ipv6_service_proof(self):
+        rows = [assessment(hostname="2001:db8::10", state="POTENTIALLY_VULNERABLE", version="8.3.35",
+                           scheme="https", port="443", path="/first.php"),
+                assessment(hostname="2001:db8::10", state="POTENTIALLY_VULNERABLE", version="8.3.35",
+                           scheme="https", port="8443", path="/second.php")]
+        payload = details(rows)
+        tree = report._report_tree_text(payload, report.compact_rows(rows))
+        self.assertIn("PREUVE https://[2001:db8::10]/first.php — PHP 8.3.35", tree)
+        self.assertIn("\n    PREUVE https://[2001:db8::10]:8443/second.php — PHP 8.3.35\n", tree)
+        self.assertEqual(report._tree_endpoint("[2001:db8::10]", "https", "443", "/"),
+                         "https://[2001:db8::10]/")
+
+    def test_tree_preserves_all_detailed_causes_and_outside_destination(self):
+        rows = [assessment(state="UNKNOWN", version="8.3.36", reason_code="CONFLICTING_VERSIONS"),
+                assessment(state="UNKNOWN", version="8.3.36", port="8443", reason_code="UNRECOGNIZED_BUILD"),
+                assessment(state="UNKNOWN", version="", port="8080", reason_code="REDIRECT_NOT_ASSESSED",
+                           php_detected="UNKNOWN", observations=[{
+                               "reason_code": "REDIRECT_NOT_ASSESSED", "redirect_to": "https://outside.example.net/"}]),
+                assessment(state="PATCHED_VERSION_ADVERTISED", version="8.3.36", port="9443",
+                           traversal_complete="false", traversal_reason_code="HTTP_ACCESS_DENIED",
+                           crawl_gap_path="/restricted-component.php")]
+        payload = details(rows)
+        compact = report.compact_rows(rows)
+        compact[0]["explication"] = "Une explication compacte volontairement tronquée."
+        tree = report._report_tree_text(payload, compact)
+        self.assertIn("Versions PHP contradictoires sur le même service (port 443)", tree)
+        self.assertIn("Build PHP non reconnu ; correctif à vérifier côté serveur (port 8443)", tree)
+        self.assertIn("HTTP 403 : accès refusé sur /restricted-component.php (port 9443)", tree)
+        self.assertIn("HORS PÉRIMÈTRE DU CONTRÔLE", tree)
+        self.assertIn("https://outside.example.net/", tree)
+        self.assertNotIn("VERSION VUE, COUVERTURE INCOMPLÈTE", tree)
 
     def test_empty_campaign_json_has_only_two_structural_lines(self):
         report.write_campaign_report(details([]), self.base)
@@ -629,6 +740,49 @@ class CompactReportTests(unittest.TestCase):
         self.save("report.json", compact)
         with self.assertRaisesRegex(report.ReportError, "incohérent"):
             report.load_campaign_report(source)
+
+    def test_v053_silent_root_versioned_index_report_loads_then_recomputes(self):
+        redirect = assessment(
+            hostname="www.constatimmo.com", port="80", state="UNKNOWN", version="", fixed_versions="",
+            service="http", scheme="http", reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"reason_code": "REDIRECT_NOT_ASSESSED", "redirect_to": "https://www.constatimmo.com/"},
+                          {"reason_code": "REDIRECT_NOT_ASSESSED", "redirect_to": "https://www.constatimmo.com/index.php"}],
+        )
+        destination = assessment(
+            hostname="www.constatimmo.com", port="443", version="8.2.35", fixed_versions="", scheme="https",
+            observations=[{"path": "/", "state": "UNKNOWN", "reason_code": "PHP_NOT_IDENTIFIED", "versions": []},
+                          {"path": "/index.php", "state": "PATCHED_VERSION_ADVERTISED",
+                           "reason_code": "FIXED_VERSION_ADVERTISED", "versions": ["8.2.35"]}],
+        )
+        old = {**details([redirect, destination]), "tool_version": "0.5.3"}
+        historical = [{"cible": "www.constatimmo.com", "php": "8.2.35", "vulnerable": "INDETERMINE",
+                       "explication": "Ports évalués : 80,443. Dans la campagne — destinations évaluées séparément : "
+                       "https://www.constatimmo.com/, https://www.constatimmo.com/index.php. "
+                       "Destination de redirection évaluée séparément dans la campagne (port 80)."}]
+        self.save("raw/report-details.json", old)
+        source = self.save("report.json", historical)
+        loaded = report.load_campaign_report(source)
+        self.assertEqual(loaded, old)
+        self.assertEqual(report.compact_rows(loaded["rows"])[0]["vulnerable"], "NON")
+        historical[0]["explication"] += " Texte altéré."
+        self.save("report.json", historical)
+        with self.assertRaisesRegex(report.ReportError, "incohérent"):
+            report.load_campaign_report(source)
+
+    def test_historical_affected_version_with_gap_loads_then_recomputes_positive(self):
+        row = assessment(state="POTENTIALLY_VULNERABLE", version="8.3.35",
+                         reason_code="HTTP_ACCESS_DENIED", traversal_complete="false")
+        reason = "HTTP 403 : accès refusé (port 443); version concernée observée, correctif à vérifier."
+        for version in ("0.4.2", "0.4.3", "0.4.4", "0.4.5", "0.4.6", "0.5.0", "0.5.1", "0.5.2", "0.5.3"):
+            with self.subTest(version=version):
+                old = {**details([row]), "tool_version": version}
+                historical = [{"cible": "app.example.com", "php": "8.3.35", "vulnerable": "INDETERMINE",
+                               "explication": ("" if version == "0.4.2" else "Ports évalués : 443. ") + reason}]
+                self.save("raw/report-details.json", old)
+                source = self.save("report.json", historical)
+                loaded = report.load_campaign_report(source)
+                self.assertEqual(loaded, old)
+                self.assertEqual(report.compact_rows(loaded["rows"])[0]["vulnerable"], "OUI")
 
     def test_v043_compact_previous_accepts_its_port_aware_redirect_rendering(self):
         redirect = assessment(

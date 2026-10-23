@@ -35,7 +35,7 @@ from discovery import discover_root
 from campaign_state import CampaignLock, EventLedger, StateError
 
 
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -1444,14 +1444,17 @@ def run_campaign(args) -> int:
           f"{summary.get('targets_resolved', 0)} resolus, {summary.get('targets_attempted', 0)} tentes, "
           f"{summary.get('targets_evaluated', 0)} avec evaluation PHP2Shell.")
     results = compact_rows(report["rows"])
+    display_verdicts = (("VULNERABLE", "OUI"), ("NON-VULNERABLE", "NON"),
+                        ("INDETERMINE", "INDETERMINE"))
     print(f"Resultats par cible ({len(results)} lignes): " + ", ".join(
-        f"{verdict}={sum(row['vulnerable'] == verdict for row in results)}"
-        for verdict in ("OUI", "NON", "INDETERMINE")))
+        f"{label}={sum(row['vulnerable'] == stored for row in results)}"
+        for label, stored in display_verdicts))
     print(f"Rapports: {output / 'report.csv'} et {output / 'report.json'}")
     print(f"Arborescence: {output / 'report-tree.txt'}")
     if args.previous:
         print(f"Comparaison: {output / 'changes.csv'}")
-    print("OUI/NON selon les versions observees ou les preuves serveur; INDETERMINE si la conclusion reste impossible.")
+    print("VULNERABLE/NON-VULNERABLE selon les versions observees ou les preuves serveur; "
+          "INDETERMINE si la conclusion reste impossible.")
     campaign_lock.release()
     return 130 if interrupted else 2 if failures else 0
 
@@ -1701,9 +1704,11 @@ def resume_campaign(args) -> int:
         "campaign_status": manifest["status"], "report": "report.json",
     })
     results = compact_rows(report["rows"])
+    display_verdicts = (("VULNERABLE", "OUI"), ("NON-VULNERABLE", "NON"),
+                        ("INDETERMINE", "INDETERMINE"))
     print(f"Reprise terminee: " + ", ".join(
-        f"{verdict}={sum(row['vulnerable'] == verdict for row in results)}"
-        for verdict in ("OUI", "NON", "INDETERMINE")))
+        f"{label}={sum(row['vulnerable'] == stored for row in results)}"
+        for label, stored in display_verdicts))
     print(f"Rapports: {output / 'report.csv'} et {output / 'report.json'}")
     print(f"Arborescence: {output / 'report-tree.txt'}")
     campaign_lock.release()

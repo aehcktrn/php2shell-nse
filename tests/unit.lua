@@ -208,7 +208,7 @@ test("success and exhausted budgets on one port never stop other ports", functio
       equal(result.versions[1], versions[number])
       equal(result.state, number == 443 and "POTENTIALLY_VULNERABLE" or "PATCHED_VERSION_ADVERTISED")
     end
-    equal(result.script_version, "0.3.3")
+    equal(result.script_version, "0.3.4")
   end
   equal(#calls, 4)
 end)
@@ -413,7 +413,7 @@ test("bounded GET has no redirect, cache, credentials or body", function()
   equal(opts.auth, nil)
   equal(opts.cookies, nil)
   equal(opts.header["User-Agent"],
-    "php2shell-scanner/0.5.3 http-php2shell/0.3.3 (+https://github.com/aehcktrn/php2shell-scanner)")
+    "php2shell-scanner/0.5.4 http-php2shell/0.3.4 (+https://github.com/aehcktrn/php2shell-scanner)")
 end)
 
 test("global HTTP user agent can be overridden or disabled", function()
@@ -527,6 +527,129 @@ test("silent entry path falls back to index.php", function()
   equal(result.observations[2].reason_code, "AFFECTED_VERSION_ADVERTISED")
 end)
 
+test("linked same-origin pages are sampled without path brute force", function()
+  local result, calls = run(function(path)
+    if path == "/" then
+      return {status = 200, header = {["content-type"] = "text/html"}, body = [[
+        <a href="https://outside.example/foreign.php">outside</a>
+        <a href="/assets/site.css">static</a>
+        <a href="/logout">logout</a>
+        <a href="/about">about</a>
+        <a href="/component.php?id=42">component</a>
+      ]]}
+    end
+    if path == "/component.php" then return response("PHP/8.3.35") end
+    if path == "/about" then return {status = 403, header = {}, body = ""} end
+    return {status = 200, header = {}, body = ""}
+  end, {['http-php2shell.max_requests'] = 4})
+  equal(result.state, "UNKNOWN")
+  equal(result.potentially_vulnerable_evidence, true)
+  equal(result.traversal_complete, false)
+  equal(result.traversal_reason_code, "HTTP_ACCESS_DENIED")
+  equal(result.versions[1], "8.3.35")
+  equal(calls[1].path, "/")
+  equal(calls[2].path, "/index.php")
+  equal(calls[3].path, "/component.php")
+  equal(calls[4].path, "/about")
+  equal(result.budget_exhausted, false)
+  truthy(not contains({calls[1].path, calls[2].path, calls[3].path, calls[4].path}, "/logout"))
+  truthy(not flatten(calls):find("outside.example", 1, true))
+  truthy(not flatten(calls):find("site.css", 1, true))
+end)
+
+test("only anchor href attributes become sampled navigation requests", function()
+  local result, calls = run(function(path)
+    if path == "/" then
+      return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"}, body = [[
+        <!-- <a href="/comment.php">comment</a> -->
+        <script>const fake = 'href="/script.php"';</script>
+        <style>foo[href="/style.php"] {color: red}</style>
+        <link href="/not-anchor.php">
+        <a data-href="/data.php" title="href='/quoted.php'">no destination</a>
+        <a href="/%64elete-record">encoded action</a>
+        <a href="/%2564elete-record">nested encoded action</a>
+        <a href="/image%2epng">encoded static extension</a>
+        <A title="x > y" HREF='/real.php?token=secret'>real</A>
+        <a href=/plain.php>unquoted</a>
+      ]]})
+    end
+    return response("PHP/8.3.36")
+  end)
+  equal(result.state, "PATCHED_VERSION_ADVERTISED")
+  equal(#calls, 3)
+  equal(calls[2].path, "/plain.php")
+  equal(calls[3].path, "/real.php")
+  equal(result.observations[2].optional_crawl, true)
+end)
+
+test("sampled redirects strip query data before following a safe destination", function()
+  local result, calls = run(function(path)
+    if path == "/" then
+      return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"},
+        body = '<a href="/component">component</a>'})
+    end
+    if path == "/component" then return {status = 302, header = {location = "/fixed.php?token=secret"}} end
+    return response("PHP/8.3.36")
+  end)
+  equal(result.state, "PATCHED_VERSION_ADVERTISED")
+  equal(#calls, 3)
+  equal(calls[3].path, "/fixed.php")
+  truthy(not flatten(calls):find("token=secret", 1, true))
+end)
+
+for _, destination in ipairs({"/delete-record?confirm=1", "/%64elete-record", "/%2564elete-record",
+    "https://outside.example/foreign.php"}) do
+  test("unassessed sampled redirect preserves an HTTP coverage gap: " .. destination, function()
+    local result, calls = run(function(path)
+      if path == "/" then
+        return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"},
+          body = '<a href="/component">component</a>'})
+      end
+      return {status = 302, header = {location = destination}}
+    end)
+    equal(#calls, 2)
+    equal(result.state, "UNKNOWN")
+    equal(result.traversal_complete, false)
+    equal(result.traversal_reason_code, "REDIRECT_NOT_ASSESSED")
+    equal(result.crawl_gap_reason_code, "REDIRECT_NOT_ASSESSED")
+    equal(result.crawl_gap_path, "/component")
+    truthy(contains(result.versions, "8.3.36"))
+  end)
+end
+
+for _, condition in ipairs({{401, "AUTHENTICATION_REQUIRED"}, {403, "HTTP_ACCESS_DENIED"},
+    {429, "RATE_LIMITED"}, {0, "NO_HTTP_RESPONSE"}}) do
+  test("sampled failure cannot be hidden by an earlier fixed banner: " .. condition[2], function()
+    local result, calls = run(function(path)
+      if path == "/" then
+        return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"},
+          body = '<a href="/component">component</a>'})
+      end
+      if condition[1] > 0 then return {status = condition[1], header = {}} end
+      return nil
+    end)
+    equal(#calls, 2)
+    equal(result.state, "UNKNOWN")
+    equal(result.traversal_complete, false)
+    equal(result.traversal_reason_code, condition[2])
+    equal(result.crawl_gap_reason_code, condition[2])
+    equal(result.crawl_gap_path, "/component")
+  end)
+end
+
+test("representative crawl cap alone does not invalidate completed version evidence", function()
+  local result, calls = run(function(path)
+    return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"},
+      body = path == "/" and '<a href="/one.php">one</a><a href="/two.php">two</a>' or ""})
+  end, {["http-php2shell.max_requests"] = 2})
+  equal(#calls, 2)
+  equal(result.state, "PATCHED_VERSION_ADVERTISED")
+  equal(result.traversal_complete, true)
+  equal(result.crawl_truncated, true)
+  equal(result.budget_exhausted, false)
+  equal(result.crawl_gap_reason_code, nil)
+end)
+
 test("explicit paths are all assessed and retain conflicting evidence", function()
   local result, calls = run(function(path)
     return response(path == "/legacy" and "PHP/8.3.35" or "PHP/8.3.36")
@@ -544,7 +667,7 @@ test("version evidence includes exact transport and request identity", function(
     {ip = "192.0.2.7", targetname = "app.example.test"}, {number = 8443, service = "https"})
   local evidence = result.evidence[1]
   equal(result.schema_version, "1")
-  equal(result.script_version, "0.3.3")
+  equal(result.script_version, "0.3.4")
   equal(result.vhost, "app.example.test")
   equal(evidence.ip, "192.0.2.7")
   equal(evidence.port, 8443)

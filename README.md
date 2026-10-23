@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.5.3**, module NSE **0.3.3**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.5.4**, module NSE **0.3.4**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -62,10 +62,12 @@ Le dossier horodaté sous **`results/` est créé automatiquement** et son chemi
 |---|---|
 | `report.csv` | Une ligne par cible : `cible`, `php`, `vulnerable`, `explication`. |
 | `report.json` | La même synthèse, un objet par ligne. |
-| `report-tree.txt` | Vue arborescente des résultats, regroupée sous chaque domaine racine. |
+| `report-tree.txt` | Quatre vues arborescentes : inventaire Internet découvert, hôtes PHP confirmés, éléments vulnérables avec leur preuve, puis éléments non conclusifs avec leur cause. |
 | `discovered.txt` | Avec `--discover` : liste distincte des noms découverts et retenus, un par ligne. |
 
 `discovered.txt` conserve aussi une racine si elle apparaît dans les résultats de la source, ainsi que les noms retenus qui ne résolvent plus. `targets.txt` contient la liste complète des cibles retenues. Le fichier d'entrée reste inchangé.
+
+`report-tree.txt` se lit directement comme une synthèse : les noms sont regroupés sous les domaines fournis, les hôtes où PHP est confirmé disposent de leur propre vue, et chaque élément vulnérable renvoie à sa preuve (page, port et version). La vue des éléments non conclusifs explique le blocage : accès HTTP refusé, version masquée, résolution DNS impossible, redirection non évaluée ou contrôle interrompu. `NON-VULNERABLE` porte sur les services observés et les CVE recherchées ; `INDETERMINE` signale une vérification encore nécessaire.
 
 Pour choisir vous-même le dossier de sortie, ajoutez `--output results/ma-campagne`. Ce dossier doit être nouveau ou vide.
 
@@ -86,10 +88,12 @@ Ces lignes illustrent le format. **`php` contient les versions observées**, sé
 **L'explication liste les ports ayant une évaluation NSE**, même indéterminée, puis le motif du résultat. Les ports ouverts pertinents sans évaluation PHP sont signalés séparément. Lorsqu'une redirection quitte l'origine contrôlée et n'est donc pas suivie, sa destination expurgée est affichée avec la mention **HORS PÉRIMÈTRE DU CONTRÔLE — destination non évaluée**. Cette mention décrit la limite de l'évaluation HTTP courante : elle ne signifie pas nécessairement que le nom est absent du périmètre DNS autorisé ou d'une autre cible de la campagne. Les listes sont triées, dédoublonnées et bornées ; au-delà de dix ports, le nombre restant est indiqué. Les ports fermés ou filtrés ne figurent pas dans cette liste d'évaluations : leurs états restent dans les fichiers Nmap de `raw/`. Un port cité dans le motif de vulnérabilité désigne le service qui justifie le résultat, pas le seul port contrôlé.
 
 - **`OUI`** : au moins un service annonce clairement une version concernée, sans preuve valide de correction, ou un inventaire atteste un runtime encore affecté. L'explication précise le correctif ou la preuve disponible. Une version annoncée ne démontre pas l'exploitabilité.
-- **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une redirection HTTP vers le même nom en HTTPS n'est couverte que si sa destination exacte — adresse, protocole, port, chemin et paramètres comparables — a été évaluée séparément. Une ancienne version avec un backport attesté peut donc apparaître en `NON`, avec la version conservée et l'attestation expliquée.
+- **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une redirection HTTP vers le même nom en HTTPS n'est couverte que si sa destination exacte — adresse, protocole, port, chemin et paramètres comparables — a été demandée séparément. Une version observée sur `/index.php` constitue une preuve PHP pour l'hôte même si `/` ne publie pas de version. Une ancienne version avec un backport attesté peut apparaître en `NON`, avec la version conservée et l'attestation expliquée.
 - **`INDETERMINE`** : version absente ou masquée, observations contradictoires, inventaire contradictoire ou contrôle incomplet. Une cause courte indique la vérification à effectuer ; l'absence de PHP identifié ne devient pas automatiquement `NON`.
 
-Une version concernée clairement observée suffit à faire ressortir la cible en `OUI`, même si d'autres services restent indéterminés. Une observation suspecte au sein d'un parcours interrompu ou contradictoire reste `INDETERMINE`. Un service reconnu comme non web, par exemple SSH, ne dégrade pas à lui seul le résultat des services PHP évalués.
+Une version concernée clairement observée sur une seule page, un port ou un backend suffit à faire ressortir la cible en `OUI`, même si d'autres pages ou services restent indéterminés. Les lacunes restent détaillées, mais ne neutralisent jamais cette preuve positive. Un service reconnu comme non web, par exemple SSH, ne dégrade pas à lui seul le résultat des services PHP évalués.
+
+Le verdict porte sur les versions observées pour les deux CVE ciblées. Une même origine peut distribuer ses pages entre plusieurs runtimes ; une bannière corrigée ne prouve donc pas la correction de tous les composants cachés derrière cet hôte. Le parcours de liens fournit un échantillon des pages exposées.
 
 `report.csv` contient une ligne d'en-tête, puis une ligne physique par cible. `report.json` est une **liste JSON simple**, avec un objet de quatre champs par ligne, sans enveloppe technique ni observations imbriquées. Pour 465 cibles retenues, cela représente 465 résultats, soit 466 lignes CSV ou 467 lignes JSON avec les deux crochets. Les sous-domaines découverts ajoutent chacun leur propre résultat.
 
@@ -108,7 +112,7 @@ Tous les fichiers ci-dessous sont des sorties du scanner. Ils n'ont pas à être
 | `discovered.txt` | Si découverte automatique : noms concrets CT retenus, y compris les racines présentes dans la source ; certains peuvent ne plus résoudre. |
 | `report.csv` | Synthèse à quatre colonnes, une ligne par cible. |
 | `report.json` | Même synthèse sous forme de liste JSON, un objet par ligne. |
-| `report-tree.txt` | Arborescence DNS lisible : domaines racines, branches intermédiaires et verdict de chaque cible. |
+| `report-tree.txt` | Synthèse managériale en quatre arborescences DNS : inventaire retenu, hôtes PHP, vulnérabilités et non-conclusifs motivés. |
 | `changes.csv` | Comparaison avec `--previous` ; en-têtes seuls sans comparaison. |
 | `raw/report-details.json` | Bilan technique complet : évaluations par service, observations, preuves, couverture et métadonnées de campagne. Nécessaire au recontrôle et à la comparaison des nouveaux rapports. |
 | Autres fichiers de `raw/` | Résultats Nmap `.xml`, `.nmap`, `.gnmap` et journaux par couple nom/IP. |
@@ -155,7 +159,7 @@ python3 scan.py domaines.txt \
 
 **Conservez le dossier de campagne complet.** Pour un `report.json` compact, `--previous` charge automatiquement `raw/report-details.json` dans le même dossier et vérifie que les deux rapports correspondent. Un compagnon absent ou incohérent est refusé avant les accès réseau. Les anciens rapports JSON détaillés de schéma `1` restent acceptés directement, sans fichier compagnon. Cette règle vaut aussi pour le profil `recontrole`.
 
-Les rapports compacts des versions 0.4.1 à 0.5.2 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouveaux rapports appliquent toujours les règles 0.5.3.
+Les rapports compacts des versions 0.4.1 à 0.5.3 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouveaux rapports appliquent toujours les règles 0.5.4.
 
 Les changements sont classés en `NEW`, `CHANGED`, `UNCHANGED` et `NO_LONGER_OBSERVED`, en conservant nom, IP, port et protocole. Un changement DNS peut apparaître comme un nouveau service et un ancien non observé. **La disparition d'un service ne prouve pas sa correction.** Les changements de périmètre, de ports ou de visibilité doivent être pris en compte.
 
@@ -316,7 +320,7 @@ Le lanceur fixe également `--script-timeout` à **22 secondes par défaut** : b
 <details>
 <summary>Adapter les chemins et le parcours HTTP</summary>
 
-Le parcours courant contrôle automatiquement `/` et `/index.php`, même si le premier chemin annonce déjà une version. Cela évite qu'une redirection HTTP vers le second chemin reste sans destination HTTPS équivalente. Si dix chemins supplémentaires remplissent déjà la limite technique, ajoutez explicitement `/index.php` au fichier à la place d'un autre chemin. Pour préciser un autre point d'entrée :
+Le parcours courant contrôle automatiquement `/` et `/index.php`, même si le premier chemin annonce déjà une version. Il extrait ensuite les liens des pages HTML reçues et échantillonne, dans le budget restant, des pages sûres de la même origine en donnant priorité aux extensions PHP. Il ne teste aucun chemin issu d'un dictionnaire, ne soumet aucun formulaire, ignore les liens externes et ne rejoue pas les paramètres de requête. Cette cartographie est représentative des composants publiquement reliés, pas exhaustive. Si dix chemins supplémentaires remplissent déjà la limite technique, ajoutez explicitement `/index.php` au fichier à la place d'un autre chemin. Pour préciser un autre point d'entrée :
 
 ```bash
 python3 scan.py domaines.txt --path /app/
