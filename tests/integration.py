@@ -8,6 +8,8 @@ No vulnerable PHP installation or public scanning target is used.
 from __future__ import annotations
 
 import http.server
+import gzip
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -26,6 +28,15 @@ VHOST = "application.example.test"
 FALLBACK_VHOST = "fallback.example.test"
 SECRET_COOKIE = "SYNTHETIC_COOKIE_MUST_NOT_APPEAR"
 SECRET_BODY = "SYNTHETIC_BODY_MUST_NOT_APPEAR"
+
+
+def phpinfo_html(version="8.3.35"):
+    return (f'<!DOCTYPE html><html><head><title>PHP {version} - phpinfo()</title></head>'
+            f'<body><h1 class="p">PHP Version {version}</h1><table>'
+            '<tr><td class="e">System </td><td class="v">Synthetic fixture</td></tr>'
+            '<tr><td class="e">Server API </td><td class="v">FPM/FastCGI</td></tr></table>'
+            f'<table><tr><td class="e">ENV_SECRET</td><td class="v">{SECRET_BODY}</td></tr></table>'
+            '</body></html>').encode()
 
 
 class FixtureHandler(http.server.BaseHTTPRequestHandler):
@@ -60,7 +71,15 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
                     b'<!-- <a href="/comment.php">comment</a> -->'
                     b'<script>const text = \'href="/script.php"\';</script>'
                     b'<a data-href="/data.php" title="href=\'/quoted.php\'">noise</a>'
-                    b'<a href="/linked-component.php?id=42">component</a>')
+                    b'<form><a href="/form.php">form</a></form>'
+                    b'<a href="/query-component.php?id=42">query rejected</a>'
+                    b'<a href="/linked-component.php">component</a>')
+        elif self.path == "/linked-dense":
+            content_type = "text/html"
+            body = b''.join(f'<a href="/navigation-{item:03d}">page</a>'.encode() for item in range(200))
+        elif self.path.startswith("/navigation-"):
+            content_type = "text/html"
+            body = b'<a href="/recursive.php">must not visit</a>'
         elif self.path == "/linked-component.php":
             headers["X-Powered-By"] = "PHP/8.3.35"
         elif self.path in ("/linked-fixed-blocked", "/linked-fixed-unsafe-redirect"):
@@ -71,6 +90,15 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/linked-safe-redirect":
             content_type = "text/html"
             body = b'<a href="/linked-redirect-safe">component</a>'
+        elif self.path == "/linked-two-hop-redirect":
+            content_type = "text/html"
+            body = b'<a href="/optional-hop-one">component</a>'
+        elif self.path == "/optional-hop-one":
+            status = 302
+            headers["Location"] = "/optional-hop-two"
+        elif self.path == "/optional-hop-two":
+            status = 302
+            headers["Location"] = "/linked-component.php"
         elif self.path == "/linked-redirect-safe":
             status = 302
             headers["Location"] = "/linked-component.php?token=synthetic-secret"
@@ -79,6 +107,28 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             headers["Location"] = "/delete-record?confirm=1"
         elif self.path == "/silent":
             body = b"Documentation example: PHP/8.3.36"
+        elif self.path.startswith("/phpinfo"):
+            content_type, body = "text/html", phpinfo_html()
+            if self.path == "/phpinfo-conflict":
+                headers["X-Powered-By"] = "PHP/8.3.36"
+            elif self.path == "/phpinfo-documentation":
+                body = body.replace(b"PHP 8.3.35 - phpinfo()", b"PHP manual")
+            elif self.path == "/phpinfo-extension":
+                body = body.replace(b"PHP 8.3.35 - phpinfo()", b"phpinfo()")
+                body = body.replace(b"PHP Version 8.3.35", b"OpenSSL 8.3.35")
+            elif self.path == "/phpinfo-compressed":
+                headers["Content-Encoding"] = "gzip"
+                body = gzip.compress(body)
+            elif self.path == "/phpinfo-compressed-large":
+                headers["Content-Encoding"] = "gzip"
+                body = gzip.compress(body + b"X" * 100_000)
+            elif self.path == "/phpinfo-large":
+                body += b"X" * 100_000
+            elif self.path == "/phpinfo-unsupported":
+                headers["Content-Encoding"] = "unsupported-synthetic"
+        elif self.path == "/redirect-query":
+            status = 302
+            headers["Location"] = f"https://{VHOST}/application.php?a=1&token={SECRET_BODY}"
         elif self.path == "/redirect":
             status = 302
             headers["Location"] = f"http://127.0.0.1:{self.server.server_port}/fixed"
@@ -222,14 +272,20 @@ class NSEIntegration(unittest.TestCase):
     def scan(self, path, *, server=None, vhost=None, discover=False, targets_file=None,
              extra_args=""):
         server = server or self.httpd
-        args = f"http-php2shell.path={path},http-php2shell.timeout=2000"
+        quoted_path = path.replace('\\', '\\\\').replace('"', '\\"')
+        args = f'http-php2shell.path="{quoted_path}",http-php2shell.timeout=2000'
         if vhost:
             args += f",http-php2shell.vhost={vhost}"
         if extra_args:
             args += "," + extra_args
         script_selector = str(SCRIPT) if discover else "+" + str(SCRIPT)
+        # Queries belong in restricted inputs, not in Nmap's public argv/XML.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.temp.name,
+                                         prefix="private-args-", delete=False) as arguments:
+            arguments.write(args)
+            arguments_path = arguments.name
         command = [self.nmap, "-sT", "-Pn", "-n", "-p", str(server.server_port),
-                   "--script", script_selector, "--script-args", args,
+                   "--script", script_selector, "--script-args-file", arguments_path,
                    "--script-timeout", "15s", "-oX", "-"]
         if targets_file is not None:
             command.extend(["--resolve-all", "-iL", str(targets_file)])
@@ -367,31 +423,29 @@ class NSEIntegration(unittest.TestCase):
         self.assertNotIn("/assets/site.css", paths)
         self.assertEqual(self.field(script, "requests_made"), "3")
 
-    def test_sampled_redirect_strips_query_values_before_request(self):
+    def test_sampled_redirect_rejects_query_without_inventing_a_new_request(self):
         with self.httpd.record_lock:
             before = len(self.httpd.requests)
         state, script, _ = self.scan("/linked-safe-redirect")
-        self.assertEqual(state, "POTENTIALLY_VULNERABLE")
+        self.assertEqual(state, "UNKNOWN")
         with self.httpd.record_lock:
             paths = [entry["path"] for entry in self.httpd.requests[before:]]
-        self.assertEqual(paths, ["/linked-safe-redirect", "/index.php",
-                                 "/linked-redirect-safe", "/linked-component.php"])
+        self.assertEqual(paths, ["/linked-safe-redirect", "/index.php", "/linked-redirect-safe"])
         self.assertEqual(self.field(self.observations(script)[-1], "optional_crawl"), "true")
+        self.assertEqual(self.field(self.observations(script)[-1], "redirect_policy"), "OPTIONAL_LINK_EXCLUDED")
 
-    def test_sampled_failure_keeps_fixed_banner_inconclusive(self):
-        for path, expected_code in (("/linked-fixed-blocked", "HTTP_ACCESS_DENIED"),
-                                    ("/linked-fixed-unsafe-redirect", "REDIRECT_NOT_ASSESSED")):
+    def test_published_base_version_suppresses_optional_links(self):
+        for path in ("/linked-fixed-blocked", "/linked-fixed-unsafe-redirect"):
             with self.subTest(path=path):
                 with self.httpd.record_lock:
                     before = len(self.httpd.requests)
                 state, script, _ = self.scan(path)
-                self.assertEqual(state, "UNKNOWN")
-                self.assertEqual(self.field(script, "traversal_complete"), "false")
-                self.assertEqual(self.field(script, "crawl_gap_reason_code"), expected_code)
-                self.assertEqual(self.field(script, "traversal_reason_code"), expected_code)
+                self.assertEqual(state, "PATCHED_VERSION_ADVERTISED")
+                self.assertEqual(self.field(script, "traversal_complete"), "true")
+                self.assertEqual(self.field(script, "enrichment_requests"), "0")
                 with self.httpd.record_lock:
                     paths = [entry["path"] for entry in self.httpd.requests[before:]]
-                self.assertEqual(len(paths), 2)
+                self.assertEqual(paths, [path])
                 self.assertTrue(all("delete-record" not in item for item in paths))
 
     def test_request_budget_stops_redirect_chain(self):
@@ -407,6 +461,116 @@ class NSEIntegration(unittest.TestCase):
         with self.httpd.record_lock:
             requests = self.httpd.requests[before:]
         self.assertEqual([item["path"] for item in requests], ["/redirect-chain/0", "/redirect-chain/1"])
+
+    def test_managed_base_defers_exact_secret_redirect_to_private_transport(self):
+        private = Path(self.temp.name) / "private-redirects.tsv"
+        private.write_text("", encoding="utf-8")
+        private.chmod(0o600)
+        with self.httpd.record_lock:
+            before = len(self.httpd.requests)
+        state, script, output = self.scan(
+            "/redirect-query", vhost=VHOST,
+            extra_args=("http-php2shell.phase=base,http-php2shell.scheme=http,"
+                        "http-php2shell.fallback=false,http-php2shell.enrich=false,"
+                        f"http-php2shell.private_plan={private}"),
+        )
+        self.assertEqual(state, "UNKNOWN")
+        observation = self.observations(script)[0]
+        request = f"http://{VHOST}:{self.httpd.server_port}/redirect-query"
+        destination = f"https://{VHOST}:443/application.php?a=1&token={SECRET_BODY}"
+        expected_source = hashlib.sha256(request.encode()).hexdigest()
+        expected_destination = hashlib.sha256(destination.encode()).hexdigest()
+        self.assertEqual(self.field(observation, "path_identity"), expected_source)
+        self.assertEqual(self.field(observation, "redirect_identity"), expected_destination)
+        self.assertEqual(self.field(observation, "redirect_hops"), "1")
+        self.assertEqual(self.field(observation, "collection_phase"), "base")
+        self.assertEqual(private.read_text().splitlines(),
+                         [f"{expected_source}\t{expected_destination}\t{destination}\t1"])
+        self.assertNotIn(SECRET_BODY, output)
+        with self.httpd.record_lock:
+            requests = self.httpd.requests[before:]
+        self.assertEqual([entry["path"] for entry in requests], ["/redirect-query"])
+
+    def test_managed_request_query_has_exact_identity_and_redacted_provenance(self):
+        identities = []
+        for query in ("a=1", "a=2"):
+            _, script, output = self.scan(
+                f"/old?{query}", vhost=VHOST,
+                extra_args="http-php2shell.phase=base,http-php2shell.scheme=http,http-php2shell.fallback=false",
+            )
+            observation = self.observations(script)[0]
+            expected = f"http://{VHOST}:{self.httpd.server_port}/old?{query}"
+            actual = self.field(observation, "path_identity")
+            self.assertEqual(actual, hashlib.sha256(expected.encode()).hexdigest())
+            self.assertEqual(self.field(observation, "path"), "/old?[redacted]")
+            self.assertNotIn(query, output)
+            identities.append(actual)
+        self.assertNotEqual(*identities)
+
+    def test_dense_page_has_two_optional_visits_and_no_recursive_links(self):
+        with self.httpd.record_lock:
+            before = len(self.httpd.requests)
+        _, script, _ = self.scan("/linked-dense", extra_args="http-php2shell.fallback=false")
+        with self.httpd.record_lock:
+            requests = self.httpd.requests[before:]
+        self.assertEqual([entry["path"] for entry in requests],
+                         ["/linked-dense", "/navigation-000", "/navigation-001"])
+        self.assertEqual(self.field(script, "enrichment_requests"), "2")
+        candidates = [elem.text for elem in script.findall("table[@key='candidate_paths']/elem")]
+        self.assertLessEqual(len(candidates), 32)
+        self.assertNotIn("/recursive.php", candidates)
+
+    def test_optional_redirects_share_the_two_get_enrichment_cap(self):
+        with self.httpd.record_lock:
+            before = len(self.httpd.requests)
+        state, script, _ = self.scan("/linked-two-hop-redirect", extra_args=(
+            "http-php2shell.fallback=false,http-php2shell.max_requests=10,http-php2shell.redirects=5"))
+        self.assertEqual(state, "UNKNOWN")
+        with self.httpd.record_lock:
+            paths = [entry["path"] for entry in self.httpd.requests[before:]]
+        self.assertEqual(paths, ["/linked-two-hop-redirect", "/optional-hop-one", "/optional-hop-two"])
+        self.assertEqual(self.field(script, "enrichment_requests"), "2")
+        self.assertEqual(self.field(script, "crawl_gap_reason_code"), "REDIRECT_NOT_ASSESSED")
+        self.assertEqual(self.field(self.observations(script)[-1], "redirect_followed"), "false")
+
+    def test_structured_phpinfo_is_a_published_version_without_saved_secrets(self):
+        state, script, output = self.scan("/phpinfo")
+        self.assertEqual(state, "POTENTIALLY_VULNERABLE")
+        evidence = script.find("table[@key='evidence']/table")
+        self.assertIsNotNone(evidence)
+        self.assertEqual(self.field(evidence, "source"), "phpinfo-structured")
+        self.assertEqual(self.field(evidence, "version"), "8.3.35")
+        self.assertEqual(self.field(evidence, "method"), "structured phpinfo HTML (published version)")
+        self.assertRegex(self.field(evidence, "timestamp"), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertNotIn(SECRET_BODY, output)
+        self.assertNotIn("ENV_SECRET", output)
+
+    def test_phpinfo_header_conflict_keeps_both_main_versions(self):
+        state, script, _ = self.scan("/phpinfo-conflict")
+        self.assertEqual(state, "UNKNOWN")
+        self.assertEqual(self.field(script, "reason_code"), "CONFLICTING_VERSIONS")
+        versions = {item.text for item in script.findall("table[@key='versions']/elem")}
+        self.assertEqual(versions, {"8.3.35", "8.3.36"})
+
+    def test_documentation_and_extension_versions_are_not_php_version_evidence(self):
+        for path in ("/phpinfo-documentation", "/phpinfo-extension"):
+            with self.subTest(path=path):
+                state, script, _ = self.scan(path, extra_args="http-php2shell.fallback=false")
+                self.assertEqual(state, "UNKNOWN")
+                self.assertEqual(script.findall("table[@key='versions']/elem"), [])
+
+    def test_compressed_phpinfo_and_decoded_body_limits(self):
+        state, _, output = self.scan("/phpinfo-compressed")
+        self.assertEqual(state, "POTENTIALLY_VULNERABLE")
+        self.assertNotIn(SECRET_BODY, output)
+        for path, expected in (("/phpinfo-large", "BODY_TRUNCATED"),
+                               ("/phpinfo-compressed-large", "BODY_TRUNCATED"),
+                               ("/phpinfo-unsupported", "BODY_ENCODING_UNSUPPORTED")):
+            with self.subTest(path=path):
+                state, script, output = self.scan(path, extra_args="http-php2shell.fallback=false")
+                self.assertEqual(state, "UNKNOWN")
+                self.assertEqual(self.field(self.observations(script)[0], "body_detection_limit"), expected)
+                self.assertNotIn(SECRET_BODY, output)
 
     def test_small_time_budget_does_not_start_fallback(self):
         with self.httpd.record_lock:
@@ -462,7 +626,8 @@ class NSEIntegration(unittest.TestCase):
             self.skipTest("openssl is required to create the local TLS fixture")
         with self.httpsd.record_lock:
             before = len(self.httpsd.requests)
-        state, script, _ = self.scan("/vhost", server=self.httpsd, vhost=VHOST)
+        state, script, _ = self.scan("/vhost", server=self.httpsd, vhost=VHOST,
+                                     extra_args="http-php2shell.scheme=https,http-php2shell.phase=base,http-php2shell.fallback=false")
         self.assertEqual(state, "PATCHED_VERSION_ADVERTISED")
         with self.httpsd.record_lock:
             requests = [entry for entry in self.httpsd.requests[before:]
@@ -472,8 +637,11 @@ class NSEIntegration(unittest.TestCase):
             self.assertEqual(entry["host"], f"{VHOST}:{self.httpsd.server_port}")
             self.assertEqual(entry["sni"], VHOST, "SNI on the NSE GET connection")
         for observation in self.observations(script):
+            self.assertEqual(self.field(observation, "scheme"), "https")
             self.assertEqual(self.field(observation, "tls_sni"), VHOST)
             self.assertEqual(self.field(observation, "http_host"), f"{VHOST}:{self.httpsd.server_port}")
+            expected = f"https://{VHOST}:{self.httpsd.server_port}/vhost"
+            self.assertEqual(self.field(observation, "path_identity"), hashlib.sha256(expected.encode()).hexdigest())
 
     def test_service_detection_selects_http_on_an_arbitrary_port(self):
         state, _, output = self.scan("/old", discover=True)

@@ -12,6 +12,7 @@ import unittest
 
 from campaign_state import CampaignLock, EventLedger, StateError
 import scan
+from service_budget import ServiceBudgets, identity_key, service_identity
 
 
 class CampaignStateTests(unittest.TestCase):
@@ -52,6 +53,58 @@ class CampaignStateTests(unittest.TestCase):
             stream.write(b'{"schema_version":"1"')
         restored = ledger.replay(self.manifest())
         self.assertEqual(restored["targets"][0]["endpoints"][0]["status"], "COMPLETED")
+
+    def test_append_repairs_partial_crash_tail_before_a_new_durable_reservation(self):
+        ledger = EventLedger(self.base)
+        ledger.append("endpoint", "task-1", {"status": "COMPLETED"})
+        with ledger.path.open("ab") as stream:
+            stream.write(b'{"schema_version":"1","kind":"http_service","value":')
+        manifest = ledger.replay(self.manifest())
+        budgets = ServiceBudgets(manifest, ledger)
+        identity = service_identity("app.example.com", "192.0.2.10", 443, "https")
+        key = budgets.ensure(identity)
+        budgets.reserve(key, 5, 20000)
+        restored = EventLedger(self.base).replay(self.manifest())
+        self.assertEqual(restored["targets"][0]["endpoints"][0]["status"], "COMPLETED")
+        self.assertEqual(restored["http_services"][key]["charged_requests"], 5)
+        self.assertTrue(all(json.loads(line) for line in ledger.path.read_bytes().splitlines()))
+
+    def test_append_preserves_a_valid_final_event_missing_only_its_newline(self):
+        ledger = EventLedger(self.base)
+        event = {"schema_version": "1", "kind": "endpoint", "key": "task-1",
+                 "value": {"status": "COMPLETED"}}
+        ledger.path.write_bytes(json.dumps(event).encode())
+        ledger.append("dns", "app.example.com", {"dns_status": "RESOLVED"})
+        restored = ledger.replay(self.manifest())
+        target = restored["targets"][0]
+        self.assertEqual(target["endpoints"][0]["status"], "COMPLETED")
+        self.assertEqual(target["dns_status"], "RESOLVED")
+
+    def test_invalid_middle_or_complete_final_events_are_never_repaired_away(self):
+        ledger = EventLedger(self.base)
+        for raw in (b'not json\n', b'{"schema_version":"untrusted"}'):
+            ledger.path.write_bytes(raw)
+            with self.subTest(raw=raw), self.assertRaises(StateError):
+                if raw.endswith(b"\n"):
+                    ledger.replay(self.manifest())
+                else:
+                    ledger.append("endpoint", "task-1", {"status": "COMPLETED"})
+
+    def test_collection_events_replay_new_services_only_with_matching_stable_identity(self):
+        ledger = EventLedger(self.base)
+        identity = service_identity("app.example.com", "192.0.2.10", 443, "https")
+        key = identity_key(identity)
+        record = {"identity": identity, "status": "PLANNED", "phases": []}
+        ledger.append("http_collection", key, record)
+        restored = ledger.replay(self.manifest())
+        self.assertEqual(restored["http_collection"]["services"][key], record)
+        with self.assertRaises(StateError):
+            ledger.append("http_collection", "not-the-service", record)
+        event = {"schema_version": "1", "kind": "http_collection", "key": "bad-key",
+                 "value": record}
+        ledger.path.write_bytes((json.dumps(event) + "\n").encode())
+        with self.assertRaises(StateError):
+            ledger.replay(self.manifest())
 
     def test_campaign_lock_refuses_a_second_process(self):
         first = CampaignLock(self.base)

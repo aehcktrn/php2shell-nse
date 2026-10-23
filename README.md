@@ -2,9 +2,9 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.5.5**, module NSE **0.3.4**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.6.0**, module NSE **0.4.0**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
-Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
+Le NSE recherche des versions explicitement publiées dans les en-têtes HTTP et les diagnostics `phpinfo()` déjà accessibles. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi des destinations exactes des redirections, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
 ## Démarrage : un fichier, deux commandes
 
@@ -85,7 +85,7 @@ Les rapports principaux contiennent exactement **quatre champs**, dans cet ordre
 
 Ces lignes illustrent le format. **`php` contient les versions observées**, séparées par ` | ` lorsqu'il y en a plusieurs, ou `INCONNUE` lorsqu'aucune version n'est disponible. Dans une campagne `scan.py`, chaque nom DNS retenu garde sa propre ligne, même s'il partage une IP avec une autre cible. Un export XML autonome reprend le vhost explicite ou l'identité de l'entrée Nmap, avec l'IP en l'absence de nom ; plusieurs alias d'une même entrée restent groupés, car ils ne prouvent pas des tests distincts de chaque vhost.
 
-**L'explication liste les ports ayant une évaluation NSE**, même indéterminée, puis le motif du résultat. Les ports ouverts pertinents sans évaluation PHP sont signalés séparément. Lorsqu'une redirection quitte l'origine contrôlée et n'est donc pas suivie, sa destination expurgée est affichée avec la mention **HORS PÉRIMÈTRE DU CONTRÔLE — destination non évaluée**. Cette mention décrit la limite de l'évaluation HTTP courante : elle ne signifie pas nécessairement que le nom est absent du périmètre DNS autorisé ou d'une autre cible de la campagne. Les listes sont triées, dédoublonnées et bornées ; au-delà de dix ports, le nombre restant est indiqué. Les ports fermés ou filtrés ne figurent pas dans cette liste d'évaluations : leurs états restent dans les fichiers Nmap de `raw/`. Un port cité dans le motif de vulnérabilité désigne le service qui justifie le résultat, pas le seul port contrôlé.
+**L'explication liste les ports ayant une évaluation NSE**, même indéterminée, puis le motif du résultat et la source de version utile. Les ports ouverts pertinents sans évaluation PHP sont signalés séparément. Le lanceur programme les URL exactes des redirections vers les noms et ports déjà autorisés. Une destination qui reste non couverte est affichée sous sa forme expurgée avec la mention **HORS PÉRIMÈTRE DU CONTRÔLE — destination non évaluée** ; le détail technique conserve la cause. Cette mention décrit la limite du contrôle : elle ne signifie pas nécessairement que le nom est absent du périmètre DNS autorisé. Une version publiée par un autre nom est attribuée à ce nom. Les listes sont triées, dédoublonnées et bornées ; au-delà de dix ports, le nombre restant est indiqué. Les ports fermés ou filtrés restent dans les fichiers Nmap de `raw/`. Un port cité dans le motif de vulnérabilité désigne le service qui justifie le résultat, pas le seul port contrôlé.
 
 - **`OUI`** : au moins un service annonce clairement une version concernée, sans preuve valide de correction, ou un inventaire atteste un runtime encore affecté. L'explication précise le correctif ou la preuve disponible. Une version annoncée ne démontre pas l'exploitabilité.
 - **`NON`** : les services pertinents évalués annoncent des versions corrigées ou disposent d'attestations valides de correction, sans contrôle HTTP ou réseau manquant. Une redirection HTTP vers le même nom en HTTPS n'est couverte que si sa destination exacte — adresse, protocole, port, chemin et paramètres comparables — a été demandée séparément. Une version observée sur `/index.php` constitue une preuve PHP pour l'hôte même si `/` ne publie pas de version. Une ancienne version avec un backport attesté peut apparaître en `NON`, avec la version conservée et l'attestation expliquée.
@@ -105,6 +105,7 @@ Tous les fichiers ci-dessous sont des sorties du scanner. Ils n'ont pas à être
 |---|---|
 | `manifest.json` | Périmètre, exclusions, empreintes des entrées, résolution A/AAAA, paramètres et état de chaque exécution. |
 | `state/events.jsonl` | Journal incrémental de récupération, écrit à chaque transition sans réécrire tout le manifeste. |
+| `state/private/` | Entrées locales nécessaires à la reprise des URL exactes, y compris leurs paramètres ; dossier privé `0700`, fichiers `0600`, à conserver localement sans les diffuser avec le rapport. |
 | `progress.json` | Progression provisoire explicitement marquée ; elle publie les positifs établis, jamais de résultat négatif avant la consolidation finale. |
 | `.campaign.lock` | Verrou local empêchant deux processus de modifier la même campagne. |
 | `targets.txt` | Ensemble des noms retenus et normalisés : cibles exactes, racines, imports et découverte. |
@@ -115,7 +116,7 @@ Tous les fichiers ci-dessous sont des sorties du scanner. Ils n'ont pas à être
 | `report-tree.txt` | Synthèse managériale en quatre arborescences DNS : inventaire retenu, hôtes PHP, vulnérabilités et non-conclusifs motivés. |
 | `changes.csv` | Comparaison avec `--previous` ; en-têtes seuls sans comparaison. |
 | `raw/report-details.json` | Bilan technique complet : évaluations par service, observations, preuves, couverture et métadonnées de campagne. Nécessaire au recontrôle et à la comparaison des nouveaux rapports. |
-| Autres fichiers de `raw/` | Résultats Nmap `.xml`, `.nmap`, `.gnmap` et journaux par couple nom/IP. |
+| Autres fichiers de `raw/` | XML de découverte assaini, journaux par couple nom/IP et résultats `.xml`, `.nmap`, `.gnmap` des phases HTTP par service. |
 
 Le bilan technique distingue **domaines retenus après validation et dédoublonnage, résolus, tentés et évalués**. Les candidats écartés restent dans `excluded_candidates` du manifeste et de `raw/report-details.json`. Les échecs DNS, délais expirés, interruptions, XML invalides et cibles absentes d'un XML restent visibles dans la ligne de leur cible. Par défaut, les adresses DNS non globales (privées, loopback, link-local, CGNAT, multicast ou réservées) sont consignées avec `NO_PUBLIC_ADDRESS` et ne sont jamais transmises à Nmap. `--allow-non-global` lève explicitement cette protection pour un laboratoire maîtrisé ; ne l'utilisez pas pour une campagne Internet. Les erreurs d'une source de découverte sont consignées dans `discovery.json` et dans le bilan technique ; elles ne créent pas de cible fictive ni de résultat PHP supplémentaire.
 
@@ -130,7 +131,7 @@ Les états suivants sont conservés dans `raw/report-details.json` et dans la so
 | `UNKNOWN` | **INDETERMINE — A VERIFIER** : suivre le motif et l'action associée. |
 | `NOT_ASSESSED` | Aucun résultat NSE exploitable pour cette ligne de couverture. |
 
-`row_type=ASSESSMENT` désigne une évaluation NSE ; `COVERAGE` une absence d'évaluation, parfois normale pour un service non web comme SSH. Les comptes ne sont pas des nombres de machines uniques. `exploitability` reste **`NOT_TESTED`**. Les en-têtes `Server` et `X-Powered-By` peuvent être masqués, modifiés ou émis par un intermédiaire.
+`row_type=ASSESSMENT` désigne une évaluation NSE ; les phases HTTP d'un même service sont fusionnées dans une seule évaluation avec toutes leurs observations et tous les échantillons. `COVERAGE` désigne une absence d'évaluation, parfois normale pour un service non web comme SSH. Les comptes ne sont pas des nombres de machines uniques. `exploitability` reste **`NOT_TESTED`**. Les en-têtes `Server` et `X-Powered-By` peuvent être masqués, modifiés ou émis par un intermédiaire. Un diagnostic structuré constitue également une **version publiée** : une reproduction statique de `phpinfo()` peut être impossible à distinguer d'une sortie actuelle.
 
 ### Motifs des indéterminés
 
@@ -146,6 +147,9 @@ Les états suivants sont conservés dans `raw/report-details.json` et dans la so
 | `CONFLICTING_VERSIONS` | Vérifier les chemins et runtimes associés aux versions. |
 | `UNRECOGNIZED_BUILD` | Identifier le build et ses correctifs fournisseur. |
 | `REQUEST_BUDGET_EXHAUSTED` | Couverture HTTP partielle : ajuster budget ou chemins. |
+| `HTTP_BUDGET_UNCERTAIN` | Une interruption a laissé une réservation de quota sans consommation exacte connue ; la reprise conserve cette réservation. |
+| `INPUT_UNAVAILABLE` | Restituer l'URL locale complète si ses paramètres expurgés ne peuvent plus être reconstruits pour la reprise. |
+| `REDIRECT_LOOP` / `CHAIN_LIMIT` | Boucle ou limite commune de redirections atteinte ; destination non couverte. |
 
 Des motifs de campagne complètent ces résultats : `DNS_ERROR`, `DNS_FAMILY_ERROR`, `SCAN_TIMEOUT`, `SCAN_SKIPPED`, `INVALID_SCAN_XML`, etc. Dans le bilan technique, `next_action`, `remediation` et `verification` donnent les suites attendues. Une preuve suspecte est conservée lorsqu'une incohérence impose `UNKNOWN`.
 
@@ -159,7 +163,7 @@ python3 scan.py domaines.txt \
 
 **Conservez le dossier de campagne complet.** Pour un `report.json` compact, `--previous` charge automatiquement `raw/report-details.json` dans le même dossier et vérifie que les deux rapports correspondent. Un compagnon absent ou incohérent est refusé avant les accès réseau. Les anciens rapports JSON détaillés de schéma `1` restent acceptés directement, sans fichier compagnon. Cette règle vaut aussi pour le profil `recontrole`.
 
-Les rapports compacts des versions 0.4.1 à 0.5.4 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouveaux rapports appliquent toujours les règles 0.5.5.
+Les rapports compacts des versions 0.4.1 à 0.5.5 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouvelles campagnes appliquent les règles de collecte 0.6.0 ; la comparaison des versions et les seuils PHP restent inchangés.
 
 Les changements sont classés en `NEW`, `CHANGED`, `UNCHANGED` et `NO_LONGER_OBSERVED`, en conservant nom, IP, port et protocole. Un changement DNS peut apparaître comme un nouveau service et un ancien non observé. **La disparition d'un service ne prouve pas sa correction.** Les changements de périmètre, de ports ou de visibilité doivent être pris en compte.
 
@@ -233,7 +237,11 @@ L'état est enregistré au fil de l'eau dans un journal local, puis consolidé d
 python3 scan.py --resume results/20261022T223344Z-9bb9cdcf
 ```
 
-La reprise garde le même identifiant, poursuit d'abord une découverte ou une résolution DNS inachevée, valide les XML des endpoints `COMPLETED`, les réutilise sans nouveau trafic et ne relance que les endpoints incomplets, en échec ou expirés. Une sortie absente, tronquée ou rattachée à une autre cible n'est jamais réutilisée comme succès. Les commandes enregistrées dans le manifeste ne sont jamais exécutées directement : Nmap et ses arguments sont reconstruits depuis les champs validés. Trois tentatives cumulées au maximum sont autorisées par couple nom/IP par défaut. Les adresses non globales restent exclues, sauf dérogation explicite de laboratoire avec `--allow-non-global`. Si un chemin avec paramètres a été expurgé, une nouvelle campagne avec le chemin complet est requise. Une campagne peut rester `PARTIAL` après reprise lorsque des noms ne résolvent pas ou qu'une lacune de couverture indépendante de Nmap subsiste.
+La reprise garde le même identifiant, poursuit d'abord une découverte ou une résolution DNS inachevée, valide les XML des endpoints `COMPLETED`, les réutilise sans nouveau trafic et ne relance que les endpoints incomplets, en échec ou expirés. Une sortie absente, tronquée ou rattachée à une autre cible n'est jamais réutilisée comme succès. Les commandes enregistrées dans le manifeste ne sont jamais exécutées directement : Nmap et ses arguments sont reconstruits depuis les champs validés. Trois tentatives cumulées au maximum sont autorisées par couple nom/IP par défaut. Les adresses non globales restent exclues, sauf dérogation explicite de laboratoire avec `--allow-non-global`.
+
+Depuis 0.6.0, les entrées privées locales permettent de restituer automatiquement les URL exactes et leurs queries pendant la reprise. Les rapports publics restent expurgés. Si ces fichiers ont disparu, ou pour une ancienne campagne ne les ayant pas conservés, une empreinte ne permet pas de reconstruire les paramètres : le scanner signale l'impossibilité et n'invente aucune valeur. Une nouvelle campagne avec les chemins complets permet alors un nouveau contrôle. Les quotas HTTP restent débités entre les phases et les reprises ; un arrêt brutal peut consommer conservativement toute l'allocation de la phase inachevée, soit **5 GET et 20 secondes** si elle disposait encore de tout le budget par défaut. Une campagne peut rester `PARTIAL` après reprise lorsque des noms ne résolvent pas ou qu'une lacune de couverture indépendante de Nmap subsiste.
+
+Une tentative NSE échouée d'une campagne antérieure à 0.6.0 peut aussi avoir consommé des GET sans compteur récupérable : sa reprise réserve conservativement tout le budget des services concernés. Les contrôles déjà terminés et valides restent utilisables ; une nouvelle campagne explicite permet un nouveau contrôle.
 
 La **reprise** poursuit la même campagne. Le profil **recontrole** crée au contraire une nouvelle campagne, résout de nouveau les noms et produit de nouvelles observations à comparer.
 
@@ -311,16 +319,20 @@ Le recontrôle écarte les lignes avec `inventory_patch_status=PATCH_CONFIRMED`.
 | Redirections par chemin | 2 au maximum | `--redirects`, de 0 à 5 |
 | Observations par chemin | 1 | `--samples`, de 1 à 3 |
 
-Le lanceur fixe également `--script-timeout` à **22 secondes par défaut** : budget HTTP plus deux secondes. Le budget HTTP limite le lancement des requêtes et leur délai réseau restant ; le délai NSE borne le script. Ces limites ne représentent pas la durée totale de la campagne. Un scan complet peut atteindre le délai de 900 secondes sur une cible filtrée ; celle-ci sera signalée comme incomplète.
+Le lanceur réalise d'abord la découverte des ports et services Nmap, puis exécute les phases de collecte NSE sur les services HTTP retenus. Le budget de **5 GET et 20 secondes** est cumulé par service identifié par **nom DNS, adresse IP épinglée, port et protocole HTTP/HTTPS**. Les contrôles de base, les redirections exactes et les liens partagent ce même budget, y compris après une reprise ou une relance technique. Une réponse de redirection consomme le quota du service source ; sa destination consomme celui du service destinataire. Les requêtes identiques sont dédupliquées sans supprimer les répétitions explicitement demandées par `--samples`.
 
-`--max-rate` transmet un plafond de sondes à **chaque processus Nmap**, sans borner toutes les requêtes HTTP. L'absence d'enregistrement AAAA est normale pour un service IPv4 ; une erreur de résolution dans une famille demandée rend en revanche la couverture partielle, même si l'autre famille a été scannée. Si le délai DNS expire, les réponses déjà reçues pour une famille sont conservées.
+Le lanceur réserve les quotas avant chaque phase et persiste leur consommation. Après un arrêt brutal sans résultat exploitable, la réservation reste consommée de manière conservatrice et la couverture restante est expliquée. Le temps d'arrêt de la campagne ne consomme pas le budget HTTP ; le recontrôle crée une nouvelle campagne avec de nouveaux quotas. Le délai NSE est borné par le reliquat HTTP plus deux secondes. Ces limites ne représentent pas la durée totale de la campagne : un scan complet peut atteindre le délai de 900 secondes sur une cible filtrée.
+
+Ces quotas concernent les **GET de collecte** ; les sondes de ports et de services Nmap s'y ajoutent. `--max-rate` transmet un plafond de sondes à **chaque processus Nmap**, sans borner toutes les requêtes HTTP. Les plafonds globaux et par IP s'appliquent aussi aux phases HTTP. L'absence d'enregistrement AAAA est normale pour un service IPv4 ; une erreur de résolution dans une famille demandée rend en revanche la couverture partielle, même si l'autre famille a été scannée. Si le délai DNS expire, les réponses déjà reçues pour une famille sont conservées.
 
 </details>
 
 <details>
 <summary>Adapter les chemins et le parcours HTTP</summary>
 
-Le parcours courant contrôle automatiquement `/` et `/index.php`, même si le premier chemin annonce déjà une version. Il extrait ensuite les liens des pages HTML reçues et échantillonne, dans le budget restant, des pages sûres de la même origine en donnant priorité aux extensions PHP. Il ne teste aucun chemin issu d'un dictionnaire, ne soumet aucun formulaire, ignore les liens externes et ne rejoue pas les paramètres de requête. Cette cartographie est représentative des composants publiquement reliés, pas exhaustive. Si dix chemins supplémentaires remplissent déjà la limite technique, ajoutez explicitement `/index.php` au fichier à la place d'un autre chemin. Pour préciser un autre point d'entrée :
+Le parcours courant contrôle automatiquement `/` et `/index.php`, même si le premier chemin annonce déjà une version. Il traite ensuite les destinations exactes nécessaires aux redirections autorisées. Si aucune version exploitable n'a été obtenue et qu'il reste du budget, il sélectionne **au maximum deux liens de navigation par service**, de manière déterministe dans les pages de base déjà reçues. Cet enrichissement dispose de **deux GET au maximum, redirections incluses**, dans le budget commun restant. Les pages supplémentaires ne déclenchent aucune exploration récursive.
+
+La sélection examine au plus **128 liens** dans les **64 Kio** de corps analysables par réponse. Elle retient seulement des chemins de consultation sans paramètres de requête, dans la même origine ; elle écarte formulaires, actions, téléchargements, exports, identifiants et liens externes. Une extension `.php` ne suffit pas à rendre un lien admissible ; une balise `base` ne peut pas élargir le périmètre. Aucun dictionnaire de chemins ni JavaScript n'est utilisé. Un candidat non retenu ne crée pas de lacune de couverture. Cette cartographie reste représentative des pages publiquement reliées, pas exhaustive. Si dix chemins supplémentaires remplissent déjà la limite technique, ajoutez explicitement `/index.php` au fichier à la place d'un autre chemin. Pour préciser un autre point d'entrée :
 
 ```bash
 python3 scan.py domaines.txt --path /app/
@@ -328,7 +340,9 @@ python3 scan.py domaines.txt --path /app/
 
 L'option facultative `--paths-file paths.txt` accepte des chemins supplémentaires, un par ligne ; voir [paths.example.txt](paths.example.txt). Ce fichier ajoute jusqu'à **10 chemins**, soit **11 au total**, avec un budget commun. Cette limite s'applique également aux chemins récupérés lors d'un recontrôle : un dépassement est refusé, sans troncature silencieuse. Les caractères Unicode des chemins fournis au lanceur sont encodés en UTF-8 `%XX` pour les requêtes HTTP. Les chemins explicitement demandés sont parcourus même si un premier chemin annonce une version. Ajustez `--max-requests` selon les chemins, redirections et échantillons ; une limite atteinte est signalée.
 
-Les redirections sont suivies uniquement dans la **même origine** : même nom, protocole et port, IP toujours épinglée. HTTP vers HTTPS, un autre port ou un autre nom restent des destinations à contrôler séparément, même si elles figurent dans le périmètre autorisé.
+Le NSE conserve sa restriction de **même origine** : même nom, protocole et port, IP épinglée. Le lanceur prend en charge les changements d'origine vers HTTP/HTTPS, uniquement dans le périmètre et les ports déjà autorisés après validation des exclusions, du DNS et des adresses. Il conserve Host/SNI et applique une limite de chaîne commune, avec détection des boucles. Il ne transfère aucun cookie ni identifiant entre origines. La couverture d'une destination exige le nom, l'IP, le port, le protocole et l'identité exacte du chemin avec sa query ; deux valeurs de paramètres différentes restent distinctes même lorsque leur affichage est expurgé.
+
+Les réponses ordinaires sont aussi examinées pour reconnaître un **diagnostic `phpinfo()` structuré** : plusieurs marqueurs cohérents et la version principale de PHP sont requis. Les versions d'extensions, Zend, OpenSSL, les prérequis et les exemples documentaires ne sont pas des preuves PHP. Il n'y a aucune recherche automatique de `phpinfo.php`, `info.php` ou variantes. L'analyse porte sur **64 Kio au maximum après décodage/décompression** ; une structure tronquée ou ambiguë reste sans version exploitable. Les artefacts conservent uniquement la version et sa provenance, jamais le corps HTML, les variables d'environnement, les cookies ou les secrets rencontrés. Toutes les contradictions entre en-têtes et diagnostic sont conservées sans priorité arbitraire de source.
 
 HTTP **401, 403 et 429 arrêtent le parcours**. Un `403` ne permet pas à lui seul d'identifier un WAF. Si le parcours prévu est interrompu après une première version annoncée, cette preuve est conservée mais l'évaluation reste `UNKNOWN` lorsque les autres contrôles n'ont pas abouti. Pour rechercher des réponses variables :
 
@@ -337,6 +351,8 @@ python3 scan.py domaines.txt --samples 2 --max-requests 8
 ```
 
 Les versions contradictoires sont conservées et signalées comme prioritaires. Des réponses identiques ne prouvent pas que tous les backends ont été contrôlés.
+
+Le bilan technique publie `summary.collection_metrics`. Son dénominateur est le nombre de **services distincts effectivement observés** (nom, IP, port, HTTP/HTTPS), et non le nombre de domaines ou de machines. `services_version_base`, `services_version_redirect` et `services_version_links` comptent le premier apport de version par service, sans double compte ; `services_version_diagnostic_only` mesure séparément les services renseignés uniquement par diagnostic structuré. Les compteurs de GET et de millisecondes distinguent base et enrichissements, avec les conflits et budgets épuisés. Les quotas débités et réservations incertaines après interruption sont exposés séparément des GET attestés par les résultats. Ces mesures servent à comparer un même laboratoire reproductible ; elles ne constituent pas un taux de détection représentatif d'Internet.
 
 </details>
 
@@ -452,7 +468,9 @@ Le NSE fait des GET ordinaires, sans déclencher volontairement d'épuisement m�
 
 Le scan TCP vise les IP résolues. Host/SNI sélectionnent l'application lors des échanges web ; **une liste de domaines n'isole pas le scan TCP sur un frontal mutualisé**. Backends cachés, noms absents des entrées et des certificats publics, services non reconnus, caches, versions masquées et restrictions d'accès limitent les observations. Les exclusions de détection de services de Nmap restent applicables même avec tous les ports TCP.
 
-Le corps lu est limité à 64 Kio et n'est pas utilisé comme preuve. Corps et cookies ne sont pas conservés par le NSE. Les valeurs de paramètres sont expurgées des chemins et redirections enregistrés et du manifeste. Les fichiers temporaires d'arguments sont supprimés à la fin du traitement, y compris en mode plan ; les entrées d'origine restent chez l'opérateur. Les CSV neutralisent les cellules pouvant être interprétées comme des formules.
+Le corps analysé est limité à 64 Kio après décodage/décompression ; seul un diagnostic `phpinfo()` reconnu peut fournir une version de corps. Corps et cookies ne sont pas conservés par le NSE. Les paramètres des chemins et redirections sont expurgés du manifeste et des rapports publics. Les entrées HTTP complètes nécessaires à la reprise restent dans `state/private/`, avec des permissions locales restrictives ; elles doivent rester chez l'opérateur. Les CSV neutralisent les cellules pouvant être interprétées comme des formules.
+
+La découverte Nmap est reçue en mémoire par blocs : les empreintes brutes `servicefp`, susceptibles d'inclure des réponses HTTP, sont retirées avant toute écriture. Ses sorties texte et diagnostics bruts ne sont pas conservés ; les erreurs restent signalées par leur statut dans le manifeste. Cette protection ne nettoie pas rétroactivement les artefacts d'anciennes campagnes.
 
 | Sortie du lanceur | Sens |
 |---|---|
@@ -474,11 +492,23 @@ python3 -m unittest discover -s tests -p 'test_scan.py'
 python3 -m unittest discover -s tests -p 'test_discovery.py'
 python3 -m unittest discover -s tests -p 'test_discovery_campaign.py'
 python3 -m unittest discover -s tests -p 'test_campaign_state.py'
+python3 -m unittest discover -s tests -p 'test_service_budget.py'
+python3 -m unittest discover -s tests -p 'test_http_campaign.py'
+python3 -m unittest discover -s tests -p 'test_collection_report.py'
 python3 tests/integration.py
 python3 tests/test_scan_integration.py
+python3 tests/test_collection_resume_integration.py
 ```
 
 `NMAP` et `NMAP_DATADIR`, ou `--nmap` et `--nmap-datadir`, permettent de choisir l'installation. Les tests réels vérifient transport, parcours, couverture et rapports ; ils ne démontrent pas une détection exhaustive de tous les déploiements PHP. GitHub Actions exécute les lots sur Ubuntu 24.04.
+
+Le test de reprise compare une campagne continue à une interruption durable après trois GET : les deux produisent les mêmes huit GET répartis entre deux services (HTTP : trois ; HTTPS : cinq), les mêmes versions et les mêmes identités d'observation. Les trois GET terminés et le DNS ne sont pas rejoués ; les durées peuvent varier. Une interruption brutale sans compteurs récupérables garde au contraire sa réservation complète et peut donc réduire la couverture, comme le vérifient les tests de quotas.
+
+### Collecte mesurée en laboratoire local
+
+`python3 tests/benchmark_collection.py` crée six noms synthétiques épinglés en boucle locale et deux services HTTP/HTTPS par nom, puis lance une vraie campagne Nmap. Le 23 octobre 2026, sur **12 services distincts observés**, les en-têtes des contrôles de base renseignaient **4 services** ; les diagnostics structurés portent ce nombre à **6**, puis les redirections exactes et les liens portent le total à **9**. Les gains supplémentaires se répartissent en **1 service via redirection exacte** et **2 via liens** ; **2 services** n'ont une version que grâce à un diagnostic. Deux services conservent une contradiction entre en-tête et diagnostic, et la page documentaire reste indéterminée.
+
+Cette exécution a ajouté **3 GET**, pour **27 GET au total**. Le temps HTTP mesuré était de **6 ms supplémentaires et 39 ms au total** ; ces durées varient selon l'exécution et excluent les sondes et le temps Nmap. Les vérifications contrôlent aussi Host/SNI, les liens refusés et l'absence des secrets synthétiques de diagnostic dans les artefacts. Ces résultats décrivent uniquement cette fixture locale reproductible et ne constituent pas un taux de détection sur Internet.
 
 ### Charge hors réseau validée
 

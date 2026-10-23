@@ -37,6 +37,14 @@ local function flatten(value, into)
 end
 
 local function load_script(modules)
+  modules.openssl = modules.openssl or {digest = function(algorithm, value)
+    equal(algorithm, "sha256")
+    -- Deterministic offline stand-in; real SHA256 is verified by the Nmap
+    -- integration test against Python hashlib, not by this synthetic stub.
+    local hash = 2166136261
+    for byte = 1, #value do hash = ((hash ~ value:byte(byte)) * 16777619) & 0xffffffff end
+    return string.rep(string.pack(">I4", hash), 8)
+  end}
   local env = setmetatable({SCRIPT_NAME = "http-php2shell"}, {__index = _G})
   env.require = function(name) return modules[name] or require(name) end
   local chunk, load_error = loadfile(script_path, "t", env)
@@ -208,7 +216,7 @@ test("success and exhausted budgets on one port never stop other ports", functio
       equal(result.versions[1], versions[number])
       equal(result.state, number == 443 and "POTENTIALLY_VULNERABLE" or "PATCHED_VERSION_ADVERTISED")
     end
-    equal(result.script_version, "0.3.4")
+    equal(result.script_version, "0.4.0")
   end
   equal(#calls, 4)
 end)
@@ -243,7 +251,7 @@ end
 
 test("CVE identifiers and evidence remain machine readable", function()
   local result = run(response("PHP/8.4.26"))
-  equal(result.detection_method, "HTTP response headers (version-based)")
+  equal(result.detection_method, "Published HTTP headers and structured phpinfo (version-based)")
   truthy(contains(result.cves, "CVE-2026-109618"), "first CVE absent")
   truthy(contains(result.cves, "CVE-2026-109619"), "second CVE absent")
   equal(result.http_status, 200)
@@ -413,7 +421,7 @@ test("bounded GET has no redirect, cache, credentials or body", function()
   equal(opts.auth, nil)
   equal(opts.cookies, nil)
   equal(opts.header["User-Agent"],
-    "php2shell-scanner/0.5.4 http-php2shell/0.3.4 (+https://github.com/aehcktrn/php2shell-scanner)")
+    "php2shell-scanner/0.6.0 http-php2shell/0.4.0 (+https://github.com/aehcktrn/php2shell-scanner)")
 end)
 
 test("global HTTP user agent can be overridden or disabled", function()
@@ -535,24 +543,24 @@ test("linked same-origin pages are sampled without path brute force", function()
         <a href="/assets/site.css">static</a>
         <a href="/logout">logout</a>
         <a href="/about">about</a>
-        <a href="/component.php?id=42">component</a>
+        <a href="/component.php">component</a>
+        <a href="/query.php?id=42">query rejected</a>
       ]]}
     end
     if path == "/component.php" then return response("PHP/8.3.35") end
     if path == "/about" then return {status = 403, header = {}, body = ""} end
     return {status = 200, header = {}, body = ""}
   end, {['http-php2shell.max_requests'] = 4})
-  equal(result.state, "UNKNOWN")
+  equal(result.state, "POTENTIALLY_VULNERABLE")
   equal(result.potentially_vulnerable_evidence, true)
-  equal(result.traversal_complete, false)
-  equal(result.traversal_reason_code, "HTTP_ACCESS_DENIED")
+  equal(result.traversal_complete, true)
   equal(result.versions[1], "8.3.35")
   equal(calls[1].path, "/")
   equal(calls[2].path, "/index.php")
   equal(calls[3].path, "/component.php")
-  equal(calls[4].path, "/about")
+  equal(#calls, 3)
   equal(result.budget_exhausted, false)
-  truthy(not contains({calls[1].path, calls[2].path, calls[3].path, calls[4].path}, "/logout"))
+  truthy(not flatten(calls):find("/logout", 1, true))
   truthy(not flatten(calls):find("outside.example", 1, true))
   truthy(not flatten(calls):find("site.css", 1, true))
 end)
@@ -560,7 +568,7 @@ end)
 test("only anchor href attributes become sampled navigation requests", function()
   local result, calls = run(function(path)
     if path == "/" then
-      return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"}, body = [[
+      return {status = 200, header = {["content-type"] = "text/html"}, body = [[
         <!-- <a href="/comment.php">comment</a> -->
         <script>const fake = 'href="/script.php"';</script>
         <style>foo[href="/style.php"] {color: red}</style>
@@ -569,31 +577,34 @@ test("only anchor href attributes become sampled navigation requests", function(
         <a href="/%64elete-record">encoded action</a>
         <a href="/%2564elete-record">nested encoded action</a>
         <a href="/image%2epng">encoded static extension</a>
+        <form><a href="/form.php">form</a></form>
+        <a href="/report.php" download>download</a>
+        <a href="/safe.php" onclick="send()">action handler</a>
         <A title="x > y" HREF='/real.php?token=secret'>real</A>
         <a href=/plain.php>unquoted</a>
-      ]]})
+      ]]}
     end
     return response("PHP/8.3.36")
   end)
   equal(result.state, "PATCHED_VERSION_ADVERTISED")
-  equal(#calls, 3)
-  equal(calls[2].path, "/plain.php")
-  equal(calls[3].path, "/real.php")
-  equal(result.observations[2].optional_crawl, true)
+  equal(#calls, 2)
+  equal(calls[2].path, "/index.php")
+  equal(result.candidate_paths[1], "/plain.php")
+  equal(#result.candidate_paths, 1)
 end)
 
-test("sampled redirects strip query data before following a safe destination", function()
+test("sampled redirects reject queries instead of inventing a changed request", function()
   local result, calls = run(function(path)
     if path == "/" then
-      return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"},
-        body = '<a href="/component">component</a>'})
+      return {status = 200, header = {["content-type"] = "text/html"},
+        body = '<a href="/component">component</a>'}
     end
     if path == "/component" then return {status = 302, header = {location = "/fixed.php?token=secret"}} end
     return response("PHP/8.3.36")
-  end)
-  equal(result.state, "PATCHED_VERSION_ADVERTISED")
-  equal(#calls, 3)
-  equal(calls[3].path, "/fixed.php")
+  end, {["http-php2shell.fallback"] = false})
+  equal(result.state, "UNKNOWN")
+  equal(#calls, 2)
+  equal(result.observations[2].redirect_policy, "OPTIONAL_LINK_EXCLUDED")
   truthy(not flatten(calls):find("token=secret", 1, true))
 end)
 
@@ -602,32 +613,32 @@ for _, destination in ipairs({"/delete-record?confirm=1", "/%64elete-record", "/
   test("unassessed sampled redirect preserves an HTTP coverage gap: " .. destination, function()
     local result, calls = run(function(path)
       if path == "/" then
-        return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"},
-          body = '<a href="/component">component</a>'})
+        return {status = 200, header = {["content-type"] = "text/html"},
+          body = '<a href="/component">component</a>'}
       end
       return {status = 302, header = {location = destination}}
-    end)
+    end, {["http-php2shell.fallback"] = false})
     equal(#calls, 2)
     equal(result.state, "UNKNOWN")
     equal(result.traversal_complete, false)
     equal(result.traversal_reason_code, "REDIRECT_NOT_ASSESSED")
     equal(result.crawl_gap_reason_code, "REDIRECT_NOT_ASSESSED")
     equal(result.crawl_gap_path, "/component")
-    truthy(contains(result.versions, "8.3.36"))
+    equal(#result.versions, 0)
   end)
 end
 
 for _, condition in ipairs({{401, "AUTHENTICATION_REQUIRED"}, {403, "HTTP_ACCESS_DENIED"},
     {429, "RATE_LIMITED"}, {0, "NO_HTTP_RESPONSE"}}) do
-  test("sampled failure cannot be hidden by an earlier fixed banner: " .. condition[2], function()
+  test("sampled failure retains an explicit coverage cause: " .. condition[2], function()
     local result, calls = run(function(path)
       if path == "/" then
-        return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"},
-          body = '<a href="/component">component</a>'})
+        return {status = 200, header = {["content-type"] = "text/html"},
+          body = '<a href="/component">component</a>'}
       end
       if condition[1] > 0 then return {status = condition[1], header = {}} end
       return nil
-    end)
+    end, {["http-php2shell.fallback"] = false})
     equal(#calls, 2)
     equal(result.state, "UNKNOWN")
     equal(result.traversal_complete, false)
@@ -637,18 +648,212 @@ for _, condition in ipairs({{401, "AUTHENTICATION_REQUIRED"}, {403, "HTTP_ACCESS
   end)
 end
 
-test("representative crawl cap alone does not invalidate completed version evidence", function()
+test("published base version suppresses optional enrichment", function()
   local result, calls = run(function(path)
     return response("PHP/8.3.36", {header = {["x-powered-by"] = "PHP/8.3.36", ["content-type"] = "text/html"},
       body = path == "/" and '<a href="/one.php">one</a><a href="/two.php">two</a>' or ""})
   end, {["http-php2shell.max_requests"] = 2})
-  equal(#calls, 2)
+  equal(#calls, 1)
   equal(result.state, "PATCHED_VERSION_ADVERTISED")
   equal(result.traversal_complete, true)
   equal(result.crawl_truncated, true)
   equal(result.budget_exhausted, false)
   equal(result.crawl_gap_reason_code, nil)
 end)
+
+test("enrichment visits at most two candidates and never grows recursively", function()
+  local result, calls = run(function(path)
+    local body = path == "/" and '<a href="/a">a</a><a href="/b">b</a><a href="/c">c</a>'
+      or '<a href="/recursive.php">never generated</a>'
+    return {status = 200, header = {["content-type"] = "text/html"}, body = body}
+  end, {["http-php2shell.fallback"] = false, ["http-php2shell.max_requests"] = 10})
+  equal(#calls, 3)
+  equal(calls[2].path, "/a")
+  equal(calls[3].path, "/b")
+  equal(result.enrichment_requests, 2)
+  equal(result.candidate_count, 3)
+  truthy(not flatten(result.candidate_paths):find("recursive.php", 1, true))
+end)
+
+test("optional redirect GETs share the two-visit enrichment cap", function()
+  local result, calls = run(function(path)
+    if path == "/" then return {status = 200, header = {["content-type"] = "text/html"},
+      body = '<a href="/one">one</a><a href="/unused">two</a>'} end
+    if path == "/one" then return {status = 302, header = {location = "/two"}} end
+    return {status = 302, header = {location = "/three"}}
+  end, {["http-php2shell.fallback"] = false, ["http-php2shell.max_requests"] = 10,
+    ["http-php2shell.redirects"] = 5})
+  equal(#calls, 3)
+  equal(result.enrichment_requests, 2)
+  equal(calls[3].path, "/two")
+  equal(result.observations[3].redirect_followed, false)
+  equal(result.crawl_gap_reason_code, "REDIRECT_NOT_ASSESSED")
+  equal(result.budget_exhausted, false)
+end)
+
+test("dense HTML stops after 128 anchors even when every anchor is rejected", function()
+  local html = string.rep('<a href="/delete.php">no</a>', 200) .. '<a href="/late.php">late</a>'
+  local result, calls = run({status = 200, header = {["content-type"] = "text/html"}, body = html},
+    {["http-php2shell.fallback"] = false})
+  equal(#calls, 1)
+  equal(result.candidates_examined, 128)
+  equal(result.candidate_count, 0)
+end)
+
+test("a foreign base tag cannot reinterpret relative links as local candidates", function()
+  local result, calls = run({status = 200, header = {["content-type"] = "text/html"},
+    body = '<base href="https://outside.example/app/"><a href="page.php">relative</a>'
+      .. '<a href="/root.php">root-relative</a>'
+      .. '<a href="https://app.example.test/about">absolute same origin</a>'},
+    {["http-php2shell.phase"] = "base", ["http-php2shell.fallback"] = false})
+  equal(#calls, 1)
+  equal(result.candidate_count, 1)
+  equal(result.candidate_paths[1], "/about")
+end)
+
+test("managed base emits safe candidates and defers exact redirects", function()
+  local result, calls = run(function(path)
+    if path == "/" then return {status = 302, header = {location = "/application.php?a=1"}} end
+    return {status = 200, header = {["content-type"] = "text/html"}, body = '<a href="/about">about</a>'}
+  end, {["http-php2shell.phase"] = "base", ["http-php2shell.scheme"] = "http",
+    ["http-php2shell.paths"] = {"/index.php"}, ["http-php2shell.fallback"] = false,
+    ["http-php2shell.enrich"] = false})
+  equal(#calls, 2)
+  equal(calls[1].options.scheme, "http")
+  equal(result.collection_phase, "base")
+  equal(result.observations[1].redirect_followed, false)
+  equal(result.observations[1].redirect_to, "/application.php?[redacted]")
+  equal(result.observations[1].redirect_hops, 1)
+  equal(#result.observations[1].path_identity, 64)
+  equal(#result.observations[1].redirect_identity, 64)
+  equal(result.candidate_paths[1], "/about")
+  equal(result.enrichment_requests, 0)
+end)
+
+test("explicit strict HTTPS is not overwritten by a missing library SSL marker", function()
+  local result, calls = run(response("PHP/8.3.36", {ssl = false}),
+    {["http-php2shell.phase"] = "base", ["http-php2shell.scheme"] = "https",
+      ["http-php2shell.fallback"] = false}, {ip = "127.0.0.1", targetname = "app.example.test"},
+    {number = 8443, service = "unknown"})
+  equal(calls[1].options.scheme, "https")
+  equal(result.scheme, "https")
+  equal(result.observations[1].scheme, "https")
+  equal(result.evidence[1].scheme, "https")
+  equal(result.evidence[1].tls_sni, "app.example.test")
+end)
+
+test("query identities differ while public provenance stays redacted", function()
+  local first = run(response("PHP/8.3.36"), {["http-php2shell.path"] = "/app?a=1"})
+  local second = run(response("PHP/8.3.36"), {["http-php2shell.path"] = "/app?a=2"})
+  equal(first.observations[1].path, second.observations[1].path)
+  truthy(first.observations[1].path_identity ~= second.observations[1].path_identity)
+end)
+
+test("managed redirect inherits the chain limit instead of resetting it", function()
+  local result, calls = run({status = 302, header = {location = "/next"}},
+    {["http-php2shell.phase"] = "redirect", ["http-php2shell.chain_hops"] = 2,
+      ["http-php2shell.redirects"] = 2, ["http-php2shell.fallback"] = false,
+      ["http-php2shell.enrich"] = false})
+  equal(#calls, 1)
+  equal(result.observations[1].chain_hops, 2)
+  equal(result.observations[1].redirect_hops, 3)
+  equal(result.reason_code, "REDIRECT_LIMIT_REACHED")
+end)
+
+test("repeated destination samples retain previously consumed redirect depth", function()
+  local endings = 0
+  local result, calls = run(function(path)
+    if path == "/start" then return {status = 302, header = {location = "/end"}} end
+    endings = endings + 1
+    if endings == 1 then return response("PHP/8.3.36") end
+    return {status = 302, header = {location = "/beyond-limit"}}
+  end, {["http-php2shell.phase"] = "redirect", ["http-php2shell.path"] = "/start",
+    ["http-php2shell.chain_hops"] = 1, ["http-php2shell.redirects"] = 2,
+    ["http-php2shell.samples"] = 2, ["http-php2shell.fallback"] = false})
+  equal(#calls, 3)
+  equal(result.observations[3].chain_hops, 2)
+  equal(result.observations[3].redirect_hops, 3)
+  equal(result.observations[3].redirect_followed, false)
+end)
+
+test("managed links cannot generate candidates or submit query paths", function()
+  local result, calls = run({status = 200, header = {["content-type"] = "text/html"},
+    body = '<a href="/recursive">recursive</a>'}, {["http-php2shell.phase"] = "links",
+    ["http-php2shell.path"] = "/about", ["http-php2shell.fallback"] = false})
+  equal(#calls, 1)
+  equal(result.candidate_count, 0)
+  equal(result.observations[1].collection_phase, "links")
+  local invalid, invalid_calls = run(response("PHP/8.3.36"), {["http-php2shell.phase"] = "links",
+    ["http-php2shell.path"] = "/about?logout=1"})
+  equal(#invalid_calls, 0)
+  equal(invalid.reason_code, "INVALID_ARGUMENT")
+end)
+
+local function diagnostic_html(version)
+  return '<!DOCTYPE html><html><head><title>PHP ' .. version .. ' - phpinfo()</title></head><body>'
+    .. '<h1 class="p">PHP Version ' .. version .. '</h1><table>'
+    .. '<tr><td class="e">System </td><td class="v">Synthetic host</td></tr>'
+    .. '<tr><td class="e">Server API </td><td class="v">FPM/FastCGI</td></tr></table>'
+    .. '<table><tr><td class="e">ENV_SECRET</td><td class="v">DO_NOT_PERSIST</td></tr></table></body></html>'
+end
+
+test("structured phpinfo adds a qualified main PHP version without retaining its body", function()
+  local result = run({status = 200, header = {["content-type"] = "text/html"}, body = diagnostic_html("8.3.35")})
+  equal(result.state, "POTENTIALLY_VULNERABLE")
+  equal(result.evidence[1].source, "phpinfo-structured")
+  equal(result.evidence[1].method, "structured phpinfo HTML (published version)")
+  equal(result.evidence[1].collection_phase, "base")
+  truthy(result.evidence[1].timestamp:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%dZ$"))
+  truthy(not flatten(result):find("DO_NOT_PERSIST", 1, true))
+  truthy(not flatten(result):find("ENV_SECRET", 1, true))
+end)
+
+test("phpinfo preserves a contradiction with a header version", function()
+  local result = run(response("PHP/8.3.36", {body = diagnostic_html("8.3.35")}))
+  equal(result.state, "UNKNOWN")
+  equal(result.reason_code, "CONFLICTING_VERSIONS")
+  truthy(contains(result.versions, "8.3.35"))
+  truthy(contains(result.versions, "8.3.36"))
+  equal(result.potentially_vulnerable_evidence, true)
+end)
+
+test("phpinfo ignores PHP Version headings found only inside extension documentation", function()
+  local body = diagnostic_html("8.3.35")
+    :gsub("<title>.-</title>", "<title>phpinfo()</title>")
+    :gsub('<h1 class="p">.-</h1>', "")
+    :gsub("</body>", "<h2>Extension documentation</h2><h1>PHP Version 8.3.36</h1></body>")
+  local result = run({status = 200, header = {["content-type"] = "text/html"}, body = body},
+    {["http-php2shell.fallback"] = false})
+  equal(#result.versions, 0)
+  equal(result.state, "UNKNOWN")
+end)
+
+test("phpinfo module tables cannot supply missing general structure markers", function()
+  local body = diagnostic_html("8.3.35")
+    :gsub('<h1 class="p">', '<h2>Extension</h2><h1 class="p">')
+  local result = run({status = 200, header = {["content-type"] = "text/html"}, body = body},
+    {["http-php2shell.fallback"] = false})
+  equal(#result.versions, 0)
+  equal(result.state, "UNKNOWN")
+end)
+
+for _, case in ipairs({
+  {"documentation", diagnostic_html("8.3.35"):gsub("<title>.-</title>", "<title>PHP manual</title>"), {}},
+  {"extension-only", diagnostic_html("8.3.35"):gsub("PHP 8.3.35 %- phpinfo%(%)", "phpinfo()")
+    :gsub("PHP Version 8.3.35", "OpenSSL 8.3.35"), {}},
+  {"insufficient structure", '<title>PHP 8.3.35 - phpinfo()</title><h1>PHP Version 8.3.35</h1>', {}},
+  {"truncated", diagnostic_html("8.3.35"), {truncated = true}},
+  {"oversized decoded body", diagnostic_html("8.3.35") .. string.rep("X", 65536), {}},
+  {"unsupported encoding", diagnostic_html("8.3.35"), {undecoded = {"br"}}},
+}) do
+  test("phpinfo rejects " .. case[1], function()
+    local fixture = {status = 200, header = {["content-type"] = "text/html"}, body = case[2]}
+    for key, value in pairs(case[3]) do fixture[key] = value end
+    local result = run(fixture, {["http-php2shell.fallback"] = false})
+    equal(#result.versions, 0)
+    equal(result.state, "UNKNOWN")
+  end)
+end
 
 test("explicit paths are all assessed and retain conflicting evidence", function()
   local result, calls = run(function(path)
@@ -667,7 +872,7 @@ test("version evidence includes exact transport and request identity", function(
     {ip = "192.0.2.7", targetname = "app.example.test"}, {number = 8443, service = "https"})
   local evidence = result.evidence[1]
   equal(result.schema_version, "1")
-  equal(result.script_version, "0.3.4")
+  equal(result.script_version, "0.4.0")
   equal(result.vhost, "app.example.test")
   equal(evidence.ip, "192.0.2.7")
   equal(evidence.port, 8443)
@@ -756,6 +961,19 @@ test("redirect query values are redacted", function()
   truthy(not flatten(result):find("REDIRECT_SECRET", 1, true))
   equal(result.observations[1].redirect_to, "https://outside.example.test/path?[redacted]")
   equal(result.observations[1].redirect_scope, "HORS_PERIMETRE_DU_CONTROLE")
+end)
+
+test("standalone external redirect remains incomplete despite a fixed source banner", function()
+  local result, calls = run({status = 302, header = {['x-powered-by'] = 'PHP/8.3.36',
+    location = 'https://outside.example.test/app?token=NEVER_PUBLIC'}})
+  equal(#calls, 1)
+  equal(result.state, "UNKNOWN")
+  equal(result.traversal_complete, false)
+  equal(result.traversal_reason_code, "REDIRECT_NOT_ASSESSED")
+  equal(result.versions[1], "8.3.36")
+  equal(result.evidence[1].state, "PATCHED_VERSION_ADVERTISED")
+  equal(result.observations[1].redirect_followed, false)
+  truthy(not flatten(result):find("NEVER_PUBLIC", 1, true))
 end)
 
 test("ambiguous duplicate Location headers are not followed", function()

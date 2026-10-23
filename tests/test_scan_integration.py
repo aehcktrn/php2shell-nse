@@ -26,12 +26,14 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-from integration import FixtureHandler, LocalServer
+from integration import FixtureHandler, LocalServer, SECRET_BODY, phpinfo_html
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import scan
+
+FINGERPRINT_SECRET = "SYNTHETIC_NMAP_ENVIRONMENT_DO_NOT_PERSIST"
 
 
 class PerPortVersionHandler(FixtureHandler):
@@ -41,6 +43,30 @@ class PerPortVersionHandler(FixtureHandler):
         if keyword.lower() == "x-powered-by":
             value = f"PHP/{self.server.php_version}"
         super().send_header(keyword, value)
+
+
+class ExactRedirectHandler(FixtureHandler):
+    """Configurable ordinary responses for exact redirect destinations."""
+
+    def do_GET(self):
+        route = getattr(self.server, "routes", {}).get(self.path)
+        if route is None:
+            return super().do_GET()
+        with self.server.record_lock:
+            self.server.requests.append({"method": "GET", "path": self.path,
+                "host": self.headers.get("Host"), "sni": getattr(self.connection, "_test_sni", None)})
+        status, headers, body = route
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 class HostRequiredHandler(socketserver.BaseRequestHandler):
@@ -92,6 +118,38 @@ class HostRequiredServer(socketserver.ThreadingTCPServer):
         self.record_lock = threading.Lock()
 
 
+class FingerprintSecretHandler(socketserver.BaseRequestHandler):
+    """Unknown HTTP response that Nmap embeds in its service fingerprint."""
+
+    def handle(self):
+        self.request.settimeout(0.1)
+        try:
+            request = self.request.recv(8192)
+        except OSError:
+            request = b""
+        # Respond even to the NULL discovery probe, without a recognizable
+        # Server banner. This reliably exercises Nmap's raw servicefp path.
+        with self.server.record_lock:
+            self.server.requests.append(request)
+        body = phpinfo_html().replace(SECRET_BODY.encode(), FINGERPRINT_SECRET.encode())
+        response = (b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+                    + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+        try:
+            self.request.sendall(response)
+        except OSError:
+            pass
+
+
+class FingerprintSecretServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, port):
+        super().__init__(("127.0.0.1", port), FingerprintSecretHandler)
+        self.requests = []
+        self.record_lock = threading.Lock()
+
+
 class ScanCLIIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -125,8 +183,10 @@ class ScanCLIIntegration(unittest.TestCase):
         cls.temp.cleanup()
 
     @contextmanager
-    def serve(self, *, tls=False, version=None):
+    def serve(self, *, tls=False, version=None, handler=None):
         server = LocalServer()
+        if handler is not None:
+            server.RequestHandlerClass = handler
         if version is not None:
             server.php_version = version
             server.RequestHandlerClass = PerPortVersionHandler
@@ -184,6 +244,25 @@ class ScanCLIIntegration(unittest.TestCase):
             self.assertEqual(list(reader), compact)
         return row
 
+    def phase_documents(self, output, manifest, hostname=None):
+        documents = []
+        for service in manifest["http_collection"]["services"].values():
+            if hostname is not None and service["hostname"] != hostname:
+                continue
+            for job in service["phase_jobs"]:
+                self.assertEqual(job["status"], "COMPLETED", job)
+                self.assertTrue(job["xml"].startswith("raw/http/"), job)
+                xml = ET.parse(output / job["xml"]).getroot()
+                script = xml.find(".//script[@id='http-php2shell']")
+                self.assertIsNotNone(script, job)
+                self.assertEqual(script.find("elem[@key='vhost']").text, service["hostname"])
+                self.assertEqual(script.find("elem[@key='ip']").text, service["ip"])
+                self.assertEqual(script.find("elem[@key='port']").text, str(service["port"]))
+                self.assertEqual(script.find("elem[@key='scheme']").text, service["scheme"])
+                self.assertEqual(script.find("elem[@key='collection_phase']").text, job["phase"])
+                documents.append((service, job, script))
+        return documents
+
     def assert_report_matches_manifest(self, output, manifest, port, *, verdict="OUI"):
         self.assertEqual(manifest["status"], "COMPLETED")
         self.assertEqual(len(manifest["targets"]), 1)
@@ -196,6 +275,12 @@ class ScanCLIIntegration(unittest.TestCase):
         self.assertEqual(endpoint["ip"], "127.0.0.1")
         self.assertEqual(endpoint["status"], "COMPLETED")
         self.assertTrue((output / endpoint["xml"]).is_file())
+        discovery = ET.parse(output / endpoint["xml"]).getroot()
+        self.assertIsNone(discovery.find(".//script[@id='http-php2shell']"))
+        phases = self.phase_documents(output, manifest, "localhost")
+        self.assertEqual(len(phases), 1)
+        self.assertEqual(phases[0][1]["phase"], "base")
+        self.assertEqual(phases[0][0]["port"], port)
         report = json.loads((output / "raw" / "report-details.json").read_text())
         rows = [row for row in report["rows"] if row["row_type"] == "ASSESSMENT"]
         self.assertEqual(len(rows), 1, report)
@@ -265,6 +350,53 @@ class ScanCLIIntegration(unittest.TestCase):
                 self.assertEqual(item["host"], f"localhost:{port}")
                 self.assertEqual(item["sni"], "localhost")
 
+    def test_http_to_https_redirect_assesses_exact_query_and_preserves_private_inputs(self):
+        if self.tls_context is None:
+            self.skipTest("openssl is required for the local TLS fixture")
+        secret = "SYNTHETIC_REDIRECT_QUERY_DO_NOT_PUBLISH"
+        exact = f"/application.php?a=1&token={secret}"
+        with self.serve(handler=ExactRedirectHandler) as http_server, \
+                self.serve(tls=True, handler=ExactRedirectHandler) as https_server:
+            http_server.routes = {
+                "/entry": (302, {"Location": f"https://localhost:{https_server.server_port}{exact}"}, b"Redirect"),
+                "/old": (200, {"X-Powered-By": "PHP/8.3.36"}, b"Fixed base service"),
+            }
+            https_server.routes = {
+                "/entry": (200, {}, b"Static landing page"),
+                "/old": (200, {}, b"Static base page"),
+                exact: (200, {"X-Powered-By": "PHP/8.3.35"}, b"Published application version"),
+            }
+            ports = f"{http_server.server_port},{https_server.server_port}"
+            output, manifest, _ = self.run_campaign(ports, "--path", "/entry")
+            self.assertEqual(manifest["status"], "COMPLETED")
+            phases = self.phase_documents(output, manifest)
+            self.assertEqual(sum(job["phase"] == "base" for _, job, _ in phases), 2)
+            redirected = [(service, job, script) for service, job, script in phases if job["phase"] == "redirect"]
+            self.assertEqual(len(redirected), 1)
+            service, job, script = redirected[0]
+            self.assertEqual((service["hostname"], service["ip"], service["port"], service["scheme"]),
+                             ("localhost", "127.0.0.1", https_server.server_port, "https"))
+            self.assertEqual(job["paths"], ["/application.php?[redacted]"])
+            self.assertEqual(script.find("elem[@key='state']").text, "POTENTIALLY_VULNERABLE")
+            with https_server.record_lock:
+                application_requests = [entry for entry in https_server.requests if entry["path"].startswith("/application.php")]
+            self.assertEqual([entry["path"] for entry in application_requests], [exact])
+            self.assertTrue(all(entry["host"] == f"localhost:{https_server.server_port}"
+                                and entry["sni"] == "localhost" for entry in application_requests))
+            compact = json.loads((output / "report.json").read_text())
+            self.assertEqual(len(compact), 1)
+            self.assertEqual(set(compact[0]), {"cible", "php", "vulnerable", "explication"})
+            self.assertEqual(compact[0]["cible"], "localhost")
+            self.assertEqual(compact[0]["vulnerable"], "OUI")
+            self.assertEqual(set(compact[0]["php"].split(" | ")), {"8.3.35", "8.3.36"})
+            public_files = [path for path in output.rglob("*")
+                            if path.is_file() and "private" not in path.relative_to(output).parts]
+            for path in public_files:
+                self.assertNotIn(secret.encode(), path.read_bytes(), str(path.relative_to(output)))
+            private_files = list((output / "state" / "private").iterdir())
+            self.assertTrue(any(secret.encode() in path.read_bytes() for path in private_files))
+            self.assertTrue(all(path.stat().st_mode & 0o077 == 0 for path in private_files))
+
     def test_dry_run_resolves_and_writes_plan_without_contacting_http(self):
         with self.serve() as server:
             output, manifest, _ = self.run_campaign(server.server_port, "--dry-run")
@@ -274,6 +406,44 @@ class ScanCLIIntegration(unittest.TestCase):
             self.assertFalse((output / "report.json").exists())
             with server.record_lock:
                 self.assertEqual(server.requests, [])
+
+    def test_discovery_fingerprints_never_persist_diagnostic_body_or_secrets(self):
+        try:
+            server = FingerprintSecretServer(9000)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                self.skipTest(f"Loopback port 9000 already in use: {exc}")
+            raise
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            output, manifest, completed = self.run_campaign(9000)
+            self.assert_report_matches_manifest(output, manifest, 9000)
+            endpoint = manifest["targets"][0]["endpoints"][0]
+            discovery = ET.parse(output / endpoint["xml"]).getroot()
+            service = discovery.find("host/ports/port/service")
+            self.assertIsNotNone(service)
+            self.assertEqual(service.get("method"), "table", "Fixture must exercise unidentified HTTP")
+            self.assertIsNone(service.get("servicefp"))
+            phases = self.phase_documents(output, manifest)
+            evidence = phases[0][2].findall("table[@key='evidence']/table")
+            self.assertTrue(any(item.find("elem[@key='source']").text == "phpinfo-structured"
+                                for item in evidence))
+            for path in output.rglob("*"):
+                if path.is_file():
+                    content = path.read_bytes()
+                    self.assertNotIn(FINGERPRINT_SECRET.encode(), content, str(path.relative_to(output)))
+                    self.assertNotIn(SECRET_BODY.encode(), content, str(path.relative_to(output)))
+                    self.assertNotIn(b"ENV_SECRET", content, str(path.relative_to(output)))
+            self.assertNotIn(FINGERPRINT_SECRET, completed.stdout + completed.stderr)
+            with server.record_lock:
+                requests = list(server.requests)
+            self.assertTrue(any(b"GET /old " in request and b"Host: localhost:9000" in request
+                                for request in requests), "PHP evidence must come from a Host-aware NSE GET")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_all_http_and_https_ports_are_assessed_after_first_affected_service(self):
         if self.tls_context is None:
@@ -295,11 +465,18 @@ class ScanCLIIntegration(unittest.TestCase):
             endpoints = manifest["targets"][0]["endpoints"]
             self.assertEqual(len(endpoints), 1)
             xml = ET.parse(output / endpoints[0]["xml"]).getroot()
-            assessed_ports = {}
+            discovered_ports = set()
             for port in xml.findall("host/ports/port"):
                 script = port.find("script[@id='http-php2shell']")
-                self.assertIsNotNone(script, ET.tostring(port, encoding="unicode"))
-                assessed_ports[int(port.get("portid"))] = script.find("elem[@key='state']").text
+                self.assertIsNone(script, ET.tostring(port, encoding="unicode"))
+                self.assertEqual(port.find("state").get("state"), "open")
+                discovered_ports.add(int(port.get("portid")))
+            self.assertEqual(discovered_ports, set(expected))
+            phases = self.phase_documents(output, manifest)
+            self.assertEqual(len(phases), len(expected))
+            self.assertTrue(all(job["phase"] == "base" for _, job, _ in phases))
+            assessed_ports = {service["port"]: script.find("elem[@key='state']").text
+                              for service, _, script in phases}
             self.assertEqual(set(assessed_ports), set(expected))
             self.assertEqual(assessed_ports[min(expected)], "POTENTIALLY_VULNERABLE")
             self.assertEqual(set(assessed_ports.values()),
@@ -345,7 +522,11 @@ class ScanCLIIntegration(unittest.TestCase):
             # The fixture must actually exercise service-detection failure,
             # rather than accidentally rely on -sV recognizing HTTP.
             self.assertEqual(port.find("service").get("method"), "table")
-            self.assertIsNotNone(port.find("script[@id='http-php2shell']"))
+            self.assertIsNone(port.find("script[@id='http-php2shell']"))
+            phases = self.phase_documents(output, manifest)
+            self.assertEqual(len(phases), 1)
+            self.assertEqual(phases[0][0]["port"], 9000)
+            self.assertEqual(phases[0][2].find("elem[@key='state']").text, "POTENTIALLY_VULNERABLE")
             self.assert_report_matches_manifest(output, manifest, 9000)
             with server.record_lock:
                 requests = list(server.requests)
@@ -446,8 +627,11 @@ class ScanCLIIntegration(unittest.TestCase):
             xml = ET.parse(output / endpoint["xml"]).getroot()
             self.assertEqual(xml.find("host/address").get("addr"), "127.0.0.1")
             script = xml.find(".//script[@id='http-php2shell']")
-            self.assertIsNotNone(script)
-            self.assertEqual(script.find("elem[@key='state']").text, "POTENTIALLY_VULNERABLE")
+            self.assertIsNone(script)
+            phases = self.phase_documents(output, manifest, target["hostname"])
+            self.assertEqual(len(phases), 1)
+            self.assertEqual(phases[0][1]["phase"], "base")
+            self.assertEqual(phases[0][2].find("elem[@key='state']").text, "POTENTIALLY_VULNERABLE")
         report = json.loads((output / "raw" / "report-details.json").read_text())
         self.assertEqual(report["discovery"], discovery)
         self.assertTrue(report["summary"]["discovery_processing_complete"])

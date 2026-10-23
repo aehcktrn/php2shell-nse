@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from copy import deepcopy
 import csv
 from datetime import datetime, timezone
 import hashlib
@@ -208,6 +209,12 @@ def _assessment(script: ET.Element) -> dict[str, Any]:
         "crawl_truncated": _scalar(script, "crawl_truncated"),
         "crawl_gap_reason_code": _scalar(script, "crawl_gap_reason_code"),
         "crawl_gap_path": _scalar(script, "crawl_gap_path"),
+        "collection_phase": _scalar(script, "collection_phase"),
+        "candidate_paths": _array(script, "candidate_paths"),
+        "candidates_examined": _scalar(script, "candidates_examined"),
+        "candidate_count": _scalar(script, "candidate_count"),
+        "enrichment_requests": _scalar(script, "enrichment_requests"),
+        "private_plan_error": _scalar(script, "private_plan_error"),
         "script_version": _scalar(script, "script_version"),
         "evidence": _details(script, "evidence"),
         "observations": observations,
@@ -314,6 +321,8 @@ def _true(value: object) -> bool:
 
 def _redirect_observation_destination(observation: dict[str, Any]) -> str:
     """Return a redirect target that the NSE deliberately did not follow."""
+    if _true(observation.get("managed_collection")) and observation.get("redirect_to"):
+        return _single_line(observation.get("redirect_to"))
     explicitly_outside = observation.get("redirect_scope") == "HORS_PERIMETRE_DU_CONTROLE"
     stopped_at_origin = (str(observation.get("redirect_followed", "")).lower() == "false"
                          and observation.get("redirect_reason") == "Redirect leaves the current origin.")
@@ -363,8 +372,11 @@ def _redirect_assessment_index(
 def _redirect_destination_was_assessed(
         row: dict[str, Any], destination_value: object,
         assessment_index: dict[tuple[str, int, str, str], set[int]],
+        observation: dict[str, Any] | None = None,
 ) -> bool:
     """Tell whether the exact redirect URL was requested elsewhere in the campaign."""
+    if row.get("collection_service_key") and observation is not None:
+        return _true(observation.get("redirect_evaluated"))
     destination = _redirect_destination(destination_value)
     if destination is None:
         return False
@@ -390,7 +402,7 @@ def _redirect_destinations_by_coverage(
             if not destination:
                 continue
             bucket = (assessed if assessment_index is not None
-                      and _redirect_destination_was_assessed(row, destination, assessment_index)
+                      and _redirect_destination_was_assessed(row, destination, assessment_index, observation)
                       else unassessed)
             bucket.append(destination)
     return _unique(unassessed), _unique(assessed)
@@ -426,6 +438,7 @@ HTTP_GAP_CODES = frozenset({
     "NO_HTTP_RESPONSE", "AUTHENTICATION_REQUIRED", "HTTP_ACCESS_DENIED", "RATE_LIMITED",
     "REDIRECT_NOT_ASSESSED", "REDIRECT_LIMIT_REACHED", "REQUEST_BUDGET_EXHAUSTED",
     "CLOCK_CHANGED", "EVIDENCE_LIMIT_REACHED", "INVALID_ARGUMENT",
+    "HTTP_BUDGET_UNCERTAIN", "INPUT_UNAVAILABLE", "REDIRECT_LOOP", "CHAIN_LIMIT", "NO_HTTP_SERVICE",
 })
 COMPACT_REASONS = {
     "DNS_ERROR": "Résolution DNS impossible",
@@ -458,6 +471,19 @@ COMPACT_REASONS = {
     "UNRECOGNIZED_BUILD": "Build PHP non reconnu ; correctif à vérifier côté serveur",
     "PHP_VERSION_HIDDEN": "PHP détecté, mais sa version n'est pas annoncée",
     "PHP_NOT_IDENTIFIED": "PHP non identifié ; absence de vulnérabilité non établie",
+    "HTTP_BUDGET_UNCERTAIN": "Quota réservé après interruption ; consommation HTTP exacte inconnue",
+    "INPUT_UNAVAILABLE": "URL exacte impossible à restituer pour la reprise ; paramètres expurgés",
+    "REDIRECT_LOOP": "Boucle de redirection détectée",
+    "CHAIN_LIMIT": "Limite commune de chaîne de redirections atteinte",
+    "NO_HTTP_SERVICE": "Service HTTP destinataire non disponible sur le port autorisé",
+    "UNAUTHORIZED_PORT": "Port de destination absent des ports autorisés de la campagne",
+    "OUTSIDE_AUTHORIZED_DOMAINS": "Nom de destination hors du périmètre DNS autorisé",
+    "EXCLUDED_BY_OPERATOR": "Destination exclue par l'opérateur",
+    "REDIRECT_PLAN_LIMIT": "Plafond de destinations de redirection atteint",
+    "INVALID_REDIRECT_URL": "URL de redirection invalide ou non HTTP/HTTPS",
+    "INVALID_REDIRECT_PORT": "Port de redirection invalide",
+    "INVALID_REDIRECT_PATH": "Chemin de redirection invalide",
+    "INVALID_REDIRECT_IDENTITY": "Identité de redirection incohérente",
 }
 
 
@@ -639,6 +665,18 @@ def _redirect_is_covered(row: dict[str, Any], rows: list[dict[str, Any]],
     request target. Once that path has answered without a service-level gap,
     PHP evidence from another requested page qualifies the same web service.
     """
+    if row.get("collection_service_key"):
+        observations = row.get("observations", [])
+        target = _single_line(row.get("hostname")).lower().rstrip(".")
+        def same_name(observation):
+            try:
+                destination = urlsplit(_single_line(observation.get("redirect_to")))
+                return (destination.hostname or "").lower().rstrip(".") == target
+            except ValueError:
+                return False
+        return (not row.get("collection_gaps") and bool(observations)
+                and all(isinstance(item, dict) and _true(item.get("redirect_evaluated"))
+                        and same_name(item) for item in observations))
     if (row.get("row_type") != "ASSESSMENT"
             or row.get("reason_code") != "REDIRECT_NOT_ASSESSED"
             or _true(row.get("budget_exhausted"))
@@ -731,6 +769,8 @@ def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str],
             reason += "; " + action + " ou vérifier le correctif fournisseur."
         if not historical_semantics and any(item.get("inventory_patch_status") == "CONFLICT" for item in rows):
             reason += " Preuves serveur contradictoires ; le signal vulnérable reste prioritaire."
+        if any(item.get("collection_original_reason_code") == "CONFLICTING_VERSIONS" for item in rows):
+            reason += " Versions publiées contradictoires ; signal vulnérable conservé."
         gaps = sum(value == "INDETERMINE" or _http_gap(item)
                    or item.get("row_type") != "ASSESSMENT" for item, value in zip(rows, verdicts))
         if gaps:
@@ -855,6 +895,25 @@ def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdic
     reason = _legacy_compact_explanation(
         rows, verdicts, verdict, assessment_index, historical_semantics=historical_semantics,
         legacy_cause_order=legacy_cause_order)
+    sources, phases = set(), set()
+    for row in rows:
+        if not row.get("collection_service_key"):
+            continue
+        for item in row.get("evidence", []):
+            if isinstance(item, dict) and item.get("version"):
+                source = str(item.get("source", ""))
+                if source == "phpinfo-structured":
+                    sources.add("diagnostic phpinfo structuré")
+                elif source in ("server", "x-powered-by"):
+                    sources.add("en-têtes HTTP")
+                phase = str(item.get("collection_phase", ""))
+                if phase in ("redirect", "links"):
+                    phases.add("redirection exacte" if phase == "redirect" else "lien applicatif")
+    if sources:
+        reason += " Source publiée : " + " et ".join(sorted(sources))
+        if phases:
+            reason += " via " + " / ".join(sorted(phases))
+        reason += "."
     ports = _port_summary(port_rows if port_rows is not None else rows)
     redirect = _redirect_summary(rows, assessment_index) if include_redirect_destinations else ""
     prefix = " ".join(part for part in (ports, redirect) if part)
@@ -1290,6 +1349,8 @@ def _historical_compact_rows(details: dict[str, Any]) -> list[dict[str, str]] | 
         return compact_rows(rows, redirect_coverage=coverage, historical_semantics=True)
     if minor == 5 and patch == 4:
         return compact_rows(rows, legacy_cause_order=True)
+    if minor == 5 and patch == 5:
+        return compact_rows(rows)
     if minor != 4:
         return None
     if patch <= 2:
@@ -1506,6 +1567,366 @@ def _campaign_coverage(hostname: str, endpoint: dict[str, Any] | None, reason: s
             "address_family": endpoint.get("family", ""), "scan_ports": endpoint.get("ports", "")}
 
 
+def _collection_identity(value: dict[str, Any]) -> tuple[str, str, str, str]:
+    """Keep virtual hosts, pinned addresses, ports and schemes distinct."""
+    return (_single_line(value.get("hostname")).lower().rstrip("."),
+            _single_line(value.get("ip")), _single_line(value.get("port")),
+            _single_line(value.get("scheme")).lower())
+
+
+def _collection_counter(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(str(value))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, number)
+
+
+def _collection_items(parts: list[dict[str, Any]], field: str) -> list[dict[str, Any]]:
+    """Retain every sample, including repeated observations of the same URL."""
+    output = []
+    for part in parts:
+        for item in part.get(field, []):
+            if isinstance(item, dict):
+                copied = deepcopy(item)
+                copied.setdefault("collection_phase", part.get("collection_phase", "base"))
+                if field == "observations":
+                    copied["managed_collection"] = True
+                output.append(copied)
+    return output
+
+
+def _merge_collection_assessments(service: dict[str, Any], parts: list[dict[str, Any]],
+                                  jobs: list[dict[str, Any]], gaps: list[dict[str, Any]],
+                                  campaign_id: str, observed_at: str) -> dict[str, Any]:
+    """Combine managed HTTP phases without manufacturing another service."""
+    name, ip, port, scheme = _collection_identity(service)
+    observations = _collection_items(parts, "observations")
+    evidence = _collection_items(parts, "evidence")
+    versions = _unique([version for part in parts for version in _version_values(part.get("versions"))])
+    fixed = _unique([version for part in parts for version in _version_values(part.get("fixed_versions"))])
+    suspect = any(_suspect(part) for part in parts)
+    conflict = len(versions) > 1 or any(part.get("reason_code") == "CONFLICTING_VERSIONS" for part in parts)
+    if conflict:
+        state, reason_code = "UNKNOWN", "CONFLICTING_VERSIONS"
+        reason = "Versions PHP publiées contradictoires ; toutes les preuves sont conservées."
+    elif suspect and versions:
+        state, reason_code = "POTENTIALLY_VULNERABLE", "AFFECTED_VERSION_ADVERTISED"
+        reason = "Version PHP publiée concernée par les CVE recherchées."
+    elif versions and any(part.get("state") == "PATCHED_VERSION_ADVERTISED" for part in parts) \
+            and not any(part.get("state") == "UNKNOWN" and _version_values(part.get("versions"))
+                        and part.get("reason_code") == "UNRECOGNIZED_BUILD" for part in parts):
+        state, reason_code = "PATCHED_VERSION_ADVERTISED", "FIXED_VERSION_ADVERTISED"
+        reason = "Version PHP publiée corrigée pour les CVE recherchées."
+    else:
+        state = "UNKNOWN"
+        reason_code = ("UNRECOGNIZED_BUILD" if versions else
+                       "PHP_VERSION_HIDDEN" if any(part.get("php_detected") == "YES" for part in parts)
+                       else "PHP_NOT_IDENTIFIED")
+        reason = COMPACT_REASONS.get(reason_code, "Version PHP impossible à établir.")
+    latest = parts[-1] if parts else {}
+    merged = {
+        **{key: value for key, value in latest.items()
+           if key not in ("evidence", "observations", "notes")},
+        "hostname": name, "ip": ip, "port": port, "protocol": "tcp", "scheme": scheme,
+        "service": "ssl/http" if scheme == "https" else "http", "row_type": "ASSESSMENT",
+        "state": state, "reason": reason, "reason_code": reason_code,
+        "verdict": VERDICTS[state], "priority": PRIORITIES[state], "remediation": REMEDIATIONS[state],
+        "verification": VERIFY_RUNTIME, "next_action": VERIFY_RUNTIME,
+        "versions": " | ".join(versions), "fixed_versions": " | ".join(fixed),
+        "potentially_vulnerable_evidence": suspect,
+        "php_detected": "YES" if versions or any(part.get("php_detected") == "YES" for part in parts) else "UNKNOWN",
+        "evidence": evidence, "observations": observations,
+        "notes": _unique([_single_line(note) for part in parts for note in part.get("notes", [])]),
+        "requests_made": str(sum(_collection_counter(part.get("requests_made")) for part in parts)),
+        "elapsed_ms": str(sum(_collection_counter(part.get("elapsed_ms")) for part in parts)),
+        "campaign_id": campaign_id, "observed_at": str(latest.get("observed_at") or observed_at),
+        "source_xml": " | ".join(_unique([str(part.get("source_xml") or "") for part in parts])),
+        "exploitability": "NOT_TESTED", "traversal_complete": "true", "budget_exhausted": "false",
+        "traversal_reason_code": "", "collection_service_key": str(service.get("service_key", "")),
+        "collection_phase": "managed", "collection_parts": [
+            {"phase": part.get("collection_phase", "base"), "versions": part.get("versions", ""),
+             "requests_made": part.get("requests_made", "0"), "elapsed_ms": part.get("elapsed_ms", "0"),
+             "source_xml": part.get("source_xml", "")} for part in parts],
+        "collection_jobs": deepcopy(jobs), "collection_gaps": deepcopy(gaps),
+        "collection_required_destinations": deepcopy(service.get("required_destinations", [])),
+        "collection_redirect_results": deepcopy(service.get("redirect_results", [])),
+        "collection_original_reason_code": reason_code,
+        "collection_original_state": state,
+    }
+    # Redirect gaps are reconciled after all services have been merged. Other
+    # failed or unfinished planned work remains explicit and cannot be cleared
+    # by a reassuring version published on another page.
+    for part in parts:
+        code = part.get("traversal_reason_code") or part.get("reason_code")
+        if _http_gap(part) and code != "REDIRECT_NOT_ASSESSED":
+            merged["collection_gaps"].append({"reason_code": str(code or "REQUEST_BUDGET_EXHAUSTED"),
+                                               "phase": part.get("collection_phase", "base")})
+        if _true(part.get("private_plan_error")):
+            merged["collection_gaps"].append({"reason_code": "INPUT_UNAVAILABLE",
+                                               "phase": part.get("collection_phase", "base")})
+    halted = service.get("halted_reason")
+    if halted:
+        merged["collection_gaps"].append({"reason_code": str(halted)})
+    if not parts:
+        merged.update(row_type="COVERAGE", state="NOT_ASSESSED", verdict="ABSENCE D'EVALUATION PHP2SHELL",
+                      priority="REVIEW_COVERAGE")
+        if not merged["collection_gaps"]:
+            merged["collection_gaps"].append({"reason_code": "SCAN_NOT_ATTEMPTED", "phase": "base"})
+    return merged
+
+
+def _collection_observation_conclusive(row: dict[str, Any], observation: dict[str, Any]) -> bool:
+    if (observation.get("reason_code") in HTTP_GAP_CODES
+            or str(observation.get("http_status", "")) in ("401", "403", "429")
+            or not str(observation.get("http_status", "")).isdigit()):
+        return False
+    if row.get("inventory_patch_status") in ("PATCH_CONFIRMED", "PATCH_MISSING_CONFIRMED"):
+        return True
+    return ((row.get("collection_original_state", row.get("state"))
+             in ("POTENTIALLY_VULNERABLE", "PATCHED_VERSION_ADVERTISED") or _suspect(row))
+            and bool(_version_values(row.get("versions"))))
+
+
+def _reconcile_collection_gaps(rows: list[dict[str, Any]]) -> None:
+    """Resolve exact managed redirects with their pinned destination addresses."""
+    managed = [row for row in rows if row.get("collection_service_key")]
+    index: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for row in managed:
+        for observation in row.get("observations", []):
+            identity = str(observation.get("path_identity", ""))
+            if identity:
+                index.setdefault((identity, row["ip"]), []).append((row, observation))
+    destinations: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in managed:
+        for destination in row.get("collection_required_destinations", []):
+            if not isinstance(destination, dict):
+                continue
+            key = str(destination.get("source_service_key", "")), str(destination.get("path_identity", ""))
+            destinations.setdefault(key, []).append(row)
+    edge_cache: dict[int, bool] = {}
+
+    def redirect_context(row, observation):
+        identity = str(observation.get("redirect_identity", ""))
+        matching = destinations.get((row["collection_service_key"], identity), [])
+        recorded = [item for item in row.get("collection_redirect_results", [])
+                    if isinstance(item, dict) and item.get("redirect_identity") == identity
+                    and (not item.get("source_path_identity")
+                         or item.get("source_path_identity") == observation.get("path_identity"))]
+        addresses = _unique([str(address) for item in recorded for address in item.get("destination_ips", [])]) \
+            or _unique([item["ip"] for item in matching]) or [row["ip"]]
+        return identity, matching, recorded, addresses
+
+    def request_conclusive(row, observation, visiting):
+        status = str(observation.get("http_status", ""))
+        if status.isdigit() and 300 <= int(status) < 400 and status != "304":
+            return edge_conclusive(row, observation, visiting)
+        return _collection_observation_conclusive(row, observation)
+
+    def edge_conclusive(row, observation, visiting=frozenset()):
+        marker = id(observation)
+        if marker in edge_cache:
+            return edge_cache[marker]
+        if marker in visiting or len(visiting) >= 32:
+            return False
+        identity, matching, recorded, addresses = redirect_context(row, observation)
+        observation["redirect_destination_ips"] = addresses
+        blocked = any(item.get("status") == "UNASSESSED" and item.get("reason_code") for item in recorded)
+        covered = bool(identity) and not blocked \
+            and bool(matching or any(index.get((identity, address)) for address in addresses)) \
+            and all(any(request_conclusive(candidate, requested, visiting | {marker})
+                        for candidate, requested in index.get((identity, address), []))
+                    for address in addresses)
+        edge_cache[marker] = covered
+        observation["redirect_evaluated"] = "true" if covered else "false"
+        return covered
+
+    # Resolve complete navigation chains before deciding whether a 302 that
+    # itself advertises PHP covers an upstream necessary destination.
+    for row in managed:
+        for observation in row.get("observations", []):
+            if _redirect_observation_destination(observation):
+                edge_conclusive(row, observation)
+    for row in managed:
+        for destination in row.get("collection_required_destinations", []):
+            if not isinstance(destination, dict):
+                continue
+            identity = str(destination.get("path_identity", ""))
+            exact = index.get((identity, row["ip"]), [])
+            if not any(request_conclusive(candidate, observation, frozenset()) for candidate, observation in exact):
+                row["collection_gaps"].append({"reason_code": str(destination.get("reason_code")
+                    or "REDIRECT_NOT_ASSESSED"), "path": destination.get("path", ""), "path_identity": identity})
+    for row in managed:
+        for observation in row.get("observations", []):
+            identity = str(observation.get("redirect_identity", ""))
+            destination = _redirect_observation_destination(observation)
+            if not destination:
+                continue
+            if not identity:
+                row["collection_gaps"].append({"reason_code": "INPUT_UNAVAILABLE"
+                    if "[redacted]" in destination else "REDIRECT_NOT_ASSESSED", "path": destination})
+                continue
+            _, _, recorded, _ = redirect_context(row, observation)
+            covered = edge_conclusive(row, observation)
+            if not covered:
+                code = next((str(item["reason_code"]) for item in recorded if item.get("reason_code")),
+                            "REDIRECT_NOT_ASSESSED")
+                row["collection_gaps"].append({"reason_code": code,
+                    "path": observation.get("redirect_to", ""), "path_identity": identity})
+        gaps = row["collection_gaps"]
+        if gaps:
+            uncertain = any(gap.get("reason_code") == "HTTP_BUDGET_UNCERTAIN" for gap in gaps)
+            code = ("HTTP_BUDGET_UNCERTAIN" if uncertain else
+                    str(gaps[0].get("reason_code") or "REQUEST_BUDGET_EXHAUSTED"))
+            if uncertain:
+                row["notes"].append("Quota réservé conservativement après interruption ; consommation exacte inconnue.")
+            row["traversal_complete"], row["traversal_reason_code"] = "false", code
+            row["budget_exhausted"] = "true" if any(gap.get("reason_code") in (
+                "REQUEST_BUDGET_EXHAUSTED", "HTTP_BUDGET_UNCERTAIN") for gap in gaps) else "false"
+            row["reason_code"] = code
+            row["reason"] = COMPACT_REASONS.get(code, "Contrôle HTTP planifié non terminé.")
+        row["redirect_destinations"] = " | ".join(_unassessed_redirect_destinations([row]))
+        row["redirect_evaluation_scope"] = "HORS_PERIMETRE_DU_CONTROLE" if row["redirect_destinations"] else ""
+
+
+def merge_collection_rows(rows: list[dict[str, Any]], collection: dict[str, Any], base_dir: Path,
+                          campaign_id: str = "", observed_at: str = "") -> list[dict[str, Any]]:
+    """Load completed phase artifacts and replace Nmap-only service coverage."""
+    if not isinstance(collection, dict) or str(collection.get("schema_version")) != "1" \
+            or not isinstance(collection.get("services"), dict):
+        raise ReportError("Journal de collecte HTTP invalide.")
+    additions = []
+    replacements = set()
+    assessment_replacements = set()
+    for key, service in collection["services"].items():
+        if not isinstance(service, dict) or not isinstance(service.get("phase_jobs", []), list):
+            raise ReportError("Service du journal HTTP invalide.")
+        service = {**service, "service_key": str(key)}
+        name, ip, port, scheme = identity = _collection_identity(service)
+        if not name or not ip or scheme not in ("http", "https") or not port.isdecimal() \
+                or not 1 <= int(port) <= 65535:
+            raise ReportError("Identité de service HTTP invalide.")
+        jobs, parts, gaps = service.get("phase_jobs", []), [], []
+        for job in jobs:
+            if not isinstance(job, dict) or job.get("phase") not in ("base", "redirect", "links"):
+                raise ReportError("Phase du journal HTTP invalide.")
+            if job.get("status") == "REUSED":
+                continue
+            if job.get("status") != "COMPLETED":
+                code = ("REQUEST_BUDGET_EXHAUSTED" if job.get("status") == "BUDGET_EXHAUSTED"
+                        else "INPUT_UNAVAILABLE" if job.get("status") == "INPUT_UNAVAILABLE"
+                        else "SCAN_INTERRUPTED" if job.get("status") in ("RUNNING", "INTERRUPTED")
+                        else "SCAN_FAILED" if job.get("status") == "FAILED" else "SCAN_NOT_ATTEMPTED")
+                if job.get("error") == "HTTP_BUDGET_UNCERTAIN":
+                    code = "HTTP_BUDGET_UNCERTAIN"
+                gaps.append({"reason_code": str(job.get("reason_code") or code),
+                             "phase": job["phase"], "job_id": job.get("job_id", "")})
+                continue
+            try:
+                parsed = parse_report(_safe_xml_path(Path(base_dir), job.get("xml")))
+                assessments = [part for part in parsed if part.get("row_type") == "ASSESSMENT"
+                               and _collection_identity(part) == identity]
+                if (len(assessments) != 1 or any(part.get("ip") != ip for part in parsed)
+                        or not job.get("imported") and len(parsed) != 1):
+                    raise ReportError("Le XML de collecte ne correspond pas au service épinglé.")
+            except ReportError:
+                gaps.append({"reason_code": "INVALID_SCAN_XML", "phase": job["phase"],
+                             "job_id": job.get("job_id", "")})
+                continue
+            part = assessments[0]
+            part.update(collection_phase=job["phase"], source_xml=str(job["xml"]))
+            if job.get("imported"):
+                for observation in part.get("observations", []):
+                    path = _single_line(observation.get("path"))
+                    if not observation.get("path_identity") and path.startswith("/") and "[redacted]" not in path:
+                        authority = "[" + name + "]" if ":" in name else name
+                        observation["path_identity"] = hashlib.sha256(
+                            (scheme + "://" + authority + ":" + port + path).encode("utf-8")).hexdigest()
+            parts.append(part)
+        merged = _merge_collection_assessments(service, parts, jobs, gaps, campaign_id, observed_at)
+        additions.append(merged)
+        replacements.add((name, ip, port))
+        assessment_replacements.add(identity)
+    output = [row for row in rows if not (row.get("row_type") == "COVERAGE"
+              and row.get("reason_code") == "SERVICE_NOT_ASSESSED"
+              and (_single_line(row.get("hostname")).lower().rstrip("."), _single_line(row.get("ip")),
+                   _single_line(row.get("port"))) in replacements)
+              and not (row.get("row_type") == "ASSESSMENT"
+                       and _collection_identity(row) in assessment_replacements)]
+    output.extend(additions)
+    _reconcile_collection_gaps(output)
+    return output
+
+
+def collection_metrics(rows: list[dict[str, Any]], collection: dict[str, Any],
+                       budget_ledger: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Count distinct assessed services; phase gains are mutually exclusive."""
+    managed = [row for row in rows if row.get("collection_service_key")]
+    assessed = [row for row in managed if row.get("observations")]
+    counts = Counter()
+    for row in assessed:
+        parts = row.get("collection_parts", [])
+        phases = {str(part.get("phase")) for part in parts if _version_values(part.get("versions"))}
+        for phase in ("base", "redirect", "links"):
+            if phase in phases:
+                counts["services_version_" + phase] += 1
+                break
+        records = [item for item in row.get("evidence", []) if isinstance(item, dict) and item.get("version")]
+        if records and all(item.get("source") == "phpinfo-structured" for item in records):
+            counts["services_version_diagnostic_only"] += 1
+        if len(_version_values(row.get("versions"))) > 1:
+            counts["services_conflicting_versions"] += 1
+    for row in managed:
+        if _true(row.get("budget_exhausted")) or any(
+                gap.get("reason_code") in ("REQUEST_BUDGET_EXHAUSTED", "HTTP_BUDGET_UNCERTAIN")
+                for gap in row.get("collection_gaps", [])):
+            counts["services_budget_exhausted"] += 1
+        for part in row.get("collection_parts", []):
+            prefix = "base" if part.get("phase") == "base" else "additional"
+            counts[prefix + "_get_requests"] += _collection_counter(part.get("requests_made"))
+            counts[prefix + "_elapsed_ms"] += _collection_counter(part.get("elapsed_ms"))
+    fields = ("services_version_base", "services_version_redirect", "services_version_links",
+              "services_version_diagnostic_only", "services_conflicting_versions", "services_budget_exhausted",
+              "base_get_requests", "additional_get_requests", "base_elapsed_ms", "additional_elapsed_ms")
+    result = {field: counts[field] for field in fields}
+    result.update(services_planned=len(managed), services_assessed=len(assessed),
+                  services_with_version=sum(bool(_version_values(row.get("versions"))) for row in assessed),
+                  total_get_requests=result["base_get_requests"] + result["additional_get_requests"],
+                  total_elapsed_ms=result["base_elapsed_ms"] + result["additional_elapsed_ms"],
+                  denominator="Services distincts effectivement observés : nom DNS, IP épinglée, port et protocole HTTP/HTTPS.")
+    if isinstance(budget_ledger, dict):
+        charged_requests = charged_ms = uncertain_requests = uncertain_ms = 0
+        exhausted_keys = {row["collection_service_key"] for row in managed if _true(row.get("budget_exhausted"))}
+        uncertain_services = 0
+        for row in managed:
+            record = budget_ledger.get(row.get("collection_service_key"), {})
+            if not isinstance(record, dict):
+                continue
+            charged_requests += _collection_counter(record.get("charged_requests"))
+            charged_ms += _collection_counter(record.get("charged_elapsed_ms"))
+            maximum_requests = _collection_counter(record.get("max_requests"))
+            maximum_ms = _collection_counter(record.get("budget_ms"))
+            if ((maximum_requests and _collection_counter(record.get("charged_requests")) >= maximum_requests)
+                    or (maximum_ms and _collection_counter(record.get("charged_elapsed_ms")) >= maximum_ms)):
+                exhausted_keys.add(row["collection_service_key"])
+            reservations = record.get("reservations", {})
+            service_uncertain = False
+            if isinstance(reservations, dict):
+                for reservation in reservations.values():
+                    if isinstance(reservation, dict) and reservation.get("status") == "RESERVED":
+                        uncertain_requests += _collection_counter(reservation.get("requests"))
+                        uncertain_ms += _collection_counter(reservation.get("budget_ms"))
+                        service_uncertain = True
+            uncertain_services += service_uncertain
+        result.update(charged_get_quota=charged_requests, charged_elapsed_ms=charged_ms,
+                      uncertain_get_quota=uncertain_requests, uncertain_elapsed_ms=uncertain_ms,
+                      services_budget_uncertain=uncertain_services,
+                      services_budget_exhausted=len(exhausted_keys))
+    return result
+
+
 def _discovery_report(manifest: dict, campaign_id: str, observed_at: str
                       ) -> tuple[dict | None, list[dict], dict]:
     """Reconcile passive-source processing without claiming exhaustive discovery."""
@@ -1702,6 +2123,23 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
                 if row["row_type"] == "ASSESSMENT":
                     evaluated_names.add(name)
                 rows.append(row)
+    collection = manifest.get("http_collection")
+    if collection is not None:
+        rows = merge_collection_rows(rows, collection, base_dir, campaign_id, observed_at)
+        target_metadata = {target["hostname"]: target for target in manifest["targets"]}
+        for row in rows:
+            if not row.get("collection_service_key"):
+                continue
+            target = target_metadata.get(row["hostname"], {})
+            endpoint = next((item for item in target.get("endpoints", [])
+                             if item.get("ip") == row.get("ip")), {})
+            row.update(target_sources=deepcopy(target.get("sources", [])),
+                       address_family=endpoint.get("family") or ("ipv6" if ":" in row["ip"] else "ipv4"),
+                       scan_ports=endpoint.get("ports") or str(manifest.get("ports") or ""),
+                       scan_status=endpoint.get("status") or "")
+        evaluated_names.update(row["hostname"] for row in rows if row.get("row_type") == "ASSESSMENT")
+        if collection.get("status") not in ("COMPLETED", "SKIPPED"):
+            processing_complete = False
     rows.extend(discovery_rows)
     for row in rows:
         try:
@@ -1721,6 +2159,8 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
         "excluded_candidates": len(manifest.get("excluded_candidates", [])),
         **discovery_summary,
     }
+    if collection is not None:
+        summary["collection_metrics"] = collection_metrics(rows, collection, manifest.get("http_services"))
     result = {"schema_version": "1", "tool_version": str(manifest.get("tool_version") or "0.3.0"),
               "campaign": {key: manifest.get(key) for key in ("campaign_id", "started_at", "finished_at", "status", "profile", "ports", "address_families", "http", "limits", "scope")},
               "generated_at": now.isoformat(), "summary": summary, "rows": rows, "changes": [],
@@ -1730,6 +2170,12 @@ def build_campaign_report(manifest: dict, base_dir: Path, inventory: Path | None
                   "Une absence d'evaluation ou de signal reseau ne confirme pas l'application du correctif.",
                   "Les preuves serveur importees restent des attestations dont l'authenticite et l'exhaustivite sont a valider par l'operateur.",
               ]}
+    if collection is not None:
+        result["campaign"]["http_collection"] = {
+            "schema_version": collection["schema_version"], "status": collection.get("status", "PARTIAL"),
+        }
+        result["limitations"].extend(_single_line(item) for item in collection.get("limitations", [])
+                                     if isinstance(item, str) and item)
     if discovery is not None:
         result["discovery"] = discovery
         result["campaign"]["discovery"] = {key: value for key, value in discovery.items()

@@ -28,14 +28,16 @@ import threading
 import time
 from urllib.parse import quote
 import uuid
+import xml.etree.ElementTree as ET
 
 from report import (ReportError, build_campaign_report, compact_rows,
                     load_campaign_report, parse_report, write_campaign_report)
 from discovery import discover_root
 from campaign_state import CampaignLock, EventLedger, StateError
+from http_campaign import discovery_command, run_collection, _private_write
 
 
-VERSION = "0.5.5"
+VERSION = "0.6.0"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -49,6 +51,35 @@ DISCOVERY_BUDGET_CAP = 7200
 PROFILES = {"rapide": "quick", "quick": "quick", "complet": "complete",
             "complete": "complete", "recontrole": "recheck", "recheck": "recheck"}
 HOST_FIELDS = ("hostname", "fqdn", "name", "domain", "host")
+
+
+class DiscoveryXML(ET.TreeBuilder):
+    """Discard raw response fingerprints before building any saved artifact."""
+
+    def start(self, tag, attributes):
+        attributes = {key: value for key, value in attributes.items() if key != "servicefp"}
+        return super().start(tag, attributes)
+
+
+def consume_discovery_xml(stream, captured):
+    """Parse bounded chunks in memory; never spool raw Nmap output to disk."""
+    parser = ET.XMLParser(target=DiscoveryXML())
+    invalid = False
+    try:
+        while chunk := stream.read(65536):
+            if not invalid:
+                try:
+                    parser.feed(chunk)
+                except ET.ParseError:
+                    invalid = True
+        if not invalid:
+            root = parser.close()
+            if root.tag == "nmaprun":
+                captured["root"] = root
+    except (ET.ParseError, OSError, ValueError):
+        pass
+    finally:
+        stream.close()
 
 
 def automatic_discovery_budget(root_count: int) -> int:
@@ -860,7 +891,7 @@ def resolve_targets_bounded(targets: list[dict], families: list[str], timeout: f
 def nse_arguments(name: str, paths: list[str], args) -> str:
     # NSE argument files support quoted strings and Lua-style arrays. JSON string
     # escaping is used as data here, never interpolated into a shell command.
-    quoted = lambda value: json.dumps(value, ensure_ascii=True)
+    quoted = lambda value: json.dumps(value, ensure_ascii=False)
     values = {"vhost": quoted(name), "path": quoted(paths[0]),
               "timeout": str(args.http_timeout), "budget": str(args.http_budget),
               "max_requests": str(args.max_requests), "redirects": str(args.redirects),
@@ -873,6 +904,8 @@ def nse_arguments(name: str, paths: list[str], args) -> str:
 
 
 def command_for(nmap: str, endpoint: dict, args_file: Path, prefix: Path, args) -> list[str]:
+    if getattr(args, "managed_http", True):
+        return discovery_command(nmap, endpoint, prefix, args)
     command = [nmap, "-sT", "-sV", "-Pn", "-n", "-p", endpoint["ports"],
                "--script", str(ROOT / "http-php2shell.nse"), "--script-args-file", str(args_file),
                "--script-timeout", f"{args.http_budget / 1000 + 2:g}s",
@@ -886,6 +919,58 @@ def command_for(nmap: str, endpoint: dict, args_file: Path, prefix: Path, args) 
     # Numeric IP from a DNS snapshot; the original DNS name travels only as Host/SNI.
     command.append(str(ipaddress.ip_address(endpoint["ip"])))
     return command
+
+
+def collection_inputs(output: Path, manifest: dict, raw_paths: dict | None = None) -> dict:
+    """Keep replayable query values in a private companion, never in reports."""
+    private = output / "state" / "private"
+    private.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(private, 0o700)
+    path = private / "inputs.json"
+    if raw_paths is not None:
+        _private_write(path, json.dumps(raw_paths, ensure_ascii=True))
+        return raw_paths
+    if path.is_file() and not path.is_symlink():
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise InputError("Entrées HTTP privées invalides ; paramètres non rejoués.") from exc
+        if not isinstance(stored, dict):
+            raise InputError("Entrées HTTP privées invalides.")
+        for target in manifest["targets"]:
+            values = stored.get(target["hostname"])
+            expected = target.get("requested_paths") or manifest["http"]["paths"]
+            defaults = stored.get("__default__")
+            if values is None and isinstance(defaults, list) and list(map(public_path, defaults)) == expected:
+                values = defaults
+                stored[target["hostname"]] = values
+            if values is None and not any("?[redacted]" in value for value in expected):
+                continue
+            if (not isinstance(values, list) or not values
+                    or any(not isinstance(value, str) for value in values)
+                    or [public_path(valid_path(value)) for value in values] != expected):
+                raise InputError("Entrées HTTP privées incohérentes avec la campagne.")
+        return stored
+    values = {target["hostname"]: target.get("requested_paths") or manifest["http"]["paths"]
+              for target in manifest["targets"]}
+    if any("?[redacted]" in path for paths in values.values() for path in paths):
+        raise InputError("Paramètres HTTP expurgés et entrées privées absentes ; nouvelle campagne nécessaire.")
+    return values
+
+
+def collect_http(manifest, output, args, control, ledger, request_paths=None):
+    print("Collecte HTTP : contrôles de base, redirections exactes, puis liens facultatifs ; quotas communs par service.", flush=True)
+    try:
+        return run_collection(manifest, output, args, control, ledger,
+                              resolve=resolve_target, validate_hostname=hostname, exclusion=exclusion_reason,
+                              save=atomic_json, endpoint_identity=endpoint_task_id,
+                              request_paths=collection_inputs(output, manifest, request_paths))
+    except KeyboardInterrupt:
+        # DNS and discovery of a newly authorized redirect name run outside
+        # phase worker batches too. Preserve a partial report at that boundary.
+        control.stop()
+        manifest.setdefault("http_collection", {})["status"] = "INTERRUPTED"
+        return True
 
 
 def endpoint_task_id(name: str, endpoint: dict, paths: list[str], http: dict) -> str:
@@ -1105,10 +1190,20 @@ class Processes:
             return result
         result["started_at"] = utcnow()
         process = None
+        reader = None
+        captured = {}
+        sanitized_discovery = "-oX" in command and command[command.index("-oX") + 1] == "-"
         try:
             with (base / result["stdout"]).open("w", encoding="utf-8") as out, (base / result["stderr"]).open("w", encoding="utf-8") as err:
-                process = subprocess.Popen(command, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                process = subprocess.Popen(command,
+                                           stdout=subprocess.PIPE if sanitized_discovery else out,
+                                           stderr=subprocess.DEVNULL if sanitized_discovery else err,
+                                           stdin=subprocess.DEVNULL,
                                            start_new_session=(os.name == "posix"))
+                if sanitized_discovery:
+                    reader = threading.Thread(target=consume_discovery_xml, args=(process.stdout, captured), daemon=True)
+                    reader.start()
+                    out.write("Service discovery XML sanitized; raw response fingerprints are not retained.\n")
                 with self.lock:
                     self.active.add(process)
                 if self.cancel.is_set():
@@ -1123,6 +1218,20 @@ class Processes:
                     result.update(status="TIMEOUT", returncode=process.poll(), error="TARGET_TIMEOUT")
                 if self.cancel.is_set():
                     result.update(status="SKIPPED", error="CAMPAIGN_INTERRUPTED")
+                if reader is not None:
+                    reader.join()
+                    root = captured.get("root")
+                    if root is not None:
+                        ET.ElementTree(root).write(base / result["xml"], encoding="utf-8", xml_declaration=True)
+                    elif result["status"] == "COMPLETED":
+                        result.update(status="FAILED", error="INVALID_DISCOVERY_XML")
+                    if result["status"] != "COMPLETED":
+                        err.write("Nmap discovery did not complete; raw diagnostic output is not retained.\n")
+        except KeyboardInterrupt:
+            self.stop()
+            if reader is not None:
+                reader.join()
+            raise
         except OSError as exc:
             result.update(status="FAILED", error=str(exc), returncode=None)
         finally:
@@ -1365,6 +1474,7 @@ def run_campaign(args) -> int:
             interrupt_discovery(manifest["discovery"], roots, rules)
             record_discovered_targets(output, manifest, targets)
             print("Interruption de la decouverte; conservation du bilan partiel.", file=sys.stderr)
+    collection_inputs(output, manifest, {**request_paths, "__default__": paths})
     jobs, index = [], 0
     for target in targets:
         selected_ports = default_ports
@@ -1381,7 +1491,7 @@ def run_campaign(args) -> int:
                         "attempts": []}
             endpoint["task_id"] = endpoint_task_id(
                 target["hostname"], endpoint, target["requested_paths"], manifest["http"])
-            arguments = output / (stem + ".args")
+            arguments = output / "state" / "private" / f"discovery-{index:06d}.args"
             with os.fdopen(os.open(arguments, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as stream:
                 stream.write(nse_arguments(target["hostname"], target_paths, args))
             endpoint["command"] = command_for(nmap or args.nmap, endpoint, arguments, output / stem, args)
@@ -1416,6 +1526,8 @@ def run_campaign(args) -> int:
         arguments.unlink()
     metrics["nmap_seconds"] = round(time.monotonic() - phase_started, 3)
     metrics["scheduler"] = scheduler_metrics
+    if not interrupted:
+        interrupted = collect_http(manifest, output, args, control, ledger)
     failures = discovery_incomplete or any(item["dns_status"] != "RESOLVED" or item.get("dns_partial") for item in targets) or any(
         endpoint["status"] != "COMPLETED" for _, endpoint in jobs)
     manifest["status"] = "PARTIAL" if failures or interrupted else "COMPLETED"
@@ -1490,6 +1602,28 @@ def _completed_endpoint_is_reusable(output: Path, endpoint: dict, expected_hostn
         return False
 
 
+def _legacy_http_cost_unknown(manifest: dict, endpoint: dict) -> bool:
+    """Old combined Nmap/NSE attempts cannot recover a failed GET count."""
+    command = endpoint.get("command")
+    if (isinstance(command, list) and command and all(isinstance(argument, str) for argument in command)
+            and not any(argument.startswith("--script") or argument in ("-sC", "-A")
+                        or "http-php2shell" in argument for argument in command)):
+        # A migrated campaign retains its original version label. Newly added
+        # discovery-only endpoints in that campaign still have a known zero
+        # collection cost; the explicit command distinguishes them safely.
+        return False
+    match = re.match(r"^(\d+)\.(\d+)", str(manifest.get("tool_version", "")))
+    if match is not None:
+        legacy = tuple(map(int, match.groups())) < (0, 6)
+    else:
+        legacy = isinstance(command, list) and any(
+            "http-php2shell" in argument for argument in command if isinstance(argument, str))
+    attempted = (bool(endpoint.get("attempts")) or bool(endpoint.get("started_at"))
+                 or endpoint.get("returncode") is not None
+                 or endpoint.get("status") in ("RUNNING", "INTERRUPTED", "FAILED", "TIMEOUT"))
+    return legacy and attempted
+
+
 def resume_campaign(args) -> int:
     """Resume only unfinished endpoints from a persisted, validated snapshot."""
     if args.targets or args.discover or args.discover_subdomains or args.discover_from or args.output:
@@ -1517,7 +1651,8 @@ def resume_campaign(args) -> int:
         args.samples = int(http["samples"])
     except (KeyError, TypeError, ValueError) as exc:
         raise InputError("Parametres HTTP absents ou invalides dans le manifeste de reprise.") from exc
-    default_raw_paths = http.get("paths") or ["/"]
+    saved_http_inputs = collection_inputs(output, manifest)
+    default_raw_paths = saved_http_inputs.get("__default__") or http.get("paths") or ["/"]
     if (not isinstance(default_raw_paths, list) or not default_raw_paths
             or any("?[redacted]" in str(path) for path in default_raw_paths)):
         raise InputError("Paramètres HTTP expurgés ou invalides; lancer une nouvelle campagne avec les chemins complets.")
@@ -1580,7 +1715,7 @@ def resume_campaign(args) -> int:
                 existing_numbers.append(int(match.group(1)))
     next_number = max(existing_numbers, default=0)
     for target in manifest["targets"]:
-        paths_for_target = target.get("requested_paths") or default_raw_paths
+        paths_for_target = saved_http_inputs.get(target["hostname"]) or target.get("requested_paths") or default_raw_paths
         if (not isinstance(paths_for_target, list) or not paths_for_target
                 or any("?[redacted]" in str(path) for path in paths_for_target)):
             raise InputError(f"{target.get('hostname')}: paramètres HTTP expurgés; lancer une nouvelle campagne.")
@@ -1609,7 +1744,7 @@ def resume_campaign(args) -> int:
         if not isinstance(target, dict) or not isinstance(target.get("hostname"), str):
             raise InputError("Cible invalide dans le manifeste de reprise.")
         name = hostname(target["hostname"])
-        raw_paths = target.get("requested_paths") or default_raw_paths
+        raw_paths = saved_http_inputs.get(name) or target.get("requested_paths") or default_raw_paths
         if not isinstance(raw_paths, list) or not raw_paths:
             raise InputError(f"{name}: chemins de reprise invalides.")
         if any("?[redacted]" in str(path) for path in raw_paths):
@@ -1639,7 +1774,15 @@ def resume_campaign(args) -> int:
                 endpoint.update(status="INTERRUPTED", error="PREVIOUS_PROCESS_STOPPED",
                                 finished_at=utcnow())
                 ledger.append("endpoint", endpoint["task_id"], dict(endpoint))
-            if _completed_endpoint_is_reusable(output, endpoint, name):
+            completed_reusable = _completed_endpoint_is_reusable(output, endpoint, name)
+            if (not completed_reusable and _legacy_http_cost_unknown(manifest, endpoint)
+                    and not endpoint.get("legacy_http_budget_uncertain")):
+                # Persist before replacing the old combined Nmap/NSE command
+                # and XML with discovery-only work. Unknown earlier GET costs
+                # must not turn into a fresh HTTP allowance after migration.
+                endpoint["legacy_http_budget_uncertain"] = True
+                ledger.append("endpoint", endpoint["task_id"], dict(endpoint))
+            if completed_reusable:
                 reusable += 1
                 continue
             if len(endpoint.get("attempts", [])) >= args.max_attempts:
@@ -1649,7 +1792,7 @@ def resume_campaign(args) -> int:
             xml = _campaign_file(output, endpoint.get("xml"), ".xml")
             stdout = _campaign_file(output, endpoint.get("stdout"))
             stderr = _campaign_file(output, endpoint.get("stderr"))
-            arguments = xml.with_suffix(".args")
+            arguments = output / "state" / "private" / ("discovery-" + xml.stem + ".args")
             arguments.unlink(missing_ok=True)
             with os.fdopen(os.open(arguments, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
                            "w", encoding="utf-8") as stream:
@@ -1676,6 +1819,8 @@ def resume_campaign(args) -> int:
             measurements=scheduler_metrics)
     if interrupted:
         print("Interruption de la reprise; conservation du bilan partiel.", file=sys.stderr, flush=True)
+    else:
+        interrupted = collect_http(manifest, output, args, control, ledger)
     for arguments in (output / "raw").glob("*.args"):
         arguments.unlink()
     discovery_incomplete = bool(manifest.get("discovery", {}).get("enabled")

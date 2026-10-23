@@ -68,7 +68,13 @@ class DiscoveryCampaignTests(unittest.TestCase):
 
     @staticmethod
     def completed_scan(command, endpoint, output, _timeout):
-        arguments = Path(command[command.index("--script-args-file") + 1]).read_text()
+        # The initial command now discovers services without running the NSE.
+        # Reuse the campaign's prepared private argument file when this legacy
+        # fixture supplies a completed assessment alongside discovery results.
+        arguments_path = (Path(command[command.index("--script-args-file") + 1])
+                          if "--script-args-file" in command
+                          else output / "state" / "private" / ("discovery-" + Path(endpoint["xml"]).stem + ".args"))
+        arguments = arguments_path.read_text()
         line = next(line for line in arguments.splitlines() if line.startswith("http-php2shell.vhost="))
         name = json.loads(line.split("=", 1)[1].rstrip(","))
         xml_file(output / endpoint["xml"], name=name, ip=endpoint["ip"],

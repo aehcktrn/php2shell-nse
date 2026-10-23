@@ -36,9 +36,15 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_discovery.py'
           python3 -m unittest discover -s tests -p 'test_discovery_campaign.py'
           python3 -m unittest discover -s tests -p 'test_campaign_state.py'
+          python3 -m unittest discover -s tests -p 'test_service_budget.py'
+          python3 -m unittest discover -s tests -p 'test_http_campaign.py'
+          python3 -m unittest discover -s tests -p 'test_collection_report.py'
 
       - name: Run HTTP and HTTPS integration tests on loopback
         run: python3 tests/integration.py
 
       - name: Run campaign CLI integration tests on loopback
         run: python3 tests/test_scan_integration.py
+
+      - name: Run durable HTTP collection resume tests on loopback
+        run: python3 tests/test_collection_resume_integration.py

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 — 2026-10-23
+
+- Planification par le lanceur des destinations exactes des redirections autorisées, en conservant Host/SNI, les adresses épinglées, les exclusions et les ports de campagne. L'identité d'URL distingue les queries expurgées ; les boucles et la limite de chaîne sont communes aux phases.
+- Budgets HTTP cumulés par nom/IP/port/protocole et partagés entre contrôles obligatoires, redirections et enrichissements. Réservation persistée avant le travail, reprise sans remise à zéro et comptabilité conservatrice lorsque la consommation après interruption est inconnue.
+- Enrichissement limité à deux liens de navigation de même origine lorsque les contrôles précédents n'ont publié aucune version, sans récursion, query, formulaire, action ni dictionnaire de chemins ; nombre de liens examinés et taille analysée bornés.
+- Reconnaissance stricte de la version principale dans les diagnostics `phpinfo()` déjà accessibles. Les corps sont bornés après décodage et ne sont jamais conservés ; les versions d'extensions et mentions documentaires restent exclues.
+- Fusion des phases en une évaluation par service, en préservant chaque échantillon, toutes les versions et les contradictions. La preuve d'un autre nom reste rattachée à ce nom ; une destination nécessaire non couverte empêche un faux verdict `NON`.
+- Compteurs techniques par service pour les gains de version de base, de redirection et de liens, les diagnostics seuls, les GET, le temps, les conflits et les quotas épuisés ou incertains.
+- Suppression en mémoire des empreintes brutes de découverte Nmap avant écriture, pour éviter qu'un corps de diagnostic ne soit conservé dans `servicefp` ou une sortie texte. Migration prudente des anciennes tentatives NSE dont le coût HTTP est inconnu.
+- Conservation des deux commandes usuelles, des quatre champs compacts, des quatre vues arborescentes et du rendu historique des rapports jusqu'à 0.5.5. La source de la version publiée est précisée lorsque utile dans les nouveaux rapports.
+
+Le lanceur passe à **0.6.0** et le NSE à **0.4.0**. Les seuils de correction et la signification des verdicts restent inchangés. Les validations utilisent uniquement des fixtures et des services locaux ; cette évolution ne publie pas de release et ne lance pas de scan public.
+
 ## 0.5.5 — 2026-10-23
 
 - Priorité à la cause réelle d'un résultat non conclusif dans la synthèse : accès HTTPS refusé ou version non identifiée plutôt qu'une simple redirection déjà demandée dans la campagne.

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import scan
@@ -33,6 +33,51 @@ class CampaignInputTests(unittest.TestCase):
         path = self.root / name
         path.write_text(text, encoding="utf-8")
         return path
+
+    def test_discovery_stream_removes_raw_response_fingerprints_before_writing(self):
+        secret = "SYNTHETIC_RESPONSE_NOT_FOR_DISK"
+        xml = '<nmaprun><host><ports><port portid="80"><service name="http" servicefp="' + secret + '"/></port></ports></host></nmaprun>'
+        program = "import sys; sys.stdout.write(" + repr(xml) + "); sys.stderr.write(" + repr(secret) + ")"
+        endpoint = {"xml": "scan.xml", "stdout": "stdout.log", "stderr": "stderr.log"}
+        result = scan.Processes().run([sys.executable, "-c", program, "-oX", "-"], endpoint, self.root, 5)
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertIn('name="http"', (self.root / "scan.xml").read_text())
+        for artifact in self.root.iterdir():
+            self.assertNotIn(secret, artifact.read_text())
+            self.assertNotIn("servicefp", artifact.read_text())
+
+    def test_invalid_discovery_stream_fails_without_saving_raw_output(self):
+        secret = "SYNTHETIC_INVALID_RESPONSE_NOT_FOR_DISK"
+        program = "import sys; sys.stdout.write(" + repr(secret) + ")"
+        endpoint = {"xml": "scan.xml", "stdout": "stdout.log", "stderr": "stderr.log"}
+        result = scan.Processes().run([sys.executable, "-c", program, "-oX", "-"], endpoint, self.root, 5)
+        self.assertEqual((result["status"], result["error"]), ("FAILED", "INVALID_DISCOVERY_XML"))
+        self.assertFalse((self.root / "scan.xml").exists())
+        for artifact in self.root.iterdir():
+            self.assertNotIn(secret, artifact.read_text())
+
+    def test_interrupted_synchronous_discovery_stops_its_process(self):
+        process = Mock()
+        process.stdout = io.BytesIO(b"<nmaprun/>")
+        process.wait.side_effect = KeyboardInterrupt
+        control = scan.Processes()
+        endpoint = {"xml": "scan.xml", "stdout": "stdout.log", "stderr": "stderr.log"}
+        with patch.object(scan.subprocess, "Popen", return_value=process), \
+             patch.object(control, "terminate") as terminate, self.assertRaises(KeyboardInterrupt):
+            control.run(["fixture-nmap", "-oX", "-"], endpoint, self.root, 5)
+        terminate.assert_called_once_with(process)
+        self.assertTrue(control.cancel.is_set())
+        self.assertEqual(control.active, set())
+
+    def test_interruption_outside_http_workers_still_preserves_partial_collection(self):
+        manifest = {}
+        control = Mock()
+        with patch.object(scan, "collection_inputs", return_value={}), \
+             patch.object(scan, "run_collection", side_effect=KeyboardInterrupt), redirect_stdout(io.StringIO()):
+            interrupted = scan.collect_http(manifest, self.root, self.args(), control, Mock())
+        self.assertTrue(interrupted)
+        control.stop.assert_called_once()
+        self.assertEqual(manifest["http_collection"]["status"], "INTERRUPTED")
 
     def args(self, *options):
         return scan.parser().parse_args([str(item) for item in options])
@@ -371,7 +416,8 @@ class CampaignInputTests(unittest.TestCase):
         self.assertEqual(command[-1], "2001:db8::10")
         self.assertIn("-6", command)
         self.assertNotIn("--resolve-all", command)
-        self.assertEqual(command[command.index("--script-timeout") + 1], "22s")
+        self.assertIn("-sV", command)
+        self.assertNotIn("--script", command)
 
     def test_dns_normal_absence_of_aaaa_is_not_partial_failure(self):
         payload = {"addresses": ["93.184.216.34"], "families": {

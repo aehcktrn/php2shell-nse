@@ -2,18 +2,22 @@ local http = require "http"
 local nmap = require "nmap"
 local shortport = require "shortport"
 local stdnse = require "stdnse"
+local openssl = require "openssl"
 
 description = [[
 Assesses possible exposure to PHP2Shell (CVE-2026-109618 and CVE-2026-109619)
-from PHP versions advertised in the Server and X-Powered-By HTTP headers.
+from PHP versions published in Server/X-Powered-By headers or a strictly
+recognized phpinfo HTML diagnostic already encountered by ordinary requests.
 
 This is a version-based assessment, not an exploit or a confirmation that the
 running service is vulnerable, patched, or compromised. Vendor backports are
 not verified. Missing, conflicting, or unrecognized versions produce UNKNOWN.
 
 The script makes a bounded sequence of ordinary GET requests. It can try
-/index.php, follow redirects within the same origin, then sample safe-looking
-same-origin pages linked by the returned HTML. It does not brute-force paths,
+/index.php, follow redirects within the same origin, then sample at most two
+admissible same-origin links only when no usable version was obtained. Link
+sampling is nonrecursive and rejects queries and action/download paths.
+It does not brute-force paths,
 submit forms or credentials, trigger memory exhaustion, or execute code. HTTP
 and HTTPS use Nmap's HTTP library.
 
@@ -48,6 +52,14 @@ https://www.php.net/
 -- @args http-php2shell.redirects Same-origin redirect limit per path, 0..5
 --   (default: 2). Other hosts, schemes and ports are never followed.
 -- @args http-php2shell.samples Observations per supplied path, 1..3 (default: 1).
+-- @args http-php2shell.scheme Internal strict transport: http or https.
+-- @args http-php2shell.phase Internal launcher phase: base, redirect or links.
+--   A managed base defers redirects; links never generate new candidates.
+-- @args http-php2shell.fallback Enable standalone /index.php fallback (default: true).
+-- @args http-php2shell.enrich Enable standalone optional links (default: true).
+-- @args http-php2shell.chain_hops Redirect depth inherited from the launcher.
+-- @args http-php2shell.private_plan Existing restricted launcher-owned file
+--   for exact redirect destinations. Never include it in public artifacts.
 -- @args http.useragent User-Agent sent with HTTP requests. The default identifies
 --   php2shell-scanner; an empty string disables the header.
 --
@@ -87,10 +99,12 @@ local POTENTIAL = "POTENTIALLY_VULNERABLE"
 local PATCHED = "PATCHED_VERSION_ADVERTISED"
 local UNKNOWN = "UNKNOWN"
 local FIXES = {[2] = 35, [3] = 36, [4] = 27, [5] = 12}
-local DEFAULT_USER_AGENT = "php2shell-scanner/0.5.4 http-php2shell/0.3.4 (+https://github.com/aehcktrn/php2shell-scanner)"
+local DEFAULT_USER_AGENT = "php2shell-scanner/0.6.0 http-php2shell/0.4.0 (+https://github.com/aehcktrn/php2shell-scanner)"
 local MAX_HEADER_BYTES = 8192
 local MAX_EVIDENCE = 32
 local MAX_CRAWL_CANDIDATES = 32
+local MAX_EXAMINED_ANCHORS = 128
+local MAX_BODY_BYTES = 65536
 -- RFC HTTP product-token characters. A fragment of Not-PHP or Not.PHP is
 -- not a PHP product. Percent and hyphen are escaped for Lua character sets.
 local PRODUCT_TOKEN = "[!#$%%&'*+%.%^_`|~%w%-]+"
@@ -98,9 +112,9 @@ local PRODUCT_TOKEN = "[!#$%%&'*+%.%^_`|~%w%-]+"
 local function output()
   local result = stdnse.output_table()
   result.state = UNKNOWN
-  result.detection_method = "HTTP response headers (version-based)"
+  result.detection_method = "Published HTTP headers and structured phpinfo (version-based)"
   result.exploitability = "NOT_TESTED"
-  result.script_version = "0.3.4"
+  result.script_version = "0.4.0"
   result.schema_version = "1"
   result.advisory_date = "2026-10-21"
   result.cves = {"CVE-2026-109618", "CVE-2026-109619"}
@@ -108,11 +122,13 @@ local function output()
   result.evidence = {}
   result.observations = {}
   result.discovered_paths = {}
+  result.candidate_paths = {}
   result.requests_made = 0
   result.budget_exhausted = false
   result.traversal_complete = false
   result.notes = {
     "Headers are untrusted and can be hidden, altered, cached, or supplied by a proxy.",
+    "Structured phpinfo is a published version, not authenticated runtime or patch evidence.",
     "Vendor backports are not verified; check the package/build used by the running web workers.",
     "HTML links are sampled within the same origin only; no path dictionary or form submission is used."
   }
@@ -325,7 +341,8 @@ local function parameters()
   end
   local args = {path = path, paths = {path}}
   for _, spec in ipairs({{"timeout", 5000, 1, 60000}, {"budget", 20000, 1, 60000},
-      {"max_requests", 5, 1, 20}, {"redirects", 2, 0, 5}, {"samples", 1, 1, 3}}) do
+      {"max_requests", 5, 1, 20}, {"redirects", 2, 0, 5}, {"samples", 1, 1, 3},
+      {"chain_hops", 0, 0, 5}}) do
     local value = stdnse.get_script_args(PREFIX .. "." .. spec[1])
     if value == nil then value = spec[2] end
     if type(value) ~= "string" and type(value) ~= "number" then
@@ -336,6 +353,26 @@ local function parameters()
       return nil, "Invalid " .. spec[1] .. ": expected an integer between " .. spec[3] .. " and " .. spec[4] .. "."
     end
     args[spec[1]] = value
+  end
+  args.phase = stdnse.get_script_args(PREFIX .. ".phase") or "standalone"
+  if args.phase ~= "standalone" and args.phase ~= "base" and args.phase ~= "redirect"
+      and args.phase ~= "links" then return nil, "Invalid collection phase." end
+  args.scheme = stdnse.get_script_args(PREFIX .. ".scheme")
+  if args.scheme ~= nil and args.scheme ~= "http" and args.scheme ~= "https" then
+    return nil, "Invalid scheme: expected http or https."
+  end
+  for _, key in ipairs({"fallback", "enrich"}) do
+    local value = stdnse.get_script_args(PREFIX .. "." .. key)
+    if value == nil then value = true end
+    if value == true or value == "true" then args[key] = true
+    elseif value == false or value == "false" then args[key] = false
+    else return nil, "Invalid " .. key .. ": expected true or false." end
+  end
+  args.private_plan = stdnse.get_script_args(PREFIX .. ".private_plan")
+  if args.private_plan ~= nil and (type(args.private_plan) ~= "string"
+      or args.private_plan:sub(1, 1) ~= "/" or #args.private_plan > 4096
+      or args.private_plan:find("[%c]")) then
+    return nil, "Invalid private redirect transport path."
   end
   local extra = stdnse.get_script_args(PREFIX .. ".paths")
   if extra ~= nil then
@@ -372,6 +409,81 @@ local function parameters()
   end
   args.useragent = useragent
   return args
+end
+
+local function header_value(response, wanted)
+  local value = (response.header or {})[wanted]
+  if type(value) == "table" then value = value[1] end
+  if type(value) == "string" then return value end
+  for _, line in ipairs(response.rawheader or {}) do
+    if type(line) == "string" then
+      local name, item = line:match("^([^:]+):%s*(.*)$")
+      if name and name:lower() == wanted then return item end
+    end
+  end
+  return nil
+end
+
+-- Nmap decodes supported Content-Encoding values under max_body_size. Never
+-- inspect unsupported or partially decoded bytes, and impose our own ceiling
+-- as well so callers/stubs cannot accidentally bypass the decoded-size bound.
+local function bounded_html(response)
+  if type(response.body) ~= "string" or #response.body == 0 then return nil end
+  if response.truncated or #response.body > MAX_BODY_BYTES then return nil, "BODY_TRUNCATED" end
+  if response.undecoded and #response.undecoded > 0 then return nil, "BODY_ENCODING_UNSUPPORTED" end
+  -- rawheader preserves the original Content-Encoding even after Nmap has
+  -- decoded it; only the remaining normalized encoding denotes raw bytes.
+  local encoding = (response.header or {})["content-encoding"]
+  if type(encoding) == "table" then encoding = encoding[1] end
+  if not encoding and not response.decoded then encoding = header_value(response, "content-encoding") end
+  if encoding and encoding:lower() ~= "identity" then return nil, "BODY_ENCODING_UNSUPPORTED" end
+  local content_type = header_value(response, "content-type")
+  if content_type and not content_type:lower():find("text/html", 1, true)
+      and not content_type:lower():find("application/xhtml+xml", 1, true) then return nil end
+  return response.body
+end
+
+local function phpinfo_versions(response)
+  local body, limit = bounded_html(response)
+  if not body then return {}, limit end
+  local html = body:lower():gsub("<!%-%-.-%-%->", "")
+    :gsub("<script[%s>].-</script%s*>", "")
+    :gsub("<style[%s>].-</style%s*>", "")
+    :gsub("<pre[%s>].-</pre%s*>", "")
+    :gsub("<code[%s>].-</code%s*>", "")
+  local head = html:match("<head[%s>].-</head%s*>")
+  local title = head and head:match("<title[^>]*>%s*(.-)%s*</title%s*>")
+  -- Require the document's own phpinfo title and several coherent markers of
+  -- its general configuration table. Documentation and extension-version
+  -- mentions elsewhere in the body cannot establish a main PHP version.
+  if not title or not (title:match("^php%s+[^<>]+%s+%-%s+phpinfo%(%)$")
+      or title == "phpinfo()") then return {} end
+  local general = html:match("^(.-)<h2[%s>]") or html
+  if not general:find("<table[%s>]") or not general:find("class%s*=%s*['\"]e['\"]")
+      or not general:find("class%s*=%s*['\"]v['\"]") then return {} end
+  local general_markers = 0
+  for _, label in ipairs({"system", "build date", "server api", "configuration file %(php.ini%) path"}) do
+    if general:find(">%s*" .. label .. "%s*</td%s*>") then general_markers = general_markers + 1 end
+  end
+  if general_markers < 2 then return {} end
+  local versions, seen = {}, {}
+  local function add(value)
+    if value and #value <= 128 and value:match("^%d+%.%d+%.%d+[%w%.+~_-]*$")
+        and not seen[value] then
+      seen[value] = true
+      versions[#versions + 1] = value
+    end
+  end
+  add(title:match("^php%s+([^%s<>]+)%s+%-%s+phpinfo%(%)$"))
+  for heading in general:gmatch("<h1[^>]*>%s*(.-)%s*</h1%s*>") do
+    add(heading:match("^php version%s+([^%s<>]+)$"))
+  end
+  -- Only a PHP Version row in the general section (before a module heading)
+  -- is eligible. Zend/OpenSSL/module versions are deliberately never parsed.
+  for value in general:gmatch("<td[^>]*>%s*php version%s*</td%s*>%s*<td[^>]*>%s*([^<>]-)%s*</td%s*>") do
+    add(value)
+  end
+  return versions
 end
 
 local function extract(response, result)
@@ -427,6 +539,18 @@ local function extract(response, result)
       inspect(name, value)
     end
   end
+  local diagnostic, body_limit = phpinfo_versions(response)
+  result.body_detection_limit = body_limit
+  for _, token in ipairs(diagnostic) do
+    php_seen = true
+    inspect("phpinfo-structured", "PHP/" .. token)
+  end
+  -- Session cookie names and a .php path are only presence hints. Cookie
+  -- values and bodies are never retained in observations or human output.
+  local cookie = header_value(response, "set-cookie") or ""
+  if cookie:match("^[%s]*PHPSESSID%s*=") then
+    result.php_presence_hint = "PHPSESSID cookie name (not a version)"
+  end
   result.php_detected = php_seen and "YES" or "UNKNOWN"
   if evidence_limited then
     result.reason = "Header evidence exceeded interpretation limits; verify the service directly."
@@ -443,7 +567,7 @@ local function extract(response, result)
     result.reason = "PHP is advertised without a usable version; patch status is indeterminate."
     result.reason_code = "PHP_VERSION_HIDDEN"
   else
-    result.reason = "No PHP version advertised in Server or X-Powered-By; PHP may still be present."
+    result.reason = "No explicit PHP version in selected headers or recognized phpinfo; PHP may still be present."
     result.reason_code = "PHP_NOT_IDENTIFIED"
   end
 end
@@ -451,6 +575,22 @@ end
 -- Query values can contain session tokens; keep only the path in reports.
 local function public_path(path)
   return path:find("?", 1, true) and (path:match("^[^?]*") .. "?[redacted]") or path
+end
+
+local function url_origin(scheme, name, number)
+  name = name:lower():gsub("%.$", "")
+  if name:find(":", 1, true) then name = "[" .. name .. "]" end
+  return scheme .. "://" .. name .. ":" .. number
+end
+
+local function identity(value)
+  return (openssl.digest("sha256", value):gsub(".", function(byte)
+    return string.format("%02x", byte:byte())
+  end))
+end
+
+local function path_identity(scheme, name, number, path)
+  return identity(url_origin(scheme, name, number) .. path)
 end
 
 local function initial_scheme(port)
@@ -462,14 +602,24 @@ end
 
 local function normalized_path(path)
   local pathname, query = path:match("^([^?]*)(.*)$")
-  local segments = {}
-  for segment in pathname:gmatch("[^/]+") do
-    if segment == ".." then table.remove(segments)
-    elseif segment ~= "." then segments[#segments + 1] = segment end
+  local result = ""
+  -- RFC 3986 remove-dot-segments, preserving meaningful repeated slashes and
+  -- the untouched query. Only relative references require this resolution.
+  while pathname ~= "" do
+    if pathname:sub(1, 3) == "../" then pathname = pathname:sub(4)
+    elseif pathname:sub(1, 2) == "./" then pathname = pathname:sub(3)
+    elseif pathname:sub(1, 3) == "/./" then pathname = pathname:sub(3)
+    elseif pathname == "/." then pathname = "/"
+    elseif pathname:sub(1, 4) == "/../" then
+      pathname = pathname:sub(4); result = result:gsub("/[^/]*$", "")
+    elseif pathname == "/.." then pathname = "/"; result = result:gsub("/[^/]*$", "")
+    elseif pathname == "." or pathname == ".." then pathname = ""
+    else
+      local segment = pathname:match("^/?[^/]*")
+      result, pathname = result .. segment, pathname:sub(#segment + 1)
+    end
   end
-  local normalized = "/" .. table.concat(segments, "/")
-  if pathname:sub(-1) == "/" and normalized ~= "/" then normalized = normalized .. "/" end
-  return normalized .. query
+  return result .. query
 end
 
 -- Returns a local path only after checking scheme, hostname and port. The
@@ -501,19 +651,22 @@ local function redirect_path(location, current_path, name, scheme, number)
       or (target_scheme == "https" and 443 or 80)
     if target_port < 1 or target_port > 65535 then return nil, "Invalid redirect port." end
     if path == "" then path = "/" elseif path:sub(1, 1) == "?" then path = "/" .. path end
+    if not valid_path(path) then return nil, "Invalid redirect path." end
     local destination = target_scheme .. "://" .. authority .. public_path(path)
+    local raw_destination = url_origin(target_scheme, target_name, target_port) .. path
     if target_scheme ~= scheme or target_name ~= name:lower():gsub("%.$", "") or target_port ~= number then
-      return nil, "Redirect leaves the current origin.", destination
+      return nil, "Redirect leaves the current origin.", destination, raw_destination
     end
+    return path, nil, destination, raw_destination
   elseif location:match("^%a[%w+.-]*:") then
     return nil, "Redirect uses an unsupported or ambiguous scheme."
   else
     if location:sub(1, 1) == "/" then path = location
     elseif location:sub(1, 1) == "?" then path = current_path:match("^[^?]*") .. location
-    else path = (current_path:match("^[^?]*"):match("^(.*/)") or "/") .. location end
+    else path = normalized_path((current_path:match("^[^?]*"):match("^(.*/)") or "/") .. location) end
   end
   if not valid_path(path) then return nil, "Invalid redirect path." end
-  return normalized_path(path), nil, public_path(path)
+  return path, nil, public_path(path), url_origin(scheme, name, number) .. path
 end
 
 local STATIC_EXTENSIONS = {
@@ -528,30 +681,20 @@ local STATIC_EXTENSIONS = {
 }
 local UNSAFE_LINK_MARKERS = {
   "logout", "logoff", "signout", "delete", "remove", "destroy",
-  "unsubscribe", "deactivate", "reset", "confirm", "activate",
+  "unsubscribe", "deactivate", "reset", "confirm", "activate", "download", "export",
+  "update", "modify", "edit", "create", "insert", "save", "submit", "upload",
+  "checkout", "purchase", "payment", "action", "execute", "command",
 }
-
-local function header_value(response, wanted)
-  local value = (response.header or {})[wanted]
-  if type(value) == "table" then value = value[1] end
-  if type(value) == "string" then return value end
-  for _, line in ipairs(response.rawheader or {}) do
-    if type(line) == "string" then
-      local name, item = line:match("^([^:]+):%s*(.*)$")
-      if name and name:lower() == wanted then return item end
-    end
-  end
-  return nil
-end
 
 local function safe_link_path(value, current_path, name, scheme, number)
   if type(value) ~= "string" then return nil end
   value = value:gsub("^%s+", ""):gsub("%s+$", ""):gsub("&amp;", "&")
+  -- A query-bearing URL is a different resource; never turn it into an
+  -- invented query-free request. Refuse all entity escapes as ambiguous.
+  if value:find("?", 1, true) or value:find("&", 1, true) then return nil end
   local path = redirect_path(value, current_path, name, scheme, number)
   if not path then return nil end
-  -- Query strings can carry secrets or state-changing actions. The page path
-  -- remains useful for a version header without replaying those values.
-  path = path:match("^[^?]*")
+  if path:find("?", 1, true) then return nil end
   if not valid_path(path) or path == "" then return nil end
   -- Inspect decoded path characters as well: servers can interpret %64elete
   -- (or nested escapes) exactly like a literal state-changing route.
@@ -563,8 +706,11 @@ local function safe_link_path(value, current_path, name, scheme, number)
     if next_path == decoded then break end
     decoded = next_path
   end
-  if decoded:find("%%%x%x") or not valid_path(decoded) then return nil end
+  if decoded:find("%", 1, true) or not valid_path(decoded) then return nil end
   local lower = decoded:lower()
+  if lower:find("?", 1, true) or lower:find("#", 1, true)
+      or lower:find(";", 1, true) or lower:find("=", 1, true)
+      or lower:find("&", 1, true) then return nil end
   for _, marker in ipairs(UNSAFE_LINK_MARKERS) do
     if lower:find(marker, 1, true) then return nil end
   end
@@ -573,19 +719,20 @@ local function safe_link_path(value, current_path, name, scheme, number)
   return path
 end
 
-local function linked_paths(response, current_path, name, scheme, number)
-  if type(response) ~= "table" or type(response.body) ~= "string"
-      or #response.body == 0 then return {} end
+local function linked_paths(response, current_path, name, scheme, number, examination_limit)
+  if type(response) ~= "table" then return {}, 0 end
   local status = tonumber(response.status)
-  if not status or status < 200 or status >= 300 then return {} end
-  local content_type = header_value(response, "content-type")
-  if content_type and not content_type:lower():find("text/html", 1, true)
-      and not content_type:lower():find("application/xhtml+xml", 1, true) then
-    return {}
-  end
-  local result, seen = {}, {}
+  if not status or status < 200 or status >= 300 then return {}, 0 end
+  local body = bounded_html(response)
+  if not body then return {}, 0 end
+  local result, seen, examined = {}, {}, 0
+  local base_present = body:find("<[bB][aA][sS][eE][%s>]") ~= nil
   local function add(value)
     if #result >= MAX_CRAWL_CANDIDATES then return end
+    -- Do not reinterpret a document's relative URL under a guessed base.
+    -- Only explicit absolute references remain independent of that base.
+    if base_present and type(value) == "string"
+        and not value:lower():match("^https?://") then return end
     local path = safe_link_path(value, current_path, name, scheme, number)
     if path and not seen[path] then
       seen[path] = true
@@ -595,13 +742,17 @@ local function linked_paths(response, current_path, name, scheme, number)
   -- Only real anchor attributes are navigation links. Ignore comments and
   -- script/style examples; parse attribute values so data-href or href-like
   -- text inside a quoted attribute cannot become a request.
-  local html = response.body:gsub("<!%-%-.-%-%->", "")
+  local html = body:gsub("<!%-%-.-%-%->", "")
     :gsub("<[sS][cC][rR][iI][pP][tT][%s>].-</[sS][cC][rR][iI][pP][tT]%s*>", "")
     :gsub("<[sS][tT][yY][lL][eE][%s>].-</[sS][tT][yY][lL][eE]%s*>", "")
+    :gsub("<[fF][oO][rR][mM][%s>].-</[fF][oO][rR][mM]%s*>", "")
+  -- An unterminated form is not a source of navigation candidates either.
+  html = html:gsub("<[fF][oO][rR][mM][%s>].*$", "")
   local cursor = 1
-  while #result < MAX_CRAWL_CANDIDATES do
+  while #result < MAX_CRAWL_CANDIDATES and examined < (examination_limit or MAX_EXAMINED_ANCHORS) do
     local _, first = html:find("<[aA]%s", cursor)
     if not first then break end
+    examined = examined + 1
     local last, quote = first + 1, nil
     while last <= #html do
       local character = html:sub(last, last)
@@ -613,6 +764,7 @@ local function linked_paths(response, current_path, name, scheme, number)
     end
     if last > #html then break end
     local attributes, position = html:sub(first + 1, last - 1), 1
+    local href, forbidden = nil, false
     while position <= #attributes do
       local whitespace = attributes:match("^%s*", position) or ""
       position = position + #whitespace
@@ -636,8 +788,14 @@ local function linked_paths(response, current_path, name, scheme, number)
           position = position + #value
         end
       end
-      if attribute:lower() == "href" then add(value); break end
+      attribute = attribute:lower()
+      if attribute == "href" then
+        if href ~= nil then forbidden = true end
+        href = value
+      elseif attribute == "download" or attribute == "onclick" or attribute == "onmousedown"
+          or attribute == "formaction" then forbidden = true end
     end
+    if not forbidden then add(href) end
     cursor = last + 1
   end
   -- Prefer explicit PHP pages, while still sampling extensionless routes that
@@ -650,7 +808,7 @@ local function linked_paths(response, current_path, name, scheme, number)
     if left_php ~= right_php then return left_php end
     return left < right
   end)
-  return result
+  return result, examined
 end
 
 local function location_header(response)
@@ -696,12 +854,27 @@ action = function(host, port)
   for key, value in pairs(host) do request_host[key] = value end
   local name = args.vhost or valid_vhost(host.targetname) or valid_vhost(host.name) or host.ip
   request_host.targetname = name
+  local scheme = args.scheme or initial_scheme(port)
+  if args.phase == "links" then
+    if #args.paths > 2 or args.samples ~= 1 then
+      result.reason_code, result.reason = "INVALID_ARGUMENT", "Managed enrichment is limited to two links and one sample."
+      return finish(result)
+    end
+    for _, path in ipairs(args.paths) do
+      if not safe_link_path(path, "/", name, scheme, port.number) then
+        result.reason_code, result.reason = "INVALID_ARGUMENT", "Managed enrichment path is not admissible."
+        return finish(result)
+      end
+    end
+  end
   local host_field = name:find(":", 1, true) and ("[" .. name .. "]") or name
-  if port.number ~= 80 and port.number ~= 443 then host_field = host_field .. ":" .. port.number end
+  if port.number ~= (scheme == "https" and 443 or 80) then host_field = host_field .. ":" .. port.number end
   local headers = {["Accept-Encoding"] = "identity", Host = host_field}
   if args.useragent ~= "" then headers["User-Agent"] = args.useragent end
   result.vhost, result.http_host, result.path = name, host_field, public_path(args.path)
-  result.ip, result.port, result.scheme = host.ip, port.number, initial_scheme(port)
+  result.ip, result.port, result.scheme = host.ip, port.number, scheme
+  result.collection_phase = args.phase == "standalone" and "base" or args.phase
+  result.candidates_examined, result.enrichment_requests = 0, 0
   result.tls_sni = result.scheme == "https" and name ~= host.ip and name or ""
   local start, previous_clock = nmap.clock_ms(), nil
   local clock_changed, stopped, evidence_limited, actionable = false, false, false, false
@@ -712,6 +885,18 @@ action = function(host, port)
   local visited_paths, queued_paths, crawl_queue = {}, {}, {}
   local crawl_halted = false
   local crawl_gap_code, crawl_gap_reason
+  local standalone_redirect_gap_code, standalone_redirect_gap_reason
+  local private_file
+  if args.private_plan then
+    -- The launcher owns permissions, symlink checks and durable storage. Read
+    -- first so a typo never silently creates a less restricted new file.
+    local existing = io.open(args.private_plan, "r")
+    if existing then existing:close(); private_file = io.open(args.private_plan, "a") end
+    if not private_file then
+      result.reason_code, result.reason = "INVALID_ARGUMENT", "Private redirect transport is unavailable."
+      return finish(result)
+    end
+  end
 
   local function crawl_gap(observation, code, reason)
     crawl_halted = true
@@ -722,7 +907,10 @@ action = function(host, port)
   end
 
   local function enqueue_links(response, current_path, scheme)
-    for _, path in ipairs(linked_paths(response, current_path, name, scheme, port.number)) do
+    local candidates, examined = linked_paths(response, current_path, name, scheme, port.number,
+      MAX_EXAMINED_ANCHORS - result.candidates_examined)
+    result.candidates_examined = math.min(MAX_EXAMINED_ANCHORS, result.candidates_examined + examined)
+    for _, path in ipairs(candidates) do
       if #result.discovered_paths >= MAX_CRAWL_CANDIDATES then
         result.crawl_truncated = true
         break
@@ -731,6 +919,7 @@ action = function(host, port)
         queued_paths[path] = true
         crawl_queue[#crawl_queue + 1] = path
         result.discovered_paths[#result.discovered_paths + 1] = public_path(path)
+        result.candidate_paths[#result.candidate_paths + 1] = path
       end
     end
   end
@@ -742,12 +931,16 @@ action = function(host, port)
       return 0
     end
     previous_clock = now
-    result.elapsed_ms = math.max(0, now - start)
+    result.elapsed_ms = math.ceil(math.max(0, now - start))
     return args.budget - result.elapsed_ms
   end
 
-  local function observe(path, sample, optional)
+  local function observe(path, sample, optional, phase, hops)
     local left = remaining()
+    if optional and result.enrichment_requests >= 2 then
+      result.crawl_truncated = true
+      return nil
+    end
     if left <= 0 or result.requests_made >= args.max_requests then
       if optional then result.crawl_truncated = true else result.budget_exhausted = true end
       return nil
@@ -757,25 +950,35 @@ action = function(host, port)
     observation.path, observation.ip, observation.port = public_path(path), host.ip, port.number
     observation.vhost, observation.http_host = name, host_field
     observation.scheme, observation.tls_sni = result.scheme, result.tls_sni
+    observation.collection_phase = phase
+    observation.chain_hops = hops
+    observation.timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
     observation.sample = sample
     if optional then observation.optional_crawl = true end
     observation.state, observation.versions, observation.evidence = UNKNOWN, {}, {}
     observation.reason_code, observation.reason = "NO_HTTP_RESPONSE", "No complete HTTP response was received."
     result.requests_made = result.requests_made + 1
+    if optional then result.enrichment_requests = result.enrichment_requests + 1 end
     observation.request_number = result.requests_made
     local response = http.get(request_host, port, path, {
       header = headers, timeout = math.max(1, math.min(args.timeout, left)),
       redirect_ok = false, bypass_cache = true, no_cache = true,
       max_body_size = 65536, truncated_ok = true,
+      scheme = args.scheme,
     })
     if type(response) == "table" and tonumber(response.status) then
       observation.http_status = tonumber(response.status)
-      if response.ssl ~= nil then observation.scheme = response.ssl and "https" or "http" end
+      -- With strict options.scheme, Nmap's opencon path can omit its SSL
+      -- return marker and report response.ssl=false after successful TLS.
+      -- The explicitly selected transport remains authoritative in that case.
+      if args.scheme == nil and response.ssl ~= nil then
+        observation.scheme = response.ssl and "https" or "http"
+      end
       observation.tls_sni = observation.scheme == "https" and name ~= host.ip and name or ""
       result.scheme, result.tls_sni = observation.scheme, observation.tls_sni
       result.http_status = observation.http_status
       extract(response, observation)
-      enqueue_links(response, path, observation.scheme)
+      if not optional and phase == "base" then enqueue_links(response, path, observation.scheme) end
       if HTTP_REASONS[observation.http_status] then
         observation.http_condition = HTTP_REASONS[observation.http_status][1]
         local condition_code, condition_reason = table.unpack(HTTP_REASONS[observation.http_status])
@@ -804,6 +1007,10 @@ action = function(host, port)
         stop_code, stop_reason, stop_unassessed = observation.reason_code, observation.reason, true
       end
     end
+    observation.path_identity = path_identity(observation.scheme, name, port.number, path)
+    if not observation.php_presence_hint and path:lower():match("%.php[%d]?[%/?]?") then
+      observation.php_presence_hint = ".php path (not a version)"
+    end
     if observation.php_detected == "YES" then result.php_detected = "YES" end
     if observation.reason_code == "EVIDENCE_LIMIT_REACHED" then evidence_limited = true end
     local retained = {}
@@ -813,6 +1020,10 @@ action = function(host, port)
       item.scheme, item.vhost = observation.scheme, name
       item.http_host, item.tls_sni = host_field, observation.tls_sni
       item.http_status, item.request_number = observation.http_status, observation.request_number
+      item.path_identity, item.timestamp = observation.path_identity, observation.timestamp
+      item.collection_phase = phase
+      item.method = item.source == "phpinfo-structured" and "structured phpinfo HTML (published version)"
+        or "HTTP response header (published version)"
       actionable = actionable or item.state == POTENTIAL or item.state == PATCHED
       retained[#retained + 1], result.evidence[#result.evidence + 1] = item, item
       if not seen_versions[item.version:lower()] then
@@ -829,24 +1040,37 @@ action = function(host, port)
     return observation, response
   end
 
-  local function visit(path, sample, optional)
+  local function visit(path, sample, optional, inherited_hops)
     if not optional then started_visits = started_visits + 1 end
-    local visited, redirects = {}, 0
+    local visited, redirects = {}, inherited_hops or args.chain_hops
+    local phase = optional and "links" or result.collection_phase
     while not stopped do
       if visited[path] then
         last_code, last_reason = "REDIRECT_LIMIT_REACHED", "A redirect loop was detected."
         break
       end
       visited[path] = true
-      local observation, response = observe(path, sample, optional)
+      local observation, response = observe(path, sample, optional, phase, redirects)
       if not observation then break end
       local status = observation.http_status
-      if not status or status < 300 or status >= 400 or status == 304 then return path end
-      local destination, why, safe_destination = redirect_path(location_header(response), path, name, observation.scheme, port.number)
+      if not status or status < 300 or status >= 400 or status == 304 then return path, redirects end
+      local destination, why, safe_destination, raw_destination = redirect_path(location_header(response), path, name, observation.scheme, port.number)
       observation.redirect_to = safe_destination
+      observation.redirect_hops = redirects + 1
+      if raw_destination then
+        observation.redirect_identity = identity(raw_destination)
+        if private_file then
+          local ok = private_file:write(observation.path_identity, "\t", observation.redirect_identity,
+            "\t", raw_destination, "\t", tostring(observation.redirect_hops), "\n")
+          if not ok or not private_file:flush() then result.private_plan_error = true end
+        end
+      end
       if optional and destination then
-        destination = safe_link_path(destination, path, name, observation.scheme, port.number)
-        if not destination then why = "Linked-page redirect destination was excluded by the safe-link rules." end
+        if not safe_link_path(destination, path, name, observation.scheme, port.number) then
+          destination = nil
+          observation.redirect_policy = "OPTIONAL_LINK_EXCLUDED"
+          why = "Linked-page redirect destination was excluded by the safe-link rules."
+        end
       end
       if not destination then
         observation.redirect_followed = false
@@ -858,8 +1082,19 @@ action = function(host, port)
           observation.reason_code, observation.reason = "REDIRECT_NOT_ASSESSED", why
         end
         last_code, last_reason = observation.reason_code, observation.reason
-        if optional then crawl_gap(observation, "REDIRECT_NOT_ASSESSED", why) end
-        return path
+        if optional then crawl_gap(observation, "REDIRECT_NOT_ASSESSED", why)
+        elseif args.phase == "standalone" then
+          standalone_redirect_gap_code, standalone_redirect_gap_reason = "REDIRECT_NOT_ASSESSED", why
+        end
+        return path, redirects
+      end
+      if args.phase == "base" then
+        observation.redirect_followed = false
+        observation.redirect_reason = "Exact destination deferred to the managed redirect phase."
+        if observation.state == UNKNOWN and #observation.versions == 0 then
+          observation.reason_code, observation.reason = "REDIRECT_NOT_ASSESSED", observation.redirect_reason
+        end
+        return path, redirects
       end
       if redirects >= args.redirects or visited[destination] then
         observation.redirect_followed = false
@@ -869,45 +1104,56 @@ action = function(host, port)
           observation.reason_code, observation.reason = last_code, last_reason
         end
         if optional then crawl_gap(observation, "REDIRECT_LIMIT_REACHED", observation.redirect_reason) end
-        return path
+        return path, redirects
+      end
+      if optional and result.enrichment_requests >= 2 then
+        observation.redirect_followed = false
+        observation.redirect_reason = "The two-GET optional enrichment limit was reached."
+        result.crawl_truncated = true
+        crawl_gap(observation, "REDIRECT_NOT_ASSESSED", observation.redirect_reason)
+        return path, redirects
       end
       if result.budget_exhausted or result.requests_made >= args.max_requests then
         if optional then result.crawl_truncated = true else result.budget_exhausted = true end
         observation.redirect_followed = false
-        return path
+        return path, redirects
       end
       observation.redirect_followed = true
       redirects = redirects + 1
       path = destination
+      if not optional then phase = "redirect" end
     end
-    return path
+    return path, redirects
   end
 
   for _, path in ipairs(args.paths) do
-    if stopped or result.budget_exhausted then break end
+    if stopped or result.budget_exhausted or (args.phase == "links" and (crawl_halted or actionable)) then break end
     visited_paths[path] = true
-    local final_path = visit(path, 1)
+    local final_path, final_hops = visit(path, 1, args.phase == "links")
     for sample = 2, args.samples do
       if stopped or result.budget_exhausted then break end
-      visit(final_path, sample)
+      visit(final_path, sample, args.phase == "links", final_hops)
     end
   end
-  if not stopped and not result.budget_exhausted and not actionable and not visited_paths["/index.php"] then
+  if args.fallback and args.phase == "standalone" and not stopped and not result.budget_exhausted
+      and not actionable and not visited_paths["/index.php"] then
     planned_visits = planned_visits + args.samples
-    local final_path = visit("/index.php", 1)
+    local final_path, final_hops = visit("/index.php", 1)
     for sample = 2, args.samples do
       if stopped or result.budget_exhausted then break end
-      visit(final_path, sample)
+      visit(final_path, sample, false, final_hops)
     end
   end
 
   -- Sample only links that the application exposed in returned HTML. This is
   -- intentionally not path brute force and never submits forms or query data.
-  while not stopped and not crawl_halted and #crawl_queue > 0
+  local enriched = 0
+  while args.phase == "standalone" and args.enrich and not actionable and enriched < 2
+      and not stopped and not crawl_halted and #crawl_queue > 0
       and result.requests_made < args.max_requests and remaining() > 0 do
     local path = table.remove(crawl_queue, 1)
     queued_paths[path] = nil
-    if not visited_paths[path] then visit(path, 1, true) end
+    if not visited_paths[path] then enriched = enriched + 1; visit(path, 1, true) end
   end
   if #crawl_queue > 0 then result.crawl_truncated = true end
   if #result.discovered_paths > 0 then
@@ -918,11 +1164,17 @@ action = function(host, port)
   end
 
   remaining()
+  if private_file then private_file:close() end
+  result.candidate_count = #result.candidate_paths
   -- A version obtained before a denied/unreachable path must not hide that
   -- path, nor any remaining explicitly requested paths or repeated samples.
   -- A version-bearing denied response can remain an observation when it is
   -- the only requested visit; it cannot stand in for skipped visits.
   local interrupted = stopped and (stop_unassessed or started_visits < planned_visits)
+  if standalone_redirect_gap_code then
+    interrupted = true
+    stop_code, stop_reason = standalone_redirect_gap_code, standalone_redirect_gap_reason
+  end
   if crawl_gap_code then
     interrupted = true
     stop_code, stop_reason = crawl_gap_code, crawl_gap_reason

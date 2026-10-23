@@ -16,6 +16,7 @@ else:
 
 SCHEMA_VERSION = "1"
 MAX_EVENT_BYTES = 64 * 1024 * 1024
+EVENT_KINDS = {"dns", "endpoint", "discovery", "http_service", "http_collection"}
 
 
 class StateError(ValueError):
@@ -86,8 +87,10 @@ class EventLedger:
         self.events_written = 0
 
     def append(self, kind: str, key: str, value: dict[str, Any]) -> None:
-        if kind not in ("dns", "endpoint", "discovery") or not isinstance(key, str) or not key:
+        if (kind not in EVENT_KINDS or not isinstance(key, str) or not key
+                or not isinstance(value, dict)):
             raise StateError("Événement de campagne invalide.")
+        self._validate_http_record(kind, key, value)
         record = {"schema_version": SCHEMA_VERSION, "kind": kind, "key": key,
                   "value": value}
         encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":"),
@@ -95,8 +98,11 @@ class EventLedger:
         if len(encoded) > MAX_EVENT_BYTES:
             raise StateError("Événement de campagne trop volumineux.")
         with self._lock:
-            descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
             try:
+                prefix = self._repair_partial_tail(descriptor)
+                if prefix:
+                    encoded = prefix + encoded
                 remaining = memoryview(encoded)
                 while remaining:
                     written = os.write(descriptor, remaining)
@@ -109,8 +115,73 @@ class EventLedger:
             self.bytes_written += len(encoded)
             self.events_written += 1
 
+    @staticmethod
+    def _validate_http_record(kind: str, key: str, value: dict[str, Any]) -> None:
+        # Local import keeps the accounting module independent of ledger internals.
+        if kind in ("http_service", "http_collection"):
+            from service_budget import validate_collection_record, validate_service_record
+            validator = (validate_service_record if kind == "http_service"
+                         else validate_collection_record)
+            validator(key, value)
+
+    @classmethod
+    def _repair_partial_tail(cls, descriptor: int) -> bytes:
+        """Remove an interrupted final append before appending another event.
+
+        Replay may safely ignore that tail, but appending behind it would turn it
+        into a permanently corrupt middle line. A valid JSON record lacking only
+        its newline is retained and separated from the next append.
+        """
+        size = os.lseek(descriptor, 0, os.SEEK_END)
+        if not size:
+            return b""
+        os.lseek(descriptor, size - 1, os.SEEK_SET)
+        if os.read(descriptor, 1) == b"\n":
+            return b""
+        cursor = size
+        chunks = []
+        length = 0
+        while cursor:
+            amount = min(cursor, 8192)
+            cursor -= amount
+            os.lseek(descriptor, cursor, os.SEEK_SET)
+            block = os.read(descriptor, amount)
+            boundary = block.rfind(b"\n")
+            tail = block[boundary + 1:] if boundary >= 0 else block
+            chunks.append(tail)
+            length += len(tail)
+            if length > MAX_EVENT_BYTES:
+                raise StateError("Événement de campagne trop volumineux.")
+            if boundary >= 0:
+                cursor += boundary + 1
+                break
+        raw = b"".join(reversed(chunks))
+        try:
+            event = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeError, RecursionError):
+            os.ftruncate(descriptor, cursor)
+            return b""
+        if (not isinstance(event, dict) or event.get("schema_version") != SCHEMA_VERSION
+                or event.get("kind") not in EVENT_KINDS
+                or not isinstance(event.get("key"), str) or not event["key"]
+                or not isinstance(event.get("value"), dict)):
+            raise StateError("Journal de campagne invalide.")
+        cls._validate_http_record(event["kind"], event["key"], event["value"])
+        return b"\n"
+
     def replay(self, manifest: dict[str, Any]) -> dict[str, Any]:
         result = copy.deepcopy(manifest)
+        http_services = result.setdefault("http_services", {})
+        collection = result.get("http_collection", {})
+        if not isinstance(http_services, dict) or not isinstance(collection, dict):
+            raise StateError("État HTTP de campagne invalide.")
+        collection_services = collection.get("services", {})
+        if not isinstance(collection_services, dict):
+            raise StateError("État de collecte HTTP invalide.")
+        for key, value in http_services.items():
+            self._validate_http_record("http_service", key, value)
+        for key, value in collection_services.items():
+            self._validate_http_record("http_collection", key, value)
         if not self.path.exists():
             return result
         targets = {target.get("hostname"): target for target in result.get("targets", [])
@@ -134,8 +205,8 @@ class EventLedger:
                             break
                         raise StateError("Journal de campagne invalide.") from exc
                     if (not isinstance(event, dict) or event.get("schema_version") != SCHEMA_VERSION
-                            or event.get("kind") not in ("dns", "endpoint", "discovery")
-                            or not isinstance(event.get("key"), str)
+                            or event.get("kind") not in EVENT_KINDS
+                            or not isinstance(event.get("key"), str) or not event["key"]
                             or not isinstance(event.get("value"), dict)):
                         raise StateError("Journal de campagne invalide.")
                     kind, key, value = event["kind"], event["key"], event["value"]
@@ -147,10 +218,16 @@ class EventLedger:
                         if key not in endpoints:
                             raise StateError("Événement endpoint sans tâche dans le manifeste.")
                         endpoints[key].update(value)
-                    else:
+                    elif kind == "discovery":
                         if key not in result.get("discovery", {}).get("roots", []):
                             raise StateError("Événement de découverte hors du manifeste.")
                         discovery_events[key] = value
+                    elif kind == "http_service":
+                        self._validate_http_record(kind, key, value)
+                        http_services[key] = value
+                    elif kind == "http_collection":
+                        self._validate_http_record(kind, key, value)
+                        result.setdefault("http_collection", {}).setdefault("services", {})[key] = value
         except OSError as exc:
             raise StateError(f"Impossible de lire l'état incrémental: {exc}") from exc
         if discovery_events and isinstance(result.get("discovery"), dict):
