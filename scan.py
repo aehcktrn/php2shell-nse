@@ -35,7 +35,7 @@ from discovery import discover_root
 from campaign_state import CampaignLock, EventLedger, StateError
 
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -1226,6 +1226,12 @@ def run_campaign(args) -> int:
     paths = list(dict.fromkeys(paths))
     if len(paths) > 11:
         raise InputError("11 chemins maximum (chemin initial + 10 supplementaires); budget de requetes partage.")
+    # The simple launcher must assess both request targets explicitly. The NSE
+    # fallback alone is insufficient: once / advertises a usable version it
+    # can stop before /index.php, leaving an HTTP-to-HTTPS redirect to that
+    # exact path uncovered in the campaign-level verdict.
+    if paths[0] == "/" and "/index.php" not in paths and len(paths) < 11:
+        paths.insert(1, "/index.php")
     roots = read_discovery_roots(discovery_file)
     discovery_budget_automatic = args.discovery_budget is None
     if roots and args.discovery_budget is None:

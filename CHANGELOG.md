@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.3 — 2026-10-23
+
+- Contrôle explicite de `/` et `/index.php` dans l'usage simple, même lorsqu'une version PHP est déjà annoncée sur la racine ; les redirections HTTP vers ces deux destinations peuvent ainsi être corrélées exactement avec leur évaluation HTTPS.
+- Ajout d'une cause opérationnelle courte aux lignes `INDETERMINE` de `report-tree.txt` : refus HTTP, absence DNS, version non exposée, redirection non couverte ou autre lacune principale.
+- Maintien du verdict prudent lorsque le serveur, le CDN ou le WAF ne publie aucune version : le scanner n'invente pas une version à partir d'un simple indice applicatif.
+
+Le lanceur passe à **0.5.3** et le NSE reste en **0.3.3**. Les deux commandes usuelles restent inchangées.
+
 ## 0.5.2 — 2026-10-23
 
 - Génération automatique de `report-tree.txt`, regroupant les résultats sous chaque domaine racine selon leur hiérarchie DNS.

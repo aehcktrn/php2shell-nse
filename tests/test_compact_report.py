@@ -34,7 +34,7 @@ def coverage(hostname="app.example.com", *, code="SCAN_FAILED", ip="192.0.2.11",
 
 
 def details(rows):
-    return {"schema_version": "1", "tool_version": "0.5.2", "rows": rows,
+    return {"schema_version": "1", "tool_version": "0.5.3", "rows": rows,
             "campaign": {"campaign_id": "fixture"}, "changes": [], "summary": {"processing_complete": True}}
 
 
@@ -564,8 +564,24 @@ class CompactReportTests(unittest.TestCase):
         self.assertIn("├── api [PHP 8.3.36 | NON]", tree)
         self.assertIn("└── fr [regroupement]", tree)
         self.assertIn("├── admin [PHP 8.3.36 | NON]", tree)
-        self.assertIn("└── www [PHP INCONNUE | INDETERMINE]", tree)
+        self.assertIn("└── www [PHP INCONNUE | INDETERMINE | SANS DNS]", tree)
         self.assertEqual(sum("[PHP " in line for line in tree.splitlines()[3:]), 4)
+
+    def test_tree_report_explains_common_indeterminate_causes(self):
+        rows = [
+            assessment(hostname="blocked.example.com", state="UNKNOWN", version="",
+                       reason_code="HTTP_ACCESS_DENIED", traversal_complete="false"),
+            assessment(hostname="hidden.example.com", state="UNKNOWN", version="",
+                       reason_code="PHP_NOT_IDENTIFIED"),
+            coverage(hostname="missing.example.com", code="NO_DNS_ADDRESS"),
+        ]
+        payload = details(rows)
+        payload["campaign"]["scope"] = {"domains": ["example.com"]}
+        report.write_campaign_report(payload, self.base)
+        tree = (self.base / "report-tree.txt").read_text(encoding="utf-8")
+        self.assertIn("blocked [PHP INCONNUE | INDETERMINE | HTTP 403]", tree)
+        self.assertIn("hidden [PHP INCONNUE | INDETERMINE | VERSION NON EXPOSÉE]", tree)
+        self.assertIn("missing [PHP INCONNUE | INDETERMINE | SANS DNS]", tree)
 
     def test_empty_campaign_json_has_only_two_structural_lines(self):
         report.write_campaign_report(details([]), self.base)

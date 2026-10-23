@@ -861,10 +861,45 @@ def _tree_result_label(label: str, row: dict[str, str] | None, count: int,
     if row is None:
         result = f"{label} [regroupement]"
     else:
-        result = f"{label} [PHP {row['php']} | {row['vulnerable']}]"
+        fields = [f"PHP {row['php']}", row["vulnerable"]]
+        cause = _tree_result_cause(row)
+        if cause:
+            fields.append(cause)
+        result = f"{label} [{' | '.join(fields)}]"
     if root:
         result += f" — {count} cible" + ("s" if count != 1 else "")
     return result
+
+
+def _tree_result_cause(row: dict[str, str]) -> str:
+    """Return a short operational cause without duplicating the full report."""
+    if row.get("vulnerable") != "INDETERMINE":
+        return ""
+    explanation = row.get("explication", "")
+    causes = (
+        ("HTTP 403", "HTTP 403"),
+        ("HTTP 401", "HTTP 401"),
+        ("HTTP 429", "HTTP 429"),
+        ("Aucune adresse IP résolue", "SANS DNS"),
+        ("Aucune adresse IP publique", "SANS IP PUBLIQUE"),
+        ("Aucun port TCP ouvert", "AUCUN PORT WEB OUVERT"),
+        ("Budget HTTP épuisé", "BUDGET HTTP ÉPUISÉ"),
+        ("Délai du scan Nmap dépassé", "SCAN EXPIRÉ"),
+        ("Échec du scan Nmap", "ÉCHEC NMAP"),
+        ("Destination de redirection non évaluée", "REDIRECTION NON COUVERTE"),
+        ("Parcours des redirections incomplet", "REDIRECTION INCOMPLÈTE"),
+        ("PHP détecté, mais sa version n'est pas annoncée", "VERSION PHP MASQUÉE"),
+        ("PHP non identifié", "VERSION NON EXPOSÉE"),
+        ("Aucune réponse HTTP exploitable", "AUCUNE RÉPONSE HTTP"),
+        ("Service ouvert sans évaluation PHP exploitable", "SERVICE NON ÉVALUÉ"),
+        ("Résolution DNS impossible", "ERREUR DNS"),
+    )
+    for marker, cause in causes:
+        if marker in explanation:
+            return cause
+    if row.get("php") and row["php"] != "INCONNUE":
+        return "VERSION VUE, COUVERTURE INCOMPLÈTE"
+    return "CAUSE À VÉRIFIER"
 
 
 def _tree_result_count(node: dict[str, Any]) -> int:
@@ -905,7 +940,7 @@ def _report_tree_text(report: dict[str, Any], compact: list[dict[str, str]]) -> 
     title = "Arborescence des résultats"
     if campaign_id:
         title += " — campagne " + campaign_id
-    lines = [title, "Légende : [PHP version | OUI/NON/INDETERMINE] ; [regroupement] = branche DNS non évaluée.", ""]
+    lines = [title, "Légende : [PHP version | verdict | cause éventuelle] ; [regroupement] = branche DNS non évaluée.", ""]
     ordered_roots = [root for root in roots if root in forest]
     ordered_roots.extend(sorted(root for root in forest if root not in roots))
     for index, root in enumerate(ordered_roots):

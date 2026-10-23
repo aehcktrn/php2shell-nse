@@ -94,6 +94,8 @@ class CampaignInputTests(unittest.TestCase):
         manifest = json.loads((output / "manifest.json").read_text())
         self.assertEqual(manifest["profile"], "quick")
         self.assertEqual(manifest["ports"], EXPECTED_QUICK_PORTS)
+        self.assertEqual(manifest["http"]["paths"], ["/", "/index.php"])
+        self.assertEqual(manifest["targets"][0]["requested_paths"], ["/", "/index.php"])
         self.assertEqual(manifest["targets"][0]["endpoints"][0]["ports"], EXPECTED_QUICK_PORTS)
         command = runner.call_args.args[0]
         self.assertEqual(command[command.index("-p") + 1], EXPECTED_QUICK_PORTS)
