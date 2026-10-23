@@ -713,7 +713,8 @@ def _unknown_reason(row: dict[str, Any],
 
 def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str,
                                 assessment_index: dict[tuple[str, int, str, str], set[int]]
-                                | None = None, *, historical_semantics: bool = False) -> str:
+                                | None = None, *, historical_semantics: bool = False,
+                                legacy_cause_order: bool = False) -> str:
     if not rows:
         return "Aucun service HTTP évalué ; PHP et ses correctifs restent à vérifier."
     if verdict == "OUI":
@@ -746,9 +747,19 @@ def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str],
             return "Versions corrigées annoncées ou correctifs attestés côté serveur sur les services évalués."
         return "Versions annoncées corrigées sur les services évalués ; runtime à confirmer côté serveur."
     unknown = [row for row, value in zip(rows, verdicts) if value == "INDETERMINE"]
+    primary = unknown
+    if not historical_semantics and not legacy_cause_order:
+        # A separately requested redirect destination can still be inconclusive.
+        # Prefer its actual failure or hidden version over the navigation hop.
+        primary = [item for item in unknown if not (
+            (item.get("traversal_reason_code") or item.get("reason_code")) == "REDIRECT_NOT_ASSESSED"
+            and item.get("inventory_patch_status") in (None, "", "NOT_PROVIDED")
+            and not _suspect(item)
+            and _redirect_row_was_assessed_separately(item, assessment_index)
+        )] or unknown
     # Surface a concrete coverage failure before a generic hidden-version
     # observation, without expanding one line into a catalogue of endpoints.
-    row = next((item for item in unknown if item.get("row_type") != "ASSESSMENT" or _http_gap(item)), unknown[0])
+    row = next((item for item in primary if item.get("row_type") != "ASSESSMENT" or _http_gap(item)), primary[0])
     reason = _unknown_reason(row, assessment_index) + _endpoint_hint(row, rows)
     if any(_suspect(item) for item in unknown):
         reason += "; version concernée observée, correctif à vérifier"
@@ -839,9 +850,11 @@ def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdic
                          *, port_rows: list[dict[str, Any]] | None = None,
                          include_redirect_destinations: bool = True,
                          assessment_index: dict[tuple[str, int, str, str], set[int]]
-                         | None = None, historical_semantics: bool = False) -> str:
+                         | None = None, historical_semantics: bool = False,
+                         legacy_cause_order: bool = False) -> str:
     reason = _legacy_compact_explanation(
-        rows, verdicts, verdict, assessment_index, historical_semantics=historical_semantics)
+        rows, verdicts, verdict, assessment_index, historical_semantics=historical_semantics,
+        legacy_cause_order=legacy_cause_order)
     ports = _port_summary(port_rows if port_rows is not None else rows)
     redirect = _redirect_summary(rows, assessment_index) if include_redirect_destinations else ""
     prefix = " ".join(part for part in (ports, redirect) if part)
@@ -856,7 +869,8 @@ def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdic
 def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False,
                  include_redirect_destinations: bool = True,
                  redirect_coverage: str = "campaign",
-                 historical_semantics: bool = False) -> list[dict[str, str]]:
+                 historical_semantics: bool = False,
+                 legacy_cause_order: bool = False) -> list[dict[str, str]]:
     """Aggregate IPs and ports into four fields per hostname (or XML IP).
 
     OUI includes an affected advertised version and says so explicitly. NON
@@ -896,13 +910,15 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
                    "NON" if verdicts and all(value == "NON" for value in verdicts) else "INDETERMINE")
         if legacy_explanation:
             explanation = _legacy_compact_explanation(
-                conclusive, verdicts, verdict, historical_semantics=historical_semantics)
+                conclusive, verdicts, verdict, historical_semantics=historical_semantics,
+                legacy_cause_order=legacy_cause_order)
         else:
             explanation = _compact_explanation(
                 conclusive, verdicts, verdict, port_rows=relevant,
                 include_redirect_destinations=include_redirect_destinations,
                 assessment_index=assessment_index,
                 historical_semantics=historical_semantics,
+                legacy_cause_order=legacy_cause_order,
             )
         output.append({"cible": target, "php": " | ".join(versions) or "INCONNUE", "vulnerable": verdict,
                        "explication": _short(explanation, MAX_COMPACT_EXPLANATION)})
@@ -1074,7 +1090,7 @@ def _report_php_targets(report: dict[str, Any]) -> set[str]:
 
 
 def _report_indeterminate_causes(report: dict[str, Any]) -> dict[str, list[str]]:
-    """Retain concrete per-service causes independently of the compact text limit."""
+    """Group identical causes across backends, retaining every reason and redirect."""
     rows = report.get("rows")
     if not isinstance(rows, list):
         return {}
@@ -1092,19 +1108,45 @@ def _report_indeterminate_causes(report: dict[str, Any]) -> dict[str, list[str]]
         conclusive = [row for row in relevant
                       if not _covered_redirect_is_navigation_only(row, relevant)]
         causes = []
-        redirects = _redirect_summary(conclusive, assessment_index)
-        if redirects:
-            causes.append(redirects)
-        for row in conclusive:
-            if _compact_verdict(row) != "INDETERMINE":
-                continue
-            cause = _unknown_reason(row, assessment_index)
-            gap_path = _single_line(row.get("crawl_gap_path"))
+        unassessed, assessed = _redirect_destinations_by_coverage(conclusive, assessment_index)
+        for destinations, prefix, singular, plural in (
+            (unassessed, "HORS PÉRIMÈTRE DU CONTRÔLE", "destination non évaluée", "destinations non évaluées"),
+            (assessed, "Dans la campagne", "destination évaluée séparément", "destinations évaluées séparément"),
+        ):
+            if destinations:
+                label = singular if len(destinations) == 1 else plural
+                causes.append(prefix + " — " + label + " : " + ", ".join(_cross_host_first(destinations, conclusive)))
+        unknown = [row for row in conclusive if _compact_verdict(row) == "INDETERMINE"]
+        navigation = {id(row) for row in unknown if (
+            (row.get("traversal_reason_code") or row.get("reason_code")) == "REDIRECT_NOT_ASSESSED"
+            and row.get("inventory_patch_status") in (None, "", "NOT_PROVIDED")
+            and not _suspect(row)
+            and _redirect_row_was_assessed_separately(row, assessment_index)
+        )}
+        actual = [row for row in unknown if id(row) not in navigation]
+        grouped: dict[tuple[str, str], dict[str, set]] = {}
+        for row in actual or unknown:
+            cause = ("Statut PHP de la destination non établi" if id(row) in navigation
+                     else _unknown_reason(row, assessment_index))
+            key = cause, _single_line(row.get("crawl_gap_path"))
+            endpoints = grouped.setdefault(key, {"ports": set(), "addresses": set()})
+            port = _single_line(row.get("port"))
+            if len(port) <= 5 and port.isascii() and port.isdecimal() and 1 <= int(port) <= 65535:
+                endpoints["ports"].add(int(port))
+            endpoints["addresses"].update(
+                address.strip() for address in _single_line(row.get("ip")).split("|") if address.strip())
+        for (cause, gap_path), endpoints in grouped.items():
             if gap_path:
                 cause += " sur " + gap_path
-            cause += _endpoint_hint(row, relevant)
-            if cause not in causes:
-                causes.append(cause)
+            context = []
+            ports = sorted(endpoints["ports"])
+            if ports:
+                context.append(("port " if len(ports) == 1 else "ports ") + ",".join(map(str, ports)))
+            if len(endpoints["addresses"]) > 1:
+                context.append(str(len(endpoints["addresses"])) + " adresses")
+            if context:
+                cause += " (" + " ; ".join(context) + ")"
+            causes.append(cause)
         if not conclusive:
             causes.append("Aucun service HTTP évalué ; PHP et ses correctifs restent à vérifier")
         output[target] = causes
@@ -1246,6 +1288,8 @@ def _historical_compact_rows(details: dict[str, Any]) -> list[dict[str, str]] | 
     if minor == 5 and patch <= 3:
         coverage = "current" if patch == 0 else "campaign"
         return compact_rows(rows, redirect_coverage=coverage, historical_semantics=True)
+    if minor == 5 and patch == 4:
+        return compact_rows(rows, legacy_cause_order=True)
     if minor != 4:
         return None
     if patch <= 2:

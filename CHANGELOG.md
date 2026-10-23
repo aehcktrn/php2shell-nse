@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.5 — 2026-10-23
+
+- Priorité à la cause réelle d'un résultat non conclusif dans la synthèse : accès HTTPS refusé ou version non identifiée plutôt qu'une simple redirection déjà demandée dans la campagne.
+- Regroupement des causes identiques par ports et nombre d'adresses dans l'arborescence, en conservant les motifs distincts et les destinations non évaluées.
+- Conservation du rendu exact des rapports compacts 0.5.4 lors du chargement de leur fichier compagnon.
+- Identification de la version de rendu courante dans le rapport régénéré après reprise, tout en conservant la version initiale du scan dans le manifeste.
+
+Le lanceur passe à **0.5.5** ; le moteur réseau NSE reste en **0.3.4**, sans changement du parcours HTTP.
+
 ## 0.5.4 — 2026-10-23
 
 - Libellés explicites `VULNERABLE` et `NON-VULNERABLE` dans l'arborescence à la place de `OUI` et `NON`.

@@ -29,7 +29,7 @@ PROVIDER_RESULT_LIMIT = 10000
 MAX_EXCLUDED_SAMPLES = 100
 MAX_RECORDS = 100000
 MAX_NAME_LENGTH = 253
-USER_AGENT = "php2shell-scanner/0.5.4 (passive certificate discovery)"
+USER_AGENT = "php2shell-scanner/0.5.5 (passive certificate discovery)"
 
 
 def _utcnow() -> str:

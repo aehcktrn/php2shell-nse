@@ -34,7 +34,7 @@ def coverage(hostname="app.example.com", *, code="SCAN_FAILED", ip="192.0.2.11",
 
 
 def details(rows):
-    return {"schema_version": "1", "tool_version": "0.5.4", "rows": rows,
+    return {"schema_version": "1", "tool_version": "0.5.5", "rows": rows,
             "campaign": {"campaign_id": "fixture"}, "changes": [], "summary": {"processing_complete": True}}
 
 
@@ -194,6 +194,31 @@ class CompactReportTests(unittest.TestCase):
         self.save("report.json", historical)
         self.save("raw/report-details.json", old)
         self.assertEqual(report.load_campaign_report(self.base / "report.json"), old)
+
+    def test_requested_https_failure_takes_priority_over_navigation_redirect(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"path": "/", "reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://app.example.com/"}],
+        )
+        for code, reason in (("HTTP_ACCESS_DENIED", "HTTP 403 : accès refusé (port 443)"),
+                             ("PHP_NOT_IDENTIFIED", "PHP non identifié ; absence de vulnérabilité non établie (port 443)")):
+            with self.subTest(code=code):
+                destination = assessment(
+                    port="443", scheme="https", state="UNKNOWN", version="", php_detected="UNKNOWN",
+                    reason_code=code, traversal_complete="false" if code == "HTTP_ACCESS_DENIED" else "true",
+                    observations=[{"path": "/", "state": "UNKNOWN", "reason_code": code, "versions": []}],
+                )
+                rows = [redirect, destination]
+                result = self.compact(*rows)
+                self.assertEqual(result["vulnerable"], "INDETERMINE")
+                self.assertIn(reason, result["explication"])
+                self.assertNotIn("Destination de redirection évaluée séparément dans la campagne (port 80)",
+                                 result["explication"])
+                historical = report.compact_rows(rows, historical_semantics=True)[0]
+                self.assertIn("Destination de redirection évaluée séparément dans la campagne (port 80)",
+                              historical["explication"])
 
     def test_redirect_requires_the_exact_destination_path(self):
         redirect = assessment(
@@ -694,6 +719,59 @@ class CompactReportTests(unittest.TestCase):
         self.assertIn("https://outside.example.net/", tree)
         self.assertNotIn("VERSION VUE, COUVERTURE INCOMPLÈTE", tree)
 
+    def test_tree_groups_same_reason_across_addresses_and_ports(self):
+        rows = []
+        for number in range(1, 13):
+            ip = f"192.0.2.{number}"
+            rows.extend([
+                assessment(hostname="campus.example.com", ip=ip, port="80", scheme="http", state="UNKNOWN",
+                           version="", php_detected="UNKNOWN", reason_code="REDIRECT_NOT_ASSESSED",
+                           observations=[{"path": "/", "reason_code": "REDIRECT_NOT_ASSESSED",
+                                          "redirect_to": "https://campus.example.com/"}]),
+                assessment(hostname="campus.example.com", ip=ip, scheme="https", state="UNKNOWN", version="",
+                           php_detected="UNKNOWN", reason_code="PHP_NOT_IDENTIFIED",
+                           observations=[{"path": "/", "reason_code": "PHP_NOT_IDENTIFIED", "state": "UNKNOWN"}]),
+            ])
+        for number in range(1, 4):
+            for port in ("443", "80"):
+                rows.append(assessment(hostname="blocked.example.com", ip=f"192.0.2.{number}", port=port,
+                                       state="UNKNOWN", version="", php_detected="UNKNOWN",
+                                       reason_code="HTTP_ACCESS_DENIED", crawl_gap_path="/restricted.php"))
+        rows.append(assessment(hostname="blocked.example.com", ip="192.0.2.1", port="443", state="UNKNOWN",
+                               version="", php_detected="UNKNOWN", reason_code="HTTP_ACCESS_DENIED",
+                               crawl_gap_path="/other.php"))
+        causes = report._report_indeterminate_causes(details(rows))
+        self.assertEqual(causes["campus.example.com"], [
+            "Dans la campagne — destination évaluée séparément : https://campus.example.com/",
+            "PHP non identifié ; absence de vulnérabilité non établie (port 443 ; 12 adresses)",
+        ])
+        self.assertEqual(causes["blocked.example.com"], [
+            "HTTP 403 : accès refusé sur /restricted.php (ports 80,443 ; 3 adresses)",
+            "HTTP 403 : accès refusé sur /other.php (port 443)",
+        ])
+
+    def test_tree_redirect_only_reason_describes_unknown_status_and_keeps_all_destinations(self):
+        destinations = [f"https://destination.example.com/page{number}" for number in range(4)]
+        alias = assessment(hostname="alias.example.com", state="UNKNOWN", version="", php_detected="UNKNOWN",
+                           reason_code="REDIRECT_NOT_ASSESSED", observations=[
+                               {"path": "/", "reason_code": "REDIRECT_NOT_ASSESSED", "redirect_to": destination}
+                               for destination in destinations])
+        destination = assessment(hostname="destination.example.com", scheme="https", state="UNKNOWN", version="",
+                                 php_detected="UNKNOWN", reason_code="PHP_NOT_IDENTIFIED", observations=[
+                                     {"path": f"/page{number}", "state": "UNKNOWN", "reason_code": "PHP_NOT_IDENTIFIED"}
+                                     for number in range(4)])
+        payload = details([alias, destination])
+        causes = report._report_indeterminate_causes(payload)["alias.example.com"]
+        self.assertEqual(causes[-1], "Statut PHP de la destination non établi (port 443)")
+        for url in destinations:
+            self.assertIn(url, causes[0])
+        self.assertNotIn("(+", causes[0])
+        # The same complete listing is retained when destinations were not requested.
+        outside = report._report_indeterminate_causes(details([alias]))["alias.example.com"][0]
+        self.assertIn("HORS PÉRIMÈTRE DU CONTRÔLE", outside)
+        for url in destinations:
+            self.assertIn(url, outside)
+
     def test_empty_campaign_json_has_only_two_structural_lines(self):
         report.write_campaign_report(details([]), self.base)
         self.assertEqual((self.base / "report.json").read_text(), "[\n]\n")
@@ -783,6 +861,32 @@ class CompactReportTests(unittest.TestCase):
                 loaded = report.load_campaign_report(source)
                 self.assertEqual(loaded, old)
                 self.assertEqual(report.compact_rows(loaded["rows"])[0]["vulnerable"], "OUI")
+
+    def test_v054_redirect_first_cause_remains_readable_then_recomputes_https_failure(self):
+        redirect = assessment(
+            port="80", state="UNKNOWN", version="", service="http", scheme="http",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"path": "/", "reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://app.example.com/"}],
+        )
+        destination = assessment(
+            port="443", scheme="https", state="UNKNOWN", version="", php_detected="UNKNOWN",
+            reason_code="HTTP_ACCESS_DENIED", traversal_complete="false",
+            observations=[{"path": "/", "state": "UNKNOWN", "reason_code": "HTTP_ACCESS_DENIED", "versions": []}],
+        )
+        old = {**details([redirect, destination]), "tool_version": "0.5.4"}
+        historical = [{"cible": "app.example.com", "php": "INCONNUE", "vulnerable": "INDETERMINE",
+                       "explication": "Ports évalués : 80,443. Dans la campagne — destination évaluée séparément : "
+                       "https://app.example.com/. Destination de redirection évaluée séparément dans la campagne "
+                       "(port 80); 2 contrôles indéterminés."}]
+        self.save("raw/report-details.json", old)
+        source = self.save("report.json", historical)
+        loaded = report.load_campaign_report(source)
+        self.assertEqual(loaded, old)
+        self.assertIn("HTTP 403 : accès refusé (port 443)", report.compact_rows(loaded["rows"])[0]["explication"])
+        # v0.5.4 already used positive-evidence precedence; only its cause order is historical.
+        destination.update(state="POTENTIALLY_VULNERABLE", versions="8.3.35")
+        self.assertEqual(report._historical_compact_rows(old)[0]["vulnerable"], "OUI")
 
     def test_v043_compact_previous_accepts_its_port_aware_redirect_rendering(self):
         redirect = assessment(

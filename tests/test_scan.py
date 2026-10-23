@@ -131,6 +131,11 @@ class CampaignInputTests(unittest.TestCase):
              patch.object(scan.Processes, "run", side_effect=failed):
             self.assertEqual(scan.run_campaign(initial), 2)
 
+        manifest_path = output / "manifest.json"
+        saved = json.loads(manifest_path.read_text())
+        saved["tool_version"] = "0.5.4"
+        manifest_path.write_text(json.dumps(saved), encoding="utf-8")
+
         def completed(_command, endpoint, base, _timeout):
             xml_file(base / endpoint["xml"], name="app.example.com", ip=endpoint["ip"],
                      state="PATCHED_VERSION_ADVERTISED", version="8.3.36")
@@ -146,6 +151,10 @@ class CampaignInputTests(unittest.TestCase):
         manifest = json.loads((output / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "COMPLETED")
         self.assertEqual(manifest["resumes"][-1]["retried_endpoints"], 1)
+        self.assertEqual(manifest["tool_version"], "0.5.4")
+        self.assertEqual(manifest["resumes"][-1]["tool_version"], scan.VERSION)
+        rendered = json.loads((output / "raw/report-details.json").read_text())
+        self.assertEqual(rendered["tool_version"], scan.VERSION)
         compact = json.loads((output / "report.json").read_text())
         self.assertEqual((compact[0]["php"], compact[0]["vulnerable"]), ("8.3.36", "NON"))
 

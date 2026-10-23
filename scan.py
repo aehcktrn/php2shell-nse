@@ -35,7 +35,7 @@ from discovery import discover_root
 from campaign_state import CampaignLock, EventLedger, StateError
 
 
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -1659,7 +1659,7 @@ def resume_campaign(args) -> int:
             endpoint["command"] = command_for(nmap, endpoint, arguments, xml.with_suffix(""), args)
             endpoint.update(status="PLANNED", error=None, started_at=None, finished_at=None, returncode=None)
             jobs.append((target, endpoint))
-    resumed = {"started_at": utcnow(), "finished_at": None,
+    resumed = {"started_at": utcnow(), "finished_at": None, "tool_version": VERSION,
                "reused_endpoints": reusable, "retried_endpoints": len(jobs)}
     manifest.setdefault("resumes", []).append(resumed)
     manifest["status"] = "RUNNING"
@@ -1693,6 +1693,9 @@ def resume_campaign(args) -> int:
     atomic_json(manifest_path, manifest)
     report = build_campaign_report(manifest, output, inventory=args.inventory, previous=args.previous,
                                    max_inventory_age_hours=args.inventory_max_age_hours)
+    # The saved manifest describes the original scan; its regenerated compact
+    # report must identify the renderer actually used for companion validation.
+    report["tool_version"] = VERSION
     if not report["summary"].get("processing_complete", True):
         manifest["status"] = "PARTIAL"
         atomic_json(manifest_path, manifest)
