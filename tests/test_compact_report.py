@@ -34,7 +34,7 @@ def coverage(hostname="app.example.com", *, code="SCAN_FAILED", ip="192.0.2.11",
 
 
 def details(rows):
-    return {"schema_version": "1", "tool_version": "0.5.0", "rows": rows,
+    return {"schema_version": "1", "tool_version": "0.5.1", "rows": rows,
             "campaign": {"campaign_id": "fixture"}, "changes": [], "summary": {"processing_complete": True}}
 
 
@@ -138,6 +138,62 @@ class CompactReportTests(unittest.TestCase):
         self.assertEqual(result["vulnerable"], "INDETERMINE")
         self.assertIn("HORS PÉRIMÈTRE DU CONTRÔLE", result["explication"])
         self.assertIn("https://other.example.com/", result["explication"])
+
+    def test_cross_hostname_redirect_assessed_in_campaign_is_not_reported_out_of_scope(self):
+        redirect = assessment(
+            hostname="www.sygestim.foncia.com", ip="163.172.183.180", port="443",
+            state="UNKNOWN", version="", scheme="https",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"path": "/index.php", "reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://sygestim.foncia.com/index.php"}],
+        )
+        destination = assessment(
+            hostname="sygestim.foncia.com", ip="163.172.183.180", port="443",
+            state="UNKNOWN", version="", scheme="https", reason_code="PHP_NOT_IDENTIFIED",
+            php_detected="UNKNOWN",
+            observations=[{"path": "/index.php", "state": "UNKNOWN",
+                           "reason_code": "PHP_NOT_IDENTIFIED", "versions": []}],
+        )
+        compact = {row["cible"]: row for row in report.compact_rows([redirect, destination])}
+        alias = compact["www.sygestim.foncia.com"]
+        self.assertEqual(alias["vulnerable"], "INDETERMINE")
+        self.assertNotIn("HORS PÉRIMÈTRE DU CONTRÔLE", alias["explication"])
+        self.assertIn("évaluée séparément", alias["explication"])
+        self.assertIn("https://sygestim.foncia.com/index.php", alias["explication"])
+
+        http_redirect = deepcopy(redirect)
+        http_redirect.update(port="80", scheme="http")
+        http_redirect["observations"][0]["redirect_to"] = (
+            "https://www.sygestim.foncia.com/index.php")
+        alias = {row["cible"]: row for row in report.compact_rows(
+            [http_redirect, redirect, destination])}["www.sygestim.foncia.com"]
+        self.assertIn("https://sygestim.foncia.com/index.php", alias["explication"])
+
+        destination["observations"][0]["path"] = "/"
+        alias = {row["cible"]: row for row in report.compact_rows([redirect, destination])}[
+            "www.sygestim.foncia.com"]
+        self.assertIn("HORS PÉRIMÈTRE DU CONTRÔLE", alias["explication"])
+
+    def test_v050_cross_hostname_redirect_rendering_remains_readable(self):
+        redirect = assessment(
+            hostname="www.sygestim.foncia.com", ip="163.172.183.180", port="443",
+            state="UNKNOWN", version="", scheme="https",
+            reason_code="REDIRECT_NOT_ASSESSED", php_detected="UNKNOWN",
+            observations=[{"path": "/index.php", "reason_code": "REDIRECT_NOT_ASSESSED",
+                           "redirect_to": "https://sygestim.foncia.com/index.php"}],
+        )
+        destination = assessment(
+            hostname="sygestim.foncia.com", ip="163.172.183.180", port="443",
+            state="UNKNOWN", version="", scheme="https", reason_code="PHP_NOT_IDENTIFIED",
+            observations=[{"path": "/index.php", "state": "UNKNOWN",
+                           "reason_code": "PHP_NOT_IDENTIFIED", "versions": []}],
+        )
+        old = {**details([redirect, destination]), "tool_version": "0.5.0"}
+        historical = report.compact_rows(old["rows"], redirect_coverage="current")
+        self.assertIn("HORS PÉRIMÈTRE DU CONTRÔLE", historical[0]["explication"])
+        self.save("report.json", historical)
+        self.save("raw/report-details.json", old)
+        self.assertEqual(report.load_campaign_report(self.base / "report.json"), old)
 
     def test_redirect_requires_the_exact_destination_path(self):
         redirect = assessment(

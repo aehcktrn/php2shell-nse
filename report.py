@@ -308,9 +308,73 @@ def _true(value: object) -> bool:
     return str(value).lower() in ("true", "yes", "1")
 
 
-def _unassessed_redirect_destinations(rows: list[dict[str, Any]]) -> list[str]:
-    """Return recorded, unrequested redirect targets without contacting them."""
-    destinations = []
+def _redirect_observation_destination(observation: dict[str, Any]) -> str:
+    """Return a redirect target that the NSE deliberately did not follow."""
+    explicitly_outside = observation.get("redirect_scope") == "HORS_PERIMETRE_DU_CONTROLE"
+    stopped_at_origin = (str(observation.get("redirect_followed", "")).lower() == "false"
+                         and observation.get("redirect_reason") == "Redirect leaves the current origin.")
+    if (observation.get("reason_code") != "REDIRECT_NOT_ASSESSED"
+            and not explicitly_outside and not stopped_at_origin):
+        return ""
+    return _single_line(observation.get("redirect_to"))
+
+
+def _observation_matches_path(candidate: dict[str, Any], request_target: str) -> bool:
+    observations = candidate.get("observations")
+    return isinstance(observations, list) and any(
+        isinstance(observation, dict)
+        and _single_line(observation.get("path")) == request_target
+        for observation in observations
+    )
+
+
+def _redirect_assessment_index(
+        rows: list[dict[str, Any]],
+) -> dict[tuple[str, int, str, str], set[int]]:
+    """Index exact requested URLs once so campaign correlation stays linear."""
+    index: dict[tuple[str, int, str, str], set[int]] = {}
+    for row in rows:
+        if row.get("row_type") != "ASSESSMENT":
+            continue
+        scheme = _single_line(row.get("scheme")).lower()
+        if scheme not in ("http", "https"):
+            continue
+        try:
+            port = int(_single_line(row.get("port")))
+        except ValueError:
+            continue
+        hostname = _single_line(row.get("hostname") or row.get("ip")).lower().rstrip(".")
+        observations = row.get("observations")
+        if not hostname or not isinstance(observations, list):
+            continue
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            request_target = _single_line(observation.get("path"))
+            if request_target:
+                index.setdefault((scheme, port, hostname, request_target), set()).add(id(row))
+    return index
+
+
+def _redirect_destination_was_assessed(
+        row: dict[str, Any], destination_value: object,
+        assessment_index: dict[tuple[str, int, str, str], set[int]],
+) -> bool:
+    """Tell whether the exact redirect URL was requested elsewhere in the campaign."""
+    destination = _redirect_destination(destination_value)
+    if destination is None:
+        return False
+    scheme, port, destination_name, request_target = destination
+    return any(candidate_id != id(row) for candidate_id in assessment_index.get(
+        (scheme, port, destination_name, request_target), ()))
+
+
+def _redirect_destinations_by_coverage(
+        rows: list[dict[str, Any]],
+        assessment_index: dict[tuple[str, int, str, str], set[int]] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Split recorded redirect URLs into unassessed and separately assessed targets."""
+    unassessed, assessed = [], []
     for row in rows:
         observations = row.get("observations")
         if not isinstance(observations, list):
@@ -318,16 +382,31 @@ def _unassessed_redirect_destinations(rows: list[dict[str, Any]]) -> list[str]:
         for observation in observations:
             if not isinstance(observation, dict):
                 continue
-            explicitly_outside = observation.get("redirect_scope") == "HORS_PERIMETRE_DU_CONTROLE"
-            stopped_at_origin = (str(observation.get("redirect_followed", "")).lower() == "false"
-                                 and observation.get("redirect_reason") == "Redirect leaves the current origin.")
-            if (observation.get("reason_code") != "REDIRECT_NOT_ASSESSED"
-                    and not explicitly_outside and not stopped_at_origin):
+            destination = _redirect_observation_destination(observation)
+            if not destination:
                 continue
-            destination = _single_line(observation.get("redirect_to"))
-            if destination:
-                destinations.append(destination)
-    return _unique(destinations)
+            bucket = (assessed if assessment_index is not None
+                      and _redirect_destination_was_assessed(row, destination, assessment_index)
+                      else unassessed)
+            bucket.append(destination)
+    return _unique(unassessed), _unique(assessed)
+
+
+def _unassessed_redirect_destinations(
+        rows: list[dict[str, Any]],
+        assessment_index: dict[tuple[str, int, str, str], set[int]] | None = None,
+) -> list[str]:
+    """Return redirect targets not evaluated elsewhere in the same campaign."""
+    return _redirect_destinations_by_coverage(rows, assessment_index)[0]
+
+
+def _redirect_row_was_assessed_separately(row: dict[str, Any],
+                                            assessment_index: dict[tuple[str, int, str, str], set[int]]
+                                            | None) -> bool:
+    if assessment_index is None:
+        return False
+    unassessed, assessed = _redirect_destinations_by_coverage([row], assessment_index)
+    return bool(assessed) and not unassessed
 
 
 # A missing NSE assessment on a positively identified non-web service is
@@ -442,9 +521,9 @@ def _redirect_destination(value: object) -> tuple[str, int, str, str] | None:
 def _observation_covers_path(candidate: dict[str, Any], request_target: str) -> bool:
     if _compact_verdict(candidate) == "INDETERMINE":
         return False
-    observations = candidate.get("observations")
-    if not isinstance(observations, list):
+    if not _observation_matches_path(candidate, request_target):
         return False
+    observations = candidate.get("observations")
     proof = candidate.get("inventory_patch_status")
     for observation in observations:
         if not isinstance(observation, dict) or _single_line(observation.get("path")) != request_target:
@@ -555,10 +634,13 @@ def _endpoint_hint(row: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     return " (port " + _short(port, 12) + ")" if port else ""
 
 
-def _unknown_reason(row: dict[str, Any]) -> str:
+def _unknown_reason(row: dict[str, Any],
+                    assessment_index: dict[tuple[str, int, str, str], set[int]] | None = None) -> str:
     if row.get("inventory_patch_status") == "CONFLICT":
         return "Preuves serveur contradictoires ; vérifier le runtime"
     code = row.get("traversal_reason_code") or row.get("reason_code")
+    if code == "REDIRECT_NOT_ASSESSED" and _redirect_row_was_assessed_separately(row, assessment_index):
+        return "Destination de redirection évaluée séparément dans la campagne"
     if code in COMPACT_REASONS:
         return COMPACT_REASONS[code]
     if _true(row.get("budget_exhausted")) or str(row.get("traversal_complete", "")).lower() in ("false", "no", "0"):
@@ -568,7 +650,9 @@ def _unknown_reason(row: dict[str, Any]) -> str:
     return "Version ou correctifs PHP impossibles à établir"
 
 
-def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str) -> str:
+def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str,
+                                assessment_index: dict[tuple[str, int, str, str], set[int]]
+                                | None = None) -> str:
     if not rows:
         return "Aucun service HTTP évalué ; PHP et ses correctifs restent à vérifier."
     if verdict == "OUI":
@@ -602,7 +686,7 @@ def _legacy_compact_explanation(rows: list[dict[str, Any]], verdicts: list[str],
     # Surface a concrete coverage failure before a generic hidden-version
     # observation, without expanding one line into a catalogue of endpoints.
     row = next((item for item in unknown if item.get("row_type") != "ASSESSMENT" or _http_gap(item)), unknown[0])
-    reason = _unknown_reason(row) + _endpoint_hint(row, rows)
+    reason = _unknown_reason(row, assessment_index) + _endpoint_hint(row, rows)
     if any(_suspect(item) for item in unknown):
         reason += "; version concernée observée, correctif à vérifier"
     if any(item.get("inventory_patch_status") == "PATCH_CONFIRMED" for item in rows):
@@ -646,26 +730,56 @@ def _port_summary(rows: list[dict[str, Any]]) -> str:
     return " ".join(parts)
 
 
-def _redirect_summary(rows: list[dict[str, Any]]) -> str:
-    destinations = _unassessed_redirect_destinations(rows)
-    if not destinations:
-        return ""
+def _destination_listing(destinations: list[str]) -> str:
     displayed = [_short(destination, 100) for destination in destinations[:2]]
     listing = ", ".join(displayed)
     if len(destinations) > len(displayed):
         listing += f" (+{len(destinations) - len(displayed)} autre"
         listing += "s" if len(destinations) - len(displayed) > 1 else ""
         listing += ")"
-    label = "destination non évaluée" if len(destinations) == 1 else "destinations non évaluées"
-    return _short(f"HORS PÉRIMÈTRE DU CONTRÔLE — {label} : {listing}.", 245)
+    return listing
+
+
+def _cross_host_first(destinations: list[str], rows: list[dict[str, Any]]) -> list[str]:
+    """Keep alias-changing redirects visible before routine HTTP-to-HTTPS hops."""
+    source_names = {
+        _single_line(row.get("hostname") or row.get("ip")).lower().rstrip(".")
+        for row in rows
+    }
+
+    def same_host(destination_value: str) -> bool:
+        destination = _redirect_destination(destination_value)
+        return destination is not None and destination[2] in source_names
+
+    return sorted(destinations, key=same_host)
+
+
+def _redirect_summary(rows: list[dict[str, Any]],
+                      assessment_index: dict[tuple[str, int, str, str], set[int]]
+                      | None = None) -> str:
+    unassessed, assessed = _redirect_destinations_by_coverage(rows, assessment_index)
+    # v0.5.0 companion validation preserves its original encounter order.
+    if assessment_index is not None:
+        unassessed = _cross_host_first(unassessed, rows)
+        assessed = _cross_host_first(assessed, rows)
+    parts = []
+    if unassessed:
+        label = "destination non évaluée" if len(unassessed) == 1 else "destinations non évaluées"
+        parts.append(f"HORS PÉRIMÈTRE DU CONTRÔLE — {label} : {_destination_listing(unassessed)}.")
+    if assessed:
+        label = "destination évaluée séparément" if len(assessed) == 1 else "destinations évaluées séparément"
+        parts.append(f"Dans la campagne — {label} : {_destination_listing(assessed)}.")
+    return _short(" ".join(parts), 245)
 
 
 def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdict: str,
                          *, port_rows: list[dict[str, Any]] | None = None,
-                         include_redirect_destinations: bool = True) -> str:
-    reason = _legacy_compact_explanation(rows, verdicts, verdict)
+                         include_redirect_destinations: bool = True,
+                         assessment_index: dict[tuple[str, int, str, str], set[int]]
+                         | None = None) -> str:
+    reason = _legacy_compact_explanation(rows, verdicts, verdict, assessment_index)
     ports = _port_summary(port_rows if port_rows is not None else rows)
-    redirect = _redirect_summary(rows) if include_redirect_destinations else ""
+    redirect = _redirect_summary(rows, assessment_index) if include_redirect_destinations else ""
     prefix = " ".join(part for part in (ports, redirect) if part)
     if not prefix:
         return _short(reason, MAX_COMPACT_EXPLANATION)
@@ -677,7 +791,7 @@ def _compact_explanation(rows: list[dict[str, Any]], verdicts: list[str], verdic
 
 def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False,
                  include_redirect_destinations: bool = True,
-                 redirect_coverage: str = "current") -> list[dict[str, str]]:
+                 redirect_coverage: str = "campaign") -> list[dict[str, str]]:
     """Aggregate IPs and ports into four fields per hostname (or XML IP).
 
     OUI includes an affected advertised version and says so explicitly. NON
@@ -689,7 +803,7 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
     """
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ReportError("Lignes détaillées invalides : une liste d'objets est requise.")
-    if redirect_coverage not in ("current", "legacy", "none"):
+    if redirect_coverage not in ("campaign", "current", "legacy", "none"):
         raise ReportError("Mode de couverture des redirections invalide.")
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -699,6 +813,7 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
         if not target:
             raise ReportError("Ligne sans cible : hostname ou ip requis pour le rapport compact.")
         groups.setdefault(target, []).append(row)
+    assessment_index = _redirect_assessment_index(rows) if redirect_coverage == "campaign" else None
     output = []
     for target, group in groups.items():
         versions = _unique([version for row in group for version in _version_values(row.get("versions"))])
@@ -718,6 +833,7 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
             explanation = _compact_explanation(
                 conclusive, verdicts, verdict, port_rows=relevant,
                 include_redirect_destinations=include_redirect_destinations,
+                assessment_index=assessment_index,
             )
         output.append({"cible": target, "php": " | ".join(versions) or "INCONNUE", "vulnerable": verdict,
                        "explication": _short(explanation, MAX_COMPACT_EXPLANATION)})
@@ -730,6 +846,8 @@ def _historical_compact_rows(details: dict[str, Any]) -> list[dict[str, str]] | 
     if not match:
         return None
     minor, patch = int(match.group(1)), int(match.group(2))
+    if minor == 5 and patch == 0:
+        return compact_rows(details["rows"], redirect_coverage="current")
     if minor != 4:
         return None
     rows = details["rows"]

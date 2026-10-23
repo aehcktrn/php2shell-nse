@@ -35,7 +35,7 @@ from discovery import discover_root
 from campaign_state import CampaignLock, EventLedger, StateError
 
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 ROOT = Path(__file__).resolve().parent
 QUICK_PORTS = "80,443,8000,8008,8080,8081,8443,8888,9000,9443"
 MAX_INPUT_BYTES = 10 * 1024 * 1024

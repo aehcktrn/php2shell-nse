@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1 — 2026-10-23
+
+- Corrélation des redirections avec toutes les cibles de la campagne : une URL exacte déjà contrôlée sous un autre nom DNS n'est plus présentée comme hors périmètre.
+- Les destinations évaluées séparément mais encore indéterminées restent `INDETERMINE`, sans produire de faux verdict rassurant.
+- Conservation de la lecture stricte des rapports 0.5.0 selon leur restitution d'origine.
+
+Le lanceur passe à **0.5.1** et le NSE reste en **0.3.3**. Les commandes usuelles et le format à quatre champs restent inchangés.
+
 ## 0.5.0 — 2026-10-23
 
 - Correction des verdicts de redirection : une destination n'est couverte qu'avec une observation concluante du même nom, de la même IP, du protocole, du port et du chemin exacts ; les paramètres expurgés restent indéterminés.

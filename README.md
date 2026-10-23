@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.5.0**, module NSE **0.3.3**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.5.1**, module NSE **0.3.3**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -136,7 +136,7 @@ Les états suivants sont conservés dans `raw/report-details.json` et dans la so
 | `HTTP_ACCESS_DENIED` | Vérifier les règles d'accès. |
 | `RATE_LIMITED` | Ralentir et recontrôler après le délai imposé. |
 | `NO_HTTP_RESPONSE` | Vérifier réseau, TLS et disponibilité. |
-| `REDIRECT_NOT_ASSESSED` | Destination affichée comme **HORS PÉRIMÈTRE DU CONTRÔLE** et non évaluée ; la contrôler séparément si elle appartient au périmètre autorisé. |
+| `REDIRECT_NOT_ASSESSED` | Le rapport recoupe l'URL exacte avec toute la campagne : une destination déjà contrôlée est indiquée comme évaluée séparément ; seule une destination absente reste affichée **HORS PÉRIMÈTRE DU CONTRÔLE**. |
 | `CONFLICTING_VERSIONS` | Vérifier les chemins et runtimes associés aux versions. |
 | `UNRECOGNIZED_BUILD` | Identifier le build et ses correctifs fournisseur. |
 | `REQUEST_BUDGET_EXHAUSTED` | Couverture HTTP partielle : ajuster budget ou chemins. |
@@ -153,7 +153,7 @@ python3 scan.py domaines.txt \
 
 **Conservez le dossier de campagne complet.** Pour un `report.json` compact, `--previous` charge automatiquement `raw/report-details.json` dans le même dossier et vérifie que les deux rapports correspondent. Un compagnon absent ou incohérent est refusé avant les accès réseau. Les anciens rapports JSON détaillés de schéma `1` restent acceptés directement, sans fichier compagnon. Cette règle vaut aussi pour le profil `recontrole`.
 
-Les rapports compacts des versions 0.4.1 à 0.4.6 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent un verdict plus prudent. Les nouveaux rapports appliquent toujours les règles 0.5.0.
+Les rapports compacts des versions 0.4.1 à 0.5.0 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouveaux rapports appliquent toujours les règles 0.5.1.
 
 Les changements sont classés en `NEW`, `CHANGED`, `UNCHANGED` et `NO_LONGER_OBSERVED`, en conservant nom, IP, port et protocole. Un changement DNS peut apparaître comme un nouveau service et un ancien non observé. **La disparition d'un service ne prouve pas sa correction.** Les changements de périmètre, de ports ou de visibilité doivent être pris en compte.
 
