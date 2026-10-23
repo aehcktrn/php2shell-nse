@@ -34,7 +34,7 @@ def coverage(hostname="app.example.com", *, code="SCAN_FAILED", ip="192.0.2.11",
 
 
 def details(rows):
-    return {"schema_version": "1", "tool_version": "0.5.1", "rows": rows,
+    return {"schema_version": "1", "tool_version": "0.5.2", "rows": rows,
             "campaign": {"campaign_id": "fixture"}, "changes": [], "summary": {"processing_complete": True}}
 
 
@@ -548,6 +548,24 @@ class CompactReportTests(unittest.TestCase):
         self.assertEqual(json.loads((self.base / "raw/report-details.json").read_text())["rows"], rows)
         self.assertTrue((self.base / "changes.csv").exists())
         self.assertFalse((self.base / "raw/report-details.csv").exists())
+
+    def test_tree_report_groups_subdomains_without_inventing_assessments(self):
+        rows = [
+            assessment(hostname="example.com"),
+            assessment(hostname="api.example.com"),
+            assessment(hostname="admin.fr.example.com"),
+            coverage(hostname="www.fr.example.com", code="NO_DNS_ADDRESS"),
+        ]
+        payload = details(rows)
+        payload["campaign"]["scope"] = {"domains": ["example.com"]}
+        report.write_campaign_report(payload, self.base)
+        tree = (self.base / "report-tree.txt").read_text(encoding="utf-8")
+        self.assertIn("example.com [PHP 8.3.36 | NON] — 4 cibles", tree)
+        self.assertIn("├── api [PHP 8.3.36 | NON]", tree)
+        self.assertIn("└── fr [regroupement]", tree)
+        self.assertIn("├── admin [PHP 8.3.36 | NON]", tree)
+        self.assertIn("└── www [PHP INCONNUE | INDETERMINE]", tree)
+        self.assertEqual(sum("[PHP " in line for line in tree.splitlines()[3:]), 4)
 
     def test_empty_campaign_json_has_only_two_structural_lines(self):
         report.write_campaign_report(details([]), self.base)

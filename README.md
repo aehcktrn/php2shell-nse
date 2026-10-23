@@ -2,7 +2,7 @@
 
 **Scanner PHP2Shell basé sur Nmap, avec un module NSE autonome.**
 
-**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.5.1**, module NSE **0.3.3**, pour **CVE-2026-109618** et **CVE-2026-109619**.
+**Rechercher les services web d'un périmètre, repérer les versions PHP concernées par PHP2Shell et suivre les corrections.** Lanceur **0.5.2**, module NSE **0.3.3**, pour **CVE-2026-109618** et **CVE-2026-109619**.
 
 Le NSE recherche des versions annoncées dans les réponses HTTP. Le lanceur ajoute les campagnes sur fichier, la découverte de sous-domaines, les imports de noms, le suivi de couverture, les rapports et les preuves de runtimes fournies par l'opérateur. Le parcours est indépendant de l'organisation et de l'hébergeur.
 
@@ -62,6 +62,7 @@ Le dossier horodaté sous **`results/` est créé automatiquement** et son chemi
 |---|---|
 | `report.csv` | Une ligne par cible : `cible`, `php`, `vulnerable`, `explication`. |
 | `report.json` | La même synthèse, un objet par ligne. |
+| `report-tree.txt` | Vue arborescente des résultats, regroupée sous chaque domaine racine. |
 | `discovered.txt` | Avec `--discover` : liste distincte des noms découverts et retenus, un par ligne. |
 
 `discovered.txt` conserve aussi une racine si elle apparaît dans les résultats de la source, ainsi que les noms retenus qui ne résolvent plus. `targets.txt` contient la liste complète des cibles retenues. Le fichier d'entrée reste inchangé.
@@ -107,6 +108,7 @@ Tous les fichiers ci-dessous sont des sorties du scanner. Ils n'ont pas à être
 | `discovered.txt` | Si découverte automatique : noms concrets CT retenus, y compris les racines présentes dans la source ; certains peuvent ne plus résoudre. |
 | `report.csv` | Synthèse à quatre colonnes, une ligne par cible. |
 | `report.json` | Même synthèse sous forme de liste JSON, un objet par ligne. |
+| `report-tree.txt` | Arborescence DNS lisible : domaines racines, branches intermédiaires et verdict de chaque cible. |
 | `changes.csv` | Comparaison avec `--previous` ; en-têtes seuls sans comparaison. |
 | `raw/report-details.json` | Bilan technique complet : évaluations par service, observations, preuves, couverture et métadonnées de campagne. Nécessaire au recontrôle et à la comparaison des nouveaux rapports. |
 | Autres fichiers de `raw/` | Résultats Nmap `.xml`, `.nmap`, `.gnmap` et journaux par couple nom/IP. |
@@ -153,7 +155,7 @@ python3 scan.py domaines.txt \
 
 **Conservez le dossier de campagne complet.** Pour un `report.json` compact, `--previous` charge automatiquement `raw/report-details.json` dans le même dossier et vérifie que les deux rapports correspondent. Un compagnon absent ou incohérent est refusé avant les accès réseau. Les anciens rapports JSON détaillés de schéma `1` restent acceptés directement, sans fichier compagnon. Cette règle vaut aussi pour le profil `recontrole`.
 
-Les rapports compacts des versions 0.4.1 à 0.5.0 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouveaux rapports appliquent toujours les règles 0.5.1.
+Les rapports compacts des versions 0.4.1 à 0.5.1 restent acceptés avec leur compagnon selon leur rendu historique exact, même lorsque les règles actuelles recalculent une restitution plus précise ou un verdict plus prudent. Les nouveaux rapports appliquent toujours les règles 0.5.2.
 
 Les changements sont classés en `NEW`, `CHANGED`, `UNCHANGED` et `NO_LONGER_OBSERVED`, en conservant nom, IP, port et protocole. Un changement DNS peut apparaître comme un nouveau service et un ancien non observé. **La disparition d'un service ne prouve pas sa correction.** Les changements de périmètre, de ports ou de visibilité doivent être pris en compte.
 

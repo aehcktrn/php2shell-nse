@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.2 — 2026-10-23
+
+- Génération automatique de `report-tree.txt`, regroupant les résultats sous chaque domaine racine selon leur hiérarchie DNS.
+- Affichage de la version PHP et du verdict sur chaque cible ; les branches intermédiaires absentes du scan sont explicitement marquées `[regroupement]`.
+- Conservation inchangée des rapports plats CSV et JSON pour les traitements automatisés et les comparaisons.
+
+Le lanceur passe à **0.5.2** et le NSE reste en **0.3.3**. Aucun nouvel argument n'est nécessaire.
+
 ## 0.5.1 — 2026-10-23
 
 - Corrélation des redirections avec toutes les cibles de la campagne : une URL exacte déjà contrôlée sous un autre nom DNS n'est plus présentée comme hors périmètre.

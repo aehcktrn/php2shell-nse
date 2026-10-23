@@ -413,7 +413,7 @@ test("bounded GET has no redirect, cache, credentials or body", function()
   equal(opts.auth, nil)
   equal(opts.cookies, nil)
   equal(opts.header["User-Agent"],
-    "php2shell-scanner/0.5.1 http-php2shell/0.3.3 (+https://github.com/aehcktrn/php2shell-scanner)")
+    "php2shell-scanner/0.5.2 http-php2shell/0.3.3 (+https://github.com/aehcktrn/php2shell-scanner)")
 end)
 
 test("global HTTP user agent can be overridden or disabled", function()

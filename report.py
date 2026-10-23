@@ -840,6 +840,83 @@ def compact_rows(rows: list[dict[str, Any]], *, legacy_explanation: bool = False
     return output
 
 
+def _report_tree_roots(report: dict[str, Any]) -> list[str]:
+    """Return explicit campaign roots without guessing public suffixes."""
+    values = []
+    discovery = report.get("discovery")
+    if isinstance(discovery, dict) and isinstance(discovery.get("roots"), list):
+        values.extend(discovery["roots"])
+    campaign = report.get("campaign")
+    scope = campaign.get("scope") if isinstance(campaign, dict) else None
+    if isinstance(scope, dict) and isinstance(scope.get("domains"), list):
+        values.extend(scope["domains"])
+    return _unique([
+        _single_line(value).lower().rstrip(".") for value in values
+        if _single_line(value)
+    ])
+
+
+def _tree_result_label(label: str, row: dict[str, str] | None, count: int,
+                       *, root: bool = False) -> str:
+    if row is None:
+        result = f"{label} [regroupement]"
+    else:
+        result = f"{label} [PHP {row['php']} | {row['vulnerable']}]"
+    if root:
+        result += f" — {count} cible" + ("s" if count != 1 else "")
+    return result
+
+
+def _tree_result_count(node: dict[str, Any]) -> int:
+    return (1 if node.get("row") is not None else 0) + sum(
+        _tree_result_count(child) for child in node["children"].values())
+
+
+def _render_tree_children(node: dict[str, Any], prefix: str, lines: list[str]) -> None:
+    children = sorted(node["children"].items(), key=lambda item: item[0])
+    for index, (label, child) in enumerate(children):
+        last = index == len(children) - 1
+        lines.append(prefix + ("└── " if last else "├── ")
+                     + _tree_result_label(label, child.get("row"), _tree_result_count(child)))
+        _render_tree_children(child, prefix + ("    " if last else "│   "), lines)
+
+
+def _report_tree_text(report: dict[str, Any], compact: list[dict[str, str]]) -> str:
+    """Render compact results as a DNS hierarchy beneath explicit scope roots."""
+    roots = _report_tree_roots(report)
+    forest: dict[str, dict[str, Any]] = {
+        root: {"row": None, "children": {}} for root in roots
+    }
+    for row in compact:
+        target = row["cible"].lower().rstrip(".")
+        matching = [root for root in roots if target == root or target.endswith("." + root)]
+        root = max(matching, key=len) if matching else target
+        node = forest.setdefault(root, {"row": None, "children": {}})
+        if target == root:
+            node["row"] = row
+            continue
+        relative = target[:-(len(root) + 1)]
+        for label in reversed(relative.split(".")):
+            node = node["children"].setdefault(label, {"row": None, "children": {}})
+        node["row"] = row
+
+    campaign = report.get("campaign")
+    campaign_id = _single_line(campaign.get("campaign_id")) if isinstance(campaign, dict) else ""
+    title = "Arborescence des résultats"
+    if campaign_id:
+        title += " — campagne " + campaign_id
+    lines = [title, "Légende : [PHP version | OUI/NON/INDETERMINE] ; [regroupement] = branche DNS non évaluée.", ""]
+    ordered_roots = [root for root in roots if root in forest]
+    ordered_roots.extend(sorted(root for root in forest if root not in roots))
+    for index, root in enumerate(ordered_roots):
+        node = forest[root]
+        lines.append(_tree_result_label(root, node.get("row"), _tree_result_count(node), root=True))
+        _render_tree_children(node, "", lines)
+        if index != len(ordered_roots) - 1:
+            lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _historical_compact_rows(details: dict[str, Any]) -> list[dict[str, str]] | None:
     """Render the exact compact contract associated with a stored tool version."""
     match = re.fullmatch(r"0\.(\d+)\.(\d+)", str(details.get("tool_version", "")))
@@ -1335,6 +1412,8 @@ def write_campaign_report(report: dict, output_dir: Path) -> None:
     _atomic_text(output_dir / "raw" / "report-details.json", write_details)
     _write_csv(compact, output_dir / "report.csv", COMPACT_FIELDS)
     _write_csv(report.get("changes", []), output_dir / "changes.csv", CHANGE_FIELDS)
+    _atomic_text(output_dir / "report-tree.txt", lambda stream: stream.write(
+        _report_tree_text(report, compact)))
     _atomic_text(output_dir / "report.json", write_compact)
 
 
